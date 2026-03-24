@@ -1,0 +1,28 @@
+name: Go Tests
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  test:
+    name: Run unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out repository code so the workflow can run tests against the commit.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Install the Go version declared in the repository module for consistent CI behavior.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Run the full Go test suite for all packages in this repository.
+      - name: Run test suite
+        run: go test ./...
