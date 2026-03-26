@@ -139,6 +139,56 @@ Current test coverage includes:
 
 CI also runs `go test ./...` on push and pull request via GitHub Actions.
 
+## Local development test environment
+
+To speed up day-to-day development without relying on a third-party identity
+provider, the repository includes a tiny mock OIDC introspection server:
+
+- `testenv/mockoidc/main.go`
+- defaults:
+  - issuer: `http://localhost:18080/oauth2/default`
+  - client credentials: `dev-client` / `dev-secret`
+  - active access token: `dev-access-token`
+
+### 1) Start mock OIDC server
+
+```bash
+go run ./testenv/mockoidc
+```
+
+### 2) Start Authunnel server against the mock issuer
+
+```bash
+export ISSUER='http://localhost:18080/oauth2/default'
+export CLIENT_ID='dev-client'
+export CLIENT_SECRET='dev-secret'
+
+cd server
+go run .
+```
+
+### 3) Start Authunnel client
+
+```bash
+export ACCESS_TOKEN='dev-access-token'
+cd client
+SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
+```
+
+### 4) Exercise SSH-style flow
+
+Direct ProxyCommand-compatible invocation:
+
+```bash
+ACCESS_TOKEN='dev-access-token' ./client/client --proxycommand localhost 22
+```
+
+Or via `socat` + unix-socket mode:
+
+```bash
+socat - SOCKS5:/tmp/authunnel/proxy.sock:localhost:22
+```
+
 ## Production-readiness plan
 
 ### Phase 1 — Security and correctness
