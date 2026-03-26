@@ -445,13 +445,22 @@ func readSOCKS5ConnectReply(conn net.Conn) error {
 
 // stdioConn adapts stdin/stdout into a net.Conn-like type usable by proxy().
 type stdioConn struct {
-	in  io.Reader
-	out io.Writer
+	in        io.ReadCloser
+	out       io.Writer
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func (s *stdioConn) Read(p []byte) (int, error)         { return s.in.Read(p) }
-func (s *stdioConn) Write(p []byte) (int, error)        { return s.out.Write(p) }
-func (s *stdioConn) Close() error                       { return nil }
+func (s *stdioConn) Read(p []byte) (int, error)  { return s.in.Read(p) }
+func (s *stdioConn) Write(p []byte) (int, error) { return s.out.Write(p) }
+func (s *stdioConn) Close() error {
+	s.closeOnce.Do(func() {
+		// Closing stdin in ProxyCommand mode is intentional so blocked reads
+		// are interrupted and proxy shutdown can complete deterministically.
+		s.closeErr = s.in.Close()
+	})
+	return s.closeErr
+}
 func (s *stdioConn) LocalAddr() net.Addr                { return dummyAddr("stdio-local") }
 func (s *stdioConn) RemoteAddr() net.Addr               { return dummyAddr("stdio-remote") }
 func (s *stdioConn) SetDeadline(_ time.Time) error      { return nil }
