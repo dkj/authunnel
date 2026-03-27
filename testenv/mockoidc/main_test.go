@@ -27,6 +27,28 @@ func TestOpenIDConfigurationEndpoint(t *testing.T) {
 	if body["issuer"] != cfg.Issuer {
 		t.Fatalf("unexpected issuer: got %q want %q", body["issuer"], cfg.Issuer)
 	}
+	if body["introspection_endpoint"] != "http://localhost:18080/oauth2/default/v1/introspect" {
+		t.Fatalf("unexpected introspection endpoint: got %q", body["introspection_endpoint"])
+	}
+}
+
+func TestOpenIDConfigurationEndpointNormalizesTrailingSlashIssuer(t *testing.T) {
+	cfg := config{Issuer: "http://localhost:18080/oauth2/custom/"}
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
+	rr := httptest.NewRecorder()
+
+	newMux(cfg).ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to parse response JSON: %v", err)
+	}
+	if body["introspection_endpoint"] != "http://localhost:18080/oauth2/custom/v1/introspect" {
+		t.Fatalf("unexpected introspection endpoint: got %q", body["introspection_endpoint"])
+	}
 }
 
 func TestIntrospectionActiveTokenWithBasicAuth(t *testing.T) {
@@ -111,6 +133,28 @@ func TestIntrospectionPathFromIssuer(t *testing.T) {
 			got := introspectionPathFromIssuer(tc.issuer)
 			if got != tc.want {
 				t.Fatalf("unexpected path: got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIntrospectionEndpointFromIssuer(t *testing.T) {
+	testCases := []struct {
+		name   string
+		issuer string
+		want   string
+	}{
+		{name: "default issuer path", issuer: "http://localhost:18080/oauth2/default", want: "http://localhost:18080/oauth2/default/v1/introspect"},
+		{name: "issuer with trailing slash", issuer: "http://localhost:18080/oauth2/custom/", want: "http://localhost:18080/oauth2/custom/v1/introspect"},
+		{name: "issuer without path", issuer: "http://localhost:18080", want: "http://localhost:18080/v1/introspect"},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := introspectionEndpointFromIssuer(tc.issuer)
+			if got != tc.want {
+				t.Fatalf("unexpected endpoint: got %q want %q", got, tc.want)
 			}
 		})
 	}

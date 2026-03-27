@@ -53,10 +53,11 @@ func getenvDefault(key, fallback string) string {
 func newMux(cfg config) *http.ServeMux {
 	mux := http.NewServeMux()
 	introspectionPath := introspectionPathFromIssuer(cfg.Issuer)
+	introspectionEndpoint := introspectionEndpointFromIssuer(cfg.Issuer)
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"issuer":                 cfg.Issuer,
-			"introspection_endpoint": fmt.Sprintf("%s/v1/introspect", cfg.Issuer),
+			"introspection_endpoint": introspectionEndpoint,
 		})
 	})
 	// Register introspection on the exact issuer-derived path so discovery metadata
@@ -79,6 +80,20 @@ func introspectionPathFromIssuer(issuer string) string {
 		basePath = "/"
 	}
 	return path.Join(basePath, "v1/introspect")
+}
+
+// introspectionEndpointFromIssuer builds the discovery endpoint from the same
+// normalized path logic as route registration to keep metadata and handlers aligned.
+func introspectionEndpointFromIssuer(issuer string) string {
+	parsed, err := url.Parse(issuer)
+	if err != nil {
+		return fmt.Sprintf("%s/v1/introspect", strings.TrimSuffix(issuer, "/"))
+	}
+	parsed.Path = introspectionPathFromIssuer(issuer)
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func handleIntrospect(w http.ResponseWriter, r *http.Request, cfg config) {
