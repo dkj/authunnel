@@ -127,6 +127,40 @@ func TestPerformSOCKS5ConnectRejectsUnsupportedAuthMethod(t *testing.T) {
 	}
 }
 
+// TestStdioConnCloseInterruptsBlockedRead verifies that Close interrupts a
+// blocked Read so proxy shutdown does not hang in ProxyCommand mode.
+func TestStdioConnCloseInterruptsBlockedRead(t *testing.T) {
+	pipeReader, pipeWriter := io.Pipe()
+	defer pipeWriter.Close()
+
+	conn := &stdioConn{
+		in:  pipeReader,
+		out: io.Discard,
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := conn.Read(buf)
+		readDone <- err
+	}()
+
+	// Give the read goroutine a moment to block in Read before closing.
+	time.Sleep(20 * time.Millisecond)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatalf("expected read to return an error after close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("blocked read did not exit after close")
+	}
+}
+
 func runMockSOCKS5ServerSuccess(conn net.Conn, t *testing.T) error {
 	greeting := make([]byte, 3)
 	if _, err := io.ReadFull(conn, greeting); err != nil {

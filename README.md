@@ -141,7 +141,8 @@ CI also runs `go test ./...` on push and pull request via GitHub Actions.
 
 ## Local development test environment
 
-To speed up day-to-day development without relying on a third-party identity provider, the repository includes a tiny mock OIDC introspection server:
+To speed up day-to-day development without relying on a third-party identity
+provider, the repository includes a tiny mock OIDC introspection server:
 
 - `testenv/mockoidc/main.go`
 - defaults:

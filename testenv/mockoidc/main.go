@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"strings"
 	"time"
 )
@@ -50,16 +52,33 @@ func getenvDefault(key, fallback string) string {
 
 func newMux(cfg config) *http.ServeMux {
 	mux := http.NewServeMux()
+	introspectionPath := introspectionPathFromIssuer(cfg.Issuer)
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"issuer":                 cfg.Issuer,
 			"introspection_endpoint": fmt.Sprintf("%s/v1/introspect", cfg.Issuer),
 		})
 	})
-	mux.HandleFunc("/oauth2/default/v1/introspect", func(w http.ResponseWriter, r *http.Request) {
+	// Register introspection on the exact issuer-derived path so discovery metadata
+	// and served routes stay consistent even when MOCK_OIDC_ISSUER changes.
+	mux.HandleFunc(introspectionPath, func(w http.ResponseWriter, r *http.Request) {
 		handleIntrospect(w, r, cfg)
 	})
 	return mux
+}
+
+// introspectionPathFromIssuer converts issuer URL into the HTTP path used for
+// /v1/introspect. If parsing fails, it falls back to the historical default path.
+func introspectionPathFromIssuer(issuer string) string {
+	parsed, err := url.Parse(issuer)
+	if err != nil {
+		return "/oauth2/default/v1/introspect"
+	}
+	basePath := strings.TrimSuffix(parsed.EscapedPath(), "/")
+	if basePath == "" {
+		basePath = "/"
+	}
+	return path.Join(basePath, "v1/introspect")
 }
 
 func handleIntrospect(w http.ResponseWriter, r *http.Request, cfg config) {
