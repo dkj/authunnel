@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -52,12 +51,20 @@ func getenvDefault(key, fallback string) string {
 
 func newMux(cfg config) *http.ServeMux {
 	mux := http.NewServeMux()
+	discoveryPath := discoveryPathFromIssuer(cfg.Issuer)
+	tokenPath := tokenPathFromIssuer(cfg.Issuer)
 	introspectionPath := introspectionPathFromIssuer(cfg.Issuer)
-	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(discoveryPath, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"issuer":                 cfg.Issuer,
-			"introspection_endpoint": fmt.Sprintf("%s/v1/introspect", cfg.Issuer),
+			"token_endpoint":         endpointURLFromIssuer(cfg.Issuer, "v1/token"),
+			"introspection_endpoint": endpointURLFromIssuer(cfg.Issuer, "v1/introspect"),
 		})
+	})
+	// Register the token endpoint even though Authunnel only uses introspection;
+	// the OIDC client validates discovery output and requires token_endpoint.
+	mux.HandleFunc(tokenPath, func(w http.ResponseWriter, r *http.Request) {
+		handleToken(w, r, cfg)
 	})
 	// Register introspection on the exact issuer-derived path so discovery metadata
 	// and served routes stay consistent even when MOCK_OIDC_ISSUER changes.
@@ -67,18 +74,78 @@ func newMux(cfg config) *http.ServeMux {
 	return mux
 }
 
+// discoveryPathFromIssuer converts issuer URL into the HTTP path used for
+// /.well-known/openid-configuration. If parsing fails, it falls back to the
+// historical root discovery path.
+func discoveryPathFromIssuer(issuer string) string {
+	return pathFromIssuer(issuer, "/.well-known/openid-configuration")
+}
+
+// tokenPathFromIssuer converts issuer URL into the HTTP path used for
+// /v1/token. If parsing fails, it falls back to the historical default path.
+func tokenPathFromIssuer(issuer string) string {
+	return pathFromIssuer(issuer, "/v1/token")
+}
+
 // introspectionPathFromIssuer converts issuer URL into the HTTP path used for
 // /v1/introspect. If parsing fails, it falls back to the historical default path.
 func introspectionPathFromIssuer(issuer string) string {
+	return pathFromIssuer(issuer, "/v1/introspect")
+}
+
+func pathFromIssuer(issuer string, endpointSuffix string) string {
 	parsed, err := url.Parse(issuer)
 	if err != nil {
-		return "/oauth2/default/v1/introspect"
+		return "/oauth2/default" + endpointSuffix
 	}
 	basePath := strings.TrimSuffix(parsed.EscapedPath(), "/")
 	if basePath == "" {
 		basePath = "/"
 	}
-	return path.Join(basePath, "v1/introspect")
+	return path.Join(basePath, endpointSuffix)
+}
+
+func endpointURLFromIssuer(issuer string, endpointSuffix string) string {
+	parsed, err := url.Parse(issuer)
+	if err != nil {
+		return strings.TrimSuffix(issuer, "/") + "/" + strings.TrimPrefix(endpointSuffix, "/")
+	}
+	basePath := strings.TrimSuffix(parsed.EscapedPath(), "/")
+	if basePath == "" {
+		basePath = "/"
+	}
+	parsed.Path = path.Join(basePath, endpointSuffix)
+	parsed.RawPath = ""
+	return parsed.String()
+}
+
+func handleToken(w http.ResponseWriter, r *http.Request, cfg config) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !isAuthorized(r, cfg) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	if grantType := r.Form.Get("grant_type"); grantType != "" && grantType != "client_credentials" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":             "unsupported_grant_type",
+			"error_description": "only client_credentials is supported",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token": cfg.ActiveToken,
+		"token_type":   "Bearer",
+		"expires_in":   int(time.Hour.Seconds()),
+		"scope":        "openid email profile",
+	})
 }
 
 func handleIntrospect(w http.ResponseWriter, r *http.Request, cfg config) {
