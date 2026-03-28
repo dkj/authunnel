@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -77,18 +79,35 @@ func (v *JWTTokenValidator) ValidateAccessToken(ctx context.Context, token strin
 func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		_, _ = w.Write([]byte("OK " + time.Now().String()))
 	})
 
 	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
 		ok := CheckToken(w, r, validator)
 		if !ok {
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		_, _ = w.Write([]byte("Protected OK " + time.Now().String()))
 	})
 
 	mux.HandleFunc("/protected/socks", func(w http.ResponseWriter, r *http.Request) {
+		if !checkWebSocketRequest(w, r) {
+			return
+		}
 		ok := CheckToken(w, r, validator)
 		if !ok {
 			return
@@ -102,6 +121,36 @@ func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 		socks.ServeConn(websocket.NetConn(r.Context(), c, websocket.MessageBinary))
 	})
 	return mux
+}
+
+// checkWebSocketRequest rejects requests that should never reach the
+// authenticated upgrade path. This keeps protocol admission checks separate
+// from bearer-token validation and makes browser-origin handling explicit.
+func checkWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		http.Error(w, "websocket upgrade requires GET", http.StatusMethodNotAllowed)
+		return false
+	}
+	if !headerContainsToken(r.Header, "Connection", "upgrade") || !headerContainsToken(r.Header, "Upgrade", "websocket") {
+		http.Error(w, "websocket upgrade required", http.StatusUpgradeRequired)
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil || originURL.Host == "" {
+		http.Error(w, "invalid origin", http.StatusForbidden)
+		return false
+	}
+	// TODO: Make the allowed origin/host comparison configurable if a reverse
+	// proxy rewrites Host instead of forwarding the original external hostname.
+	if !sameHost(originURL.Host, r.Host) {
+		http.Error(w, "cross-origin websocket forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // CheckToken extracts the bearer token from the request and delegates
@@ -132,4 +181,40 @@ func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator
 		return false
 	}
 	return true
+}
+
+func headerContainsToken(header http.Header, name, expected string) bool {
+	for _, value := range header.Values(name) {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), expected) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameHost(a, b string) bool {
+	return strings.EqualFold(normalizeHost(a), normalizeHost(b))
+}
+
+func normalizeHost(hostport string) string {
+	host := hostport
+	if parsedHost, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsedHost
+	} else if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
+		host = strings.TrimPrefix(strings.TrimSuffix(hostport, "]"), "[")
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+}
+
+func allowMethods(w http.ResponseWriter, r *http.Request, allowed ...string) bool {
+	for _, method := range allowed {
+		if r.Method == method {
+			return true
+		}
+	}
+	w.Header().Set("Allow", strings.Join(allowed, ", "))
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return false
 }

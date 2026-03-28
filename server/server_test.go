@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	socks5 "github.com/armon/go-socks5"
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
@@ -87,12 +88,150 @@ func TestCheckTokenDoesNotLeakValidationErrors(t *testing.T) {
 	}
 }
 
+func TestRootRejectsUnsupportedMethod(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, rr.Code)
+	}
+	if rr.Header().Get("Allow") != "GET, HEAD" {
+		t.Fatalf("expected Allow header %q, got %q", "GET, HEAD", rr.Header().Get("Allow"))
+	}
+}
+
+func TestProtectedAllowsHEAD(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodHead, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("expected HEAD response body to be empty, got %q", rr.Body.String())
+	}
+}
+
+func TestProtectedSocksRejectsNonWebSocketRequestsBeforeAuth(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "/protected/socks", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUpgradeRequired {
+		t.Fatalf("expected status %d, got %d", http.StatusUpgradeRequired, rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "forbidden") {
+		t.Fatalf("expected request admission failure before token validation, got %q", rr.Body.String())
+	}
+}
+
+func TestProtectedSocksRejectsNonGETMethod(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodPost, "/protected/socks", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, rr.Code)
+	}
+}
+
+func TestProtectedSocksRejectsCrossOriginWebSocketRequests(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req.Host = "authunnel.example"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://evil.example")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "cross-origin websocket forbidden") {
+		t.Fatalf("expected explicit cross-origin rejection, got %q", rr.Body.String())
+	}
+}
+
+func TestProtectedSocksAllowsSameHostOriginToReachAuth(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticFailValidator{err: errors.New("token rejected")}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req.Host = "authunnel.example"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "forbidden") {
+		t.Fatalf("expected request to pass admission checks and fail in token validation, got %q", rr.Body.String())
+	}
+}
+
 type staticFailValidator struct {
 	err error
 }
 
 func (v staticFailValidator) ValidateAccessToken(context.Context, string) (*oidc.AccessTokenClaims, error) {
 	return nil, v.err
+}
+
+type staticSuccessValidator struct{}
+
+func (staticSuccessValidator) ValidateAccessToken(context.Context, string) (*oidc.AccessTokenClaims, error) {
+	return &oidc.AccessTokenClaims{}, nil
 }
 
 func newJWTTestIssuer(t *testing.T, audience string) (string, *http.Client, string) {
