@@ -10,6 +10,8 @@ jobs:
   test:
     name: Run unit tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       # Check out repository code so the workflow can run tests against the commit.
