@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +68,31 @@ func TestJWTTokenValidatorRejectsWrongAudience(t *testing.T) {
 	if _, err := validator.ValidateAccessToken(context.Background(), token); err == nil {
 		t.Fatalf("expected wrong audience token to be rejected")
 	}
+}
+
+func TestCheckTokenDoesNotLeakValidationErrors(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer not-a-real-token")
+	rr := httptest.NewRecorder()
+
+	ok := tunnelserver.CheckToken(rr, req, staticFailValidator{err: errors.New("signature mismatch for key kid=abc123")})
+	if ok {
+		t.Fatalf("expected token check to fail for invalid token")
+	}
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "kid=abc123") || strings.Contains(rr.Body.String(), "signature mismatch") {
+		t.Fatalf("expected response body to avoid leaking verifier internals, got %q", rr.Body.String())
+	}
+}
+
+type staticFailValidator struct {
+	err error
+}
+
+func (v staticFailValidator) ValidateAccessToken(context.Context, string) (*oidc.AccessTokenClaims, error) {
+	return nil, v.err
 }
 
 func newJWTTestIssuer(t *testing.T, audience string) (string, *http.Client, string) {

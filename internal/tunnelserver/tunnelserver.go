@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -123,7 +124,11 @@ func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator
 
 	token := strings.TrimPrefix(auth, oidc.PrefixBearer)
 	if _, err := validator.ValidateAccessToken(r.Context(), token); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
+		// Do not reflect verifier details (signature, issuer/audience mismatch,
+		// expiry parsing errors, etc.) back to callers. Returning a fixed message
+		// keeps the auth surface predictable while preserving diagnostics in logs.
+		log.Printf("access token validation failed: %v", err)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return false
 	}
 	return true
