@@ -163,7 +163,23 @@ func TestStdioConnCloseInterruptsBlockedRead(t *testing.T) {
 	}
 }
 
-func TestEnsureUnixSocketDirTightensPermissions(t *testing.T) {
+func TestEnsureUnixSocketDirCreatesMissingDirectoryWithTightPermissions(t *testing.T) {
+	socketDir := filepath.Join(t.TempDir(), "socket-dir")
+	socketPath := filepath.Join(socketDir, "proxy.sock")
+	if err := ensureUnixSocketDir(socketPath); err != nil {
+		t.Fatalf("ensureUnixSocketDir failed: %v", err)
+	}
+
+	info, err := os.Stat(socketDir)
+	if err != nil {
+		t.Fatalf("stat socket dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("unexpected socket dir permissions: got %#o want %#o", got, 0o700)
+	}
+}
+
+func TestEnsureUnixSocketDirLeavesExistingDirectoryPermissionsAlone(t *testing.T) {
 	socketDir := filepath.Join(t.TempDir(), "socket-dir")
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		t.Fatalf("create socket dir: %v", err)
@@ -181,8 +197,8 @@ func TestEnsureUnixSocketDirTightensPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat socket dir: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Fatalf("unexpected socket dir permissions: got %#o want %#o", got, 0o700)
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("unexpected socket dir permissions: got %#o want %#o", got, 0o755)
 	}
 }
 

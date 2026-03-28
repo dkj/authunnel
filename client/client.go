@@ -195,6 +195,13 @@ func ensureUnixSocketDir(unixSocketPath string) error {
 	if dir == "." {
 		return nil
 	}
+	_, err := os.Stat(dir)
+	switch {
+	case err == nil:
+		return nil
+	case !errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("stat directory for socket %q: %w", unixSocketPath, err)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("failed to create directory for socket %q: %w", unixSocketPath, err)
 	}
