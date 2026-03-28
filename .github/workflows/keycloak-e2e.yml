@@ -1,0 +1,50 @@
+name: Keycloak E2E
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  keycloak-e2e:
+    name: Run Keycloak end-to-end test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start Keycloak
+        run: docker compose -f testenv/keycloak/docker-compose.yml up -d
+
+      - name: Wait for Keycloak readiness
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18080/realms/authunnel/.well-known/openid-configuration >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Keycloak did not become ready in time" >&2
+          docker compose -f testenv/keycloak/docker-compose.yml logs >&2
+          exit 1
+
+      - name: Run Keycloak-backed E2E test
+        env:
+          AUTHUNNEL_E2E: "1"
+        run: go test ./client -run TestKeycloakProxyCommandManagedOIDCE2E -count=1
+
+      - name: Dump Keycloak logs on failure
+        if: failure()
+        run: docker compose -f testenv/keycloak/docker-compose.yml logs
+
+      - name: Stop Keycloak
+        if: always()
+        run: docker compose -f testenv/keycloak/docker-compose.yml down -v

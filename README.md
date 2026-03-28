@@ -1,92 +1,73 @@
 # Authunnel
 
-Authunnel is a proof-of-concept (PoC) authenticated tunnel for reaching private TCP services (including SSH) through an OAuth2-protected, TLS WebSocket conduit.
+Authunnel is a proof-of-concept authenticated tunnel for reaching private TCP services, including SSH, through an OAuth2-protected TLS WebSocket conduit.
 
-The intended target workflow is:
+The target workflow is:
 
-1. local SSH client launches Authunnel client as `ProxyCommand`,
-2. client authenticates to Authunnel server using bearer token,
-3. server hosts a SOCKS5 backend and opens the requested `%h:%p` destination,
-4. SSH stdio is bridged over that authenticated path.
+1. `ssh` launches the Authunnel client as `ProxyCommand`.
+2. The client reuses a cached token, refreshes it, or completes Authorization Code + PKCE in a browser.
+3. The Authunnel server validates the JWT access token against issuer discovery and JWKS.
+4. The server hosts a SOCKS5 backend and opens the requested `%h:%p` destination.
+5. SSH stdio is bridged over that authenticated path.
 
 The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for tools such as `socat`.
 
 ## Components
 
 - `server/server.go`
-  - HTTPS server on `:8443`.
-  - OAuth2 access-token introspection for protected endpoints.
-  - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server.
+  - HTTPS server on `:8443`
+  - JWT access-token validation via OIDC discovery + JWKS
+  - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
 - `client/client.go`
-  - **ProxyCommand mode**: stdio bridge for direct SSH integration.
-  - **Unix socket mode**: local SOCKS5 endpoint for generic client tooling.
+  - **ProxyCommand mode**: stdio bridge for direct SSH integration
+  - **Unix socket mode**: local SOCKS5 endpoint for generic client tooling
+  - **Managed OIDC mode**: public-client PKCE login with token cache + refresh
 
-## Current maturity assessment
-
-This remains a **PoC**, but now better aligned with SSH usage.
-
-Strengths:
-- end-to-end authenticated tunnel concept works,
-- clear split between server auth gateway and client-side entrypoint,
-- automated unit tests and CI test workflow exist.
-
-Gaps before production:
-- robust reconnect/backoff behavior,
-- structured observability (metrics + correlation IDs),
-- hardened lifecycle/shutdown semantics,
-- integration/system tests with realistic network and IdP failure modes.
-
-## How it works
+## How It Works
 
 ### Server flow
 
-1. Reads `ISSUER`, `CLIENT_ID`, `CLIENT_SECRET`.
-2. Validates bearer tokens using introspection.
-3. Accepts WebSocket connections at `/protected/socks`.
-4. Hands each upgraded connection to SOCKS5 server implementation.
+1. Reads `ISSUER` and `TOKEN_AUDIENCE`.
+2. Discovers issuer metadata and JWKS.
+3. Verifies bearer-token signature, issuer, expiration, and audience.
+4. Accepts WebSocket connections at `/protected/socks`.
+5. Hands each upgraded connection to the SOCKS5 server implementation.
 
-### Client flow: unix socket mode (default)
+### Client flow
 
-1. Reads `ACCESS_TOKEN`.
-2. Opens unix socket listener (`proxy.sock` by default; configurable).
-3. For each local connection, dials authenticated websocket endpoint.
-4. Proxies bytes bidirectionally.
-
-### Client flow: ProxyCommand mode
-
-1. SSH invokes client with `%h %p`.
-2. Client opens authenticated websocket.
-3. Client performs SOCKS5 greeting + CONNECT for `%h:%p`.
-4. Client bridges `stdin/stdout` with remote stream.
+1. Either:
+   - uses `ACCESS_TOKEN` as a manual fallback, or
+   - runs managed OIDC mode when `--oidc-issuer` and `--oidc-client-id` are configured.
+2. In managed mode the client:
+   - reuses a cached token when it remains valid for more than 60 seconds,
+   - otherwise refreshes it when a refresh token is available,
+   - otherwise launches a browser to the IdP and listens on `127.0.0.1` for the callback.
+3. The client opens an authenticated WebSocket connection to the Authunnel server.
+4. In ProxyCommand mode it performs a SOCKS5 CONNECT for `%h:%p` and bridges `stdin/stdout`.
+5. In unix-socket mode it exposes a local SOCKS5 endpoint and opens a dedicated tunnel per local connection.
 
 ## Usage
 
 ### Prerequisites
 
 - Go 1.24.10+
-- OAuth2 provider credentials/tokens
-- Local TLS certificate trusted by the client runtime
+- An OIDC provider that issues JWT access tokens
+- A server audience configured in the IdP and emitted into access-token `aud`
+- A local TLS certificate trusted by the client runtime
 
 ### Start server
 
 ```bash
-export ISSUER='https://<issuer>/oauth2/default'
-export CLIENT_ID='<resource-server-client-id>'
-export CLIENT_SECRET='<resource-server-client-secret>'
+export ISSUER='https://<issuer>'
+export TOKEN_AUDIENCE='authunnel-server'
 
 cd server
 go run .
 ```
 
-### Acquire access token
+### Managed OIDC client mode
 
-Set:
-
-```bash
-export ACCESS_TOKEN='<access-token>'
-```
-
-### Option A: SSH ProxyCommand (target mode)
+This is the intended `ssh` workflow.
 
 Example SSH config entry:
 
@@ -94,22 +75,52 @@ Example SSH config entry:
 Host internal-host
   HostName internal-host
   User myuser
-  ProxyCommand /path/to/authunnel-client --proxycommand %h %p
+  ProxyCommand /path/to/authunnel-client \
+    --ws-url https://localhost:8443/protected/socks \
+    --oidc-issuer https://<issuer> \
+    --oidc-client-id authunnel-cli \
+    --proxycommand %h %p
 ```
 
-If needed, override endpoint:
+Useful client flags:
+
+- `--oidc-issuer`
+- `--oidc-client-id`
+- `--oidc-scopes` with default `openid offline_access`
+- `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json`
+- `--oidc-no-browser` to print the URL without attempting automatic browser launch
+- `--ws-url`
+- `--unix-socket`
+- `--proxycommand`
+
+On first use the client prints the authorization URL to `stderr` and tries to open the system browser. Subsequent runs reuse the cache or refresh token when possible.
+
+### Manual `ACCESS_TOKEN` fallback
+
+This remains available for non-interactive workflows.
 
 ```bash
-ACCESS_TOKEN="$ACCESS_TOKEN" /path/to/authunnel-client --ws-url https://localhost:8443/protected/socks --proxycommand internal-host 22
+export ACCESS_TOKEN='<access-token>'
+cd client
+SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
 ```
 
-### Option B: Unix socket SOCKS5 endpoint
+ProxyCommand example with a pre-supplied token:
 
-Run client listener:
+```bash
+ACCESS_TOKEN="$ACCESS_TOKEN" /path/to/authunnel-client \
+  --ws-url https://localhost:8443/protected/socks \
+  --proxycommand internal-host 22
+```
+
+### Unix socket SOCKS5 endpoint
 
 ```bash
 cd client
-SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
+SSL_CERT_FILE=../cert.pem go run . \
+  --oidc-issuer https://<issuer> \
+  --oidc-client-id authunnel-cli \
+  --unix-socket /tmp/authunnel/proxy.sock
 ```
 
 Use with `socat` in an SSH `ProxyCommand`:
@@ -121,66 +132,110 @@ Host internal-host-via-socat
   ProxyCommand socat - SOCKS5:/tmp/authunnel/proxy.sock:%h:%p
 ```
 
-(Exact `socat` syntax may vary by version/platform.)
+## OIDC Client Registration
+
+For managed client mode, register a **public** OIDC client with:
+
+- standard authorization code flow enabled
+- PKCE required with `S256`
+- loopback redirect URIs allowed for `http://127.0.0.1/*`
+- refresh tokens enabled
+- scopes that include `openid` and `offline_access`
+- an access-token audience that includes the Authunnel resource, for example `authunnel-server`
+
+Some providers require extra configuration before `offline_access` can be requested successfully. When that is not configured, override the client with `--oidc-scopes openid` and rely on cached access tokens only.
 
 ## Testing
 
-Run the full suite:
+Run the fast suite:
 
 ```bash
 go test ./...
 ```
 
-Current test coverage includes:
+Current fast coverage includes:
 
-- `checkToken` authorization-header rejection behavior,
-- bidirectional proxy forwarding behavior,
-- SOCKS5 CONNECT request construction and handshake behavior for ProxyCommand mode.
+- client config validation for manual vs managed auth modes
+- token cache reuse, mismatch rejection, and refresh-before-browser behavior
+- PKCE callback state validation and stderr-only auth messaging
+- SOCKS5 CONNECT request construction and handshake behavior
+- bidirectional proxy forwarding behavior
+- server authorization-header rejection and JWT audience validation
 
-CI also runs `go test ./...` on push and pull request via GitHub Actions.
+## Developer Notes
 
-## Local development test environment
+The codebase is intentionally split so the moving parts of the auth and tunnel
+flows are easy to locate:
 
-To speed up day-to-day development without relying on a third-party identity
-provider, the repository includes a tiny mock OIDC discovery/token/introspection server:
+- [`client/client.go`](client/client.go)
+  - CLI parsing
+  - ProxyCommand and unix-socket tunnel setup
+  - SOCKS5 client-side handshake and byte forwarding
+- [`client/auth.go`](client/auth.go)
+  - auth-mode abstraction
+  - OIDC discovery, refresh, and Authorization Code + PKCE flow
+  - token cache and lock-file coordination for concurrent `ssh` invocations
+- [`internal/tunnelserver/tunnelserver.go`](internal/tunnelserver/tunnelserver.go)
+  - issuer discovery and JWKS-backed JWT validation
+  - HTTP route setup for protected endpoints
+  - websocket-to-SOCKS bridge wiring
 
-- `testenv/mockoidc/main.go`
-- defaults:
-  - issuer: `http://localhost:18080/oauth2/default`
-  - client credentials: `dev-client` / `dev-secret`
-  - active access token: `dev-access-token`
+When changing the auth flow, keep these invariants intact:
 
-### 1) Start mock OIDC server
+- ProxyCommand mode must only write transport bytes to `stdout`; any user-facing auth output belongs on `stderr`.
+- Managed OIDC mode must prefer cache, then refresh, then browser login, so repeated `ssh` runs stay fast and predictable.
+- Server-side authorization must continue to fail closed on missing bearer token, invalid JWT signature, wrong issuer, expired token, or wrong `aud`.
+
+## Local Keycloak Test Environment
+
+The repository includes a Keycloak-based development environment under `testenv/keycloak/`.
+
+### 1) Start Keycloak
 
 ```bash
-go run ./testenv/mockoidc
+docker compose -f testenv/keycloak/docker-compose.yml up -d
 ```
 
-### 2) Start Authunnel server against the mock issuer
+This imports a realm with:
+
+- realm: `authunnel`
+- issuer: `http://127.0.0.1:18080/realms/authunnel`
+- public client: `authunnel-cli`
+- bearer-only resource client: `authunnel-server`
+- test user: `dev-user` / `dev-password`
+
+### 2) Start Authunnel server against Keycloak
 
 ```bash
-export ISSUER='http://localhost:18080/oauth2/default'
-export CLIENT_ID='dev-client'
-export CLIENT_SECRET='dev-secret'
+export ISSUER='http://127.0.0.1:18080/realms/authunnel'
+export TOKEN_AUDIENCE='authunnel-server'
 
 cd server
 go run .
 ```
 
-### 3) Start Authunnel client
+### 3) Start Authunnel client in managed mode
 
 ```bash
-export ACCESS_TOKEN='dev-access-token'
 cd client
-SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
+SSL_CERT_FILE=../cert.pem go run . \
+  --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
+  --oidc-client-id authunnel-cli \
+  --oidc-scopes openid \
+  --unix-socket /tmp/authunnel/proxy.sock
 ```
 
-### 4) Exercise SSH-style flow
+### 4) Exercise the SSH-style flow
 
 Direct ProxyCommand-compatible invocation:
 
 ```bash
-ACCESS_TOKEN='dev-access-token' ./client/client --proxycommand localhost 22
+SSL_CERT_FILE=../cert.pem ./client/client \
+  --ws-url https://localhost:8443/protected/socks \
+  --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
+  --oidc-client-id authunnel-cli \
+  --oidc-scopes openid \
+  --proxycommand localhost 22
 ```
 
 Or via `socat` + unix-socket mode:
@@ -189,26 +244,15 @@ Or via `socat` + unix-socket mode:
 socat - SOCKS5:/tmp/authunnel/proxy.sock:localhost:22
 ```
 
-## Production-readiness plan
+## End-To-End Test
 
-### Phase 1 — Security and correctness
+An opt-in Keycloak-backed end-to-end test is available:
 
-1. Add strict startup config validation and documented defaults.
-2. Enforce TLS minima, certificate pin/trust options, and optional mTLS.
-3. Add request-scoped timeouts for introspection and websocket/socks negotiations.
-4. Ensure deterministic graceful shutdown and session draining.
+```bash
+AUTHUNNEL_E2E=1 go test ./client -run TestKeycloakProxyCommandManagedOIDCE2E -count=1
+```
 
-### Phase 2 — Reliability and operations
-
-1. Add reconnect/backoff and transient error handling strategy.
-2. Introduce structured logs and metrics (auth failures, active tunnels, bytes, latency).
-3. Add runtime controls (session limits, idle timeout, per-session caps).
-
-### Phase 3 — Delivery and quality gates
-
-1. Add lint, race detector, vulnerability scans, and reproducible release builds.
-2. Add integration tests with mock IdP + ephemeral certs + end-to-end SSH path.
-3. Add system tests for long-lived connections, performance baselines, and fault injection.
+The GitHub Actions workflow in [`.github/workflows/keycloak-e2e.yml`](.github/workflows/keycloak-e2e.yml) starts Keycloak from `testenv/keycloak/docker-compose.yml` and runs that test in CI.
 
 ## License
 
