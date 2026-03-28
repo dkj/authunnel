@@ -18,7 +18,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 type TokenValidator interface {
