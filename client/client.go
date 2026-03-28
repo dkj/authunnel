@@ -27,57 +27,126 @@ const (
 	socksReplySucceeded = 0x00
 )
 
+type authMode string
+
+const (
+	authModeManual authMode = "manual"
+	authModeOIDC   authMode = "oidc"
+)
+
 // clientConfig captures command-line and environment driven behavior for the client process.
 type clientConfig struct {
-	AccessToken      string
+	AuthMode authMode
+
+	AccessToken string
+
+	OIDCIssuer    string
+	OIDCClientID  string
+	OIDCScopes    string
+	OIDCCache     string
+	OIDCNoBrowser bool
+
 	WebSocketURL     string
 	UnixSocketPath   string
 	ProxyCommandMode bool
 	TargetHost       string
 	TargetPort       int
+
+	HTTPClient     *http.Client
+	AuthHTTPClient *http.Client
+	Stdin          io.ReadCloser
+	Stdout         io.Writer
+	Stderr         io.Writer
+	BrowserOpener  browserOpener
 }
 
 func main() {
-	cfg, err := parseClientConfig()
+	cfg, err := parseClientConfig(os.Args[1:], os.Getenv)
+	if err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
+
+	source, err := newAuthTokenSource(cfg)
 	if err != nil {
 		log.Fatalf("invalid configuration: %v", err)
 	}
 
 	ctx := context.Background()
 	if cfg.ProxyCommandMode {
-		if err := runProxyCommandMode(ctx, cfg); err != nil {
+		if err := runProxyCommandMode(ctx, cfg, source); err != nil {
 			log.Fatalf("proxycommand mode failed: %v", err)
 		}
 		return
 	}
 
-	if err := runUnixSocketMode(ctx, cfg); err != nil {
+	if err := runUnixSocketMode(ctx, cfg, source); err != nil {
 		log.Fatalf("unix socket mode failed: %v", err)
 	}
 }
 
-func parseClientConfig() (clientConfig, error) {
-	cfg := clientConfig{}
-	cfg.AccessToken = os.Getenv("ACCESS_TOKEN")
+// parseClientConfig keeps auth-mode selection explicit so developers can reason
+// about startup behavior from one place. Manual token mode and managed OIDC are
+// intentionally mutually exclusive to avoid surprising precedence rules.
+func parseClientConfig(args []string, getenv func(string) string) (clientConfig, error) {
+	cfg := clientConfig{
+		AccessToken:   getenv("ACCESS_TOKEN"),
+		Stdin:         os.Stdin,
+		Stdout:        os.Stdout,
+		Stderr:        os.Stderr,
+		BrowserOpener: defaultBrowserOpener,
+	}
 
-	flag.StringVar(&cfg.WebSocketURL, "ws-url", "https://localhost:8443/protected/socks", "WebSocket URL for the authenticated socks tunnel endpoint")
-	flag.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
-	flag.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
-	flag.Parse()
+	fs := flag.NewFlagSet("authunnel-client", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&cfg.WebSocketURL, "ws-url", "https://localhost:8443/protected/socks", "WebSocket URL for the authenticated socks tunnel endpoint")
+	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
+	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
+	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
+	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", "", "OIDC client ID used for managed login")
+	fs.StringVar(&cfg.OIDCScopes, "oidc-scopes", "openid offline_access", "Space-delimited OIDC scopes for managed login")
+	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
+	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
+	if err := fs.Parse(args); err != nil {
+		return cfg, err
+	}
 
-	if cfg.AccessToken == "" {
-		return cfg, errors.New("ACCESS_TOKEN environment variable is required")
+	hasOIDC := cfg.OIDCIssuer != "" || cfg.OIDCClientID != ""
+	if cfg.AccessToken != "" && hasOIDC {
+		return cfg, errors.New("ACCESS_TOKEN cannot be combined with --oidc-issuer/--oidc-client-id")
+	}
+	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
+		return cfg, errors.New("managed OIDC mode requires both --oidc-issuer and --oidc-client-id")
+	}
+	if cfg.AccessToken == "" && cfg.OIDCIssuer == "" {
+		return cfg, errors.New("either ACCESS_TOKEN or both --oidc-issuer and --oidc-client-id are required")
+	}
+
+	if cfg.AccessToken != "" {
+		cfg.AuthMode = authModeManual
+	} else {
+		cfg.AuthMode = authModeOIDC
+		cfg.OIDCScopes = normalizeScopes(cfg.OIDCScopes)
+		if cfg.OIDCScopes == "" {
+			cfg.OIDCScopes = normalizeScopes("openid offline_access")
+		}
+		if cfg.OIDCCache == "" {
+			cachePath, err := defaultOIDCCachePath()
+			if err != nil {
+				return cfg, err
+			}
+			cfg.OIDCCache = cachePath
+		}
 	}
 
 	if cfg.ProxyCommandMode {
-		args := flag.Args()
-		if len(args) != 2 {
+		positional := fs.Args()
+		if len(positional) != 2 {
 			return cfg, errors.New("proxycommand mode requires host and port positional arguments")
 		}
-		cfg.TargetHost = args[0]
-		port, err := strconv.Atoi(args[1])
+		cfg.TargetHost = positional[0]
+		port, err := strconv.Atoi(positional[1])
 		if err != nil || port < 1 || port > 65535 {
-			return cfg, fmt.Errorf("invalid target port %q", args[1])
+			return cfg, fmt.Errorf("invalid target port %q", positional[1])
 		}
 		cfg.TargetPort = port
 	}
@@ -87,7 +156,7 @@ func parseClientConfig() (clientConfig, error) {
 
 // runUnixSocketMode exposes a local unix-domain SOCKS5 endpoint, with each accepted
 // connection tunneled via a dedicated authenticated websocket connection.
-func runUnixSocketMode(ctx context.Context, cfg clientConfig) error {
+func runUnixSocketMode(ctx context.Context, cfg clientConfig, source authTokenSource) error {
 	if err := ensureUnixSocketDir(cfg.UnixSocketPath); err != nil {
 		return err
 	}
@@ -111,7 +180,7 @@ func runUnixSocketMode(ctx context.Context, cfg clientConfig) error {
 		}
 
 		go func(conn net.Conn) {
-			if err := handleSOCKSClient(ctx, cfg, conn); err != nil {
+			if err := handleSOCKSClient(ctx, cfg, source, conn); err != nil {
 				log.Printf("connection failed: %v", err)
 			}
 		}(localConn)
@@ -129,10 +198,14 @@ func ensureUnixSocketDir(unixSocketPath string) error {
 	return nil
 }
 
-func handleSOCKSClient(ctx context.Context, cfg clientConfig, localConn net.Conn) error {
-	wsConn, _, err := websocket.Dial(ctx, cfg.WebSocketURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + cfg.AccessToken}},
-	})
+func handleSOCKSClient(ctx context.Context, cfg clientConfig, source authTokenSource, localConn net.Conn) error {
+	token, err := source.AccessToken(ctx)
+	if err != nil {
+		_ = localConn.Close()
+		return fmt.Errorf("resolve access token: %w", err)
+	}
+
+	wsConn, _, err := dialTunnel(ctx, cfg, token)
 	if err != nil {
 		_ = localConn.Close()
 		return fmt.Errorf("websocket dial failed: %w", err)
@@ -149,10 +222,13 @@ func handleSOCKSClient(ctx context.Context, cfg clientConfig, localConn net.Conn
 //
 // It opens a websocket tunnel, performs SOCKS5 CONNECT for the target host/port,
 // then bridges stdin/stdout with the resulting network stream.
-func runProxyCommandMode(ctx context.Context, cfg clientConfig) error {
-	wsConn, _, err := websocket.Dial(ctx, cfg.WebSocketURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + cfg.AccessToken}},
-	})
+func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authTokenSource) error {
+	token, err := source.AccessToken(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve access token: %w", err)
+	}
+
+	wsConn, _, err := dialTunnel(ctx, cfg, token)
 	if err != nil {
 		return fmt.Errorf("websocket dial failed: %w", err)
 	}
@@ -165,9 +241,19 @@ func runProxyCommandMode(ctx context.Context, cfg clientConfig) error {
 		return fmt.Errorf("socks5 connect failed: %w", err)
 	}
 
-	stdioConn := &stdioConn{in: os.Stdin, out: os.Stdout}
+	stdioConn := &stdioConn{in: cfg.Stdin, out: cfg.Stdout}
 	proxy(stdioConn, remoteConn)
 	return nil
+}
+
+func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket.Conn, *http.Response, error) {
+	options := &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
+	}
+	if cfg.HTTPClient != nil {
+		options.HTTPClient = cfg.HTTPClient
+	}
+	return websocket.Dial(ctx, cfg.WebSocketURL, options)
 }
 
 // performSOCKS5Connect performs a minimal no-auth SOCKS5 handshake and CONNECT request.
@@ -202,6 +288,8 @@ func performSOCKS5Connect(conn net.Conn, targetHost string, targetPort int) erro
 	return nil
 }
 
+// buildSOCKS5ConnectRequest emits the minimal CONNECT frame the server-side
+// SOCKS implementation expects after the no-auth greeting has completed.
 func buildSOCKS5ConnectRequest(targetHost string, targetPort int) ([]byte, error) {
 	if targetPort < 1 || targetPort > 65535 {
 		return nil, fmt.Errorf("invalid target port: %d", targetPort)
@@ -228,6 +316,8 @@ func buildSOCKS5ConnectRequest(targetHost string, targetPort int) ([]byte, error
 	return request, nil
 }
 
+// readSOCKS5ConnectReply consumes the remainder of the CONNECT reply so the
+// bridged application stream starts aligned on the first payload byte.
 func readSOCKS5ConnectReply(conn net.Conn) error {
 	replyHeader := make([]byte, 4)
 	if _, err := io.ReadFull(conn, replyHeader); err != nil {
@@ -272,8 +362,8 @@ type stdioConn struct {
 	closeErr  error
 }
 
-func (s *stdioConn) Read(p []byte) (int, error)         { return s.in.Read(p) }
-func (s *stdioConn) Write(p []byte) (int, error)        { return s.out.Write(p) }
+func (s *stdioConn) Read(p []byte) (int, error)  { return s.in.Read(p) }
+func (s *stdioConn) Write(p []byte) (int, error) { return s.out.Write(p) }
 func (s *stdioConn) Close() error {
 	s.closeOnce.Do(func() {
 		// Closing stdin in ProxyCommand mode is intentional so blocked reads
@@ -305,13 +395,15 @@ func proxy(conn1, conn2 net.Conn) {
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(conn1, conn2)
-		// Signal peer that no more data is coming.
+		// Signal peer that no more data is coming. Full Close is acceptable here
+		// because both endpoints are tunnel/session scoped and are torn down once
+		// either side stops producing bytes.
 		_ = conn1.Close()
 	}()
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(conn2, conn1)
-		// Signal peer that no more data is coming.
+		// Mirror the same shutdown semantics in the opposite direction.
 		_ = conn2.Close()
 	}()
 
