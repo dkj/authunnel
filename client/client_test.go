@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -158,6 +160,61 @@ func TestStdioConnCloseInterruptsBlockedRead(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("blocked read did not exit after close")
+	}
+}
+
+func TestEnsureUnixSocketDirTightensPermissions(t *testing.T) {
+	socketDir := filepath.Join(t.TempDir(), "socket-dir")
+	if err := os.MkdirAll(socketDir, 0o755); err != nil {
+		t.Fatalf("create socket dir: %v", err)
+	}
+	if err := os.Chmod(socketDir, 0o755); err != nil {
+		t.Fatalf("chmod socket dir: %v", err)
+	}
+
+	socketPath := filepath.Join(socketDir, "proxy.sock")
+	if err := ensureUnixSocketDir(socketPath); err != nil {
+		t.Fatalf("ensureUnixSocketDir failed: %v", err)
+	}
+
+	info, err := os.Stat(socketDir)
+	if err != nil {
+		t.Fatalf("stat socket dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("unexpected socket dir permissions: got %#o want %#o", got, 0o700)
+	}
+}
+
+func TestTightenUnixSocketPermissionsSetsOwnerOnlyMode(t *testing.T) {
+	socketDir, err := os.MkdirTemp(".", "socktest-")
+	if err != nil {
+		t.Fatalf("create temp socket dir: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+
+	socketPath := filepath.Join(socketDir, "proxy.sock")
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	defer listener.Close()
+	defer os.Remove(socketPath)
+
+	if err := os.Chmod(socketPath, 0o666); err != nil {
+		t.Fatalf("widen socket permissions: %v", err)
+	}
+	if err := tightenUnixSocketPermissions(socketPath); err != nil {
+		t.Fatalf("tightenUnixSocketPermissions failed: %v", err)
+	}
+
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatalf("stat socket path: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("unexpected socket permissions: got %#o want %#o", got, 0o600)
 	}
 }
 

@@ -133,6 +133,10 @@ Host internal-host-via-socat
   ProxyCommand socat - SOCKS5:/tmp/authunnel/proxy.sock:%h:%p
 ```
 
+The client creates the unix-socket parent directory with `0700` permissions and
+then tightens the socket itself to `0600` so other local users cannot connect by
+default on shared hosts.
+
 ## OIDC Client Registration
 
 For managed client mode, register a **public** OIDC client with:

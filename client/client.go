@@ -171,6 +171,9 @@ func runUnixSocketMode(ctx context.Context, cfg clientConfig, source authTokenSo
 	}
 	defer proxyListen.Close()
 	defer os.Remove(cfg.UnixSocketPath)
+	if err := tightenUnixSocketPermissions(cfg.UnixSocketPath); err != nil {
+		return err
+	}
 
 	log.Printf("listening for local SOCKS5 clients on unix socket %s", cfg.UnixSocketPath)
 	for {
@@ -192,8 +195,18 @@ func ensureUnixSocketDir(unixSocketPath string) error {
 	if dir == "." {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("failed to create directory for socket %q: %w", unixSocketPath, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("failed to set directory permissions for socket %q: %w", unixSocketPath, err)
+	}
+	return nil
+}
+
+func tightenUnixSocketPermissions(unixSocketPath string) error {
+	if err := os.Chmod(unixSocketPath, 0o600); err != nil {
+		return fmt.Errorf("failed to set socket permissions on %q: %w", unixSocketPath, err)
 	}
 	return nil
 }
