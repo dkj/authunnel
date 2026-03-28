@@ -4,6 +4,7 @@
 package tunnelserver
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -112,7 +113,10 @@ func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 		if !ok {
 			return
 		}
-		c, err := websocket.Accept(w, r, nil)
+		// websocket.Accept hijacks the HTTP/1.1 connection. Clear any
+		// server-level deadlines first so the upgraded SOCKS tunnel can stay
+		// open independently of the HTTP request timeout budget.
+		c, err := websocket.Accept(clearHijackedConnDeadlines(w), r, nil)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUpgradeRequired)
 			return
@@ -217,4 +221,29 @@ func allowMethods(w http.ResponseWriter, r *http.Request, allowed ...string) boo
 	w.Header().Set("Allow", strings.Join(allowed, ", "))
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	return false
+}
+
+func clearHijackedConnDeadlines(w http.ResponseWriter) http.ResponseWriter {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		return w
+	}
+	return deadlineClearingResponseWriter{ResponseWriter: w, hijacker: hj}
+}
+
+type deadlineClearingResponseWriter struct {
+	http.ResponseWriter
+	hijacker http.Hijacker
+}
+
+func (w deadlineClearingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := w.hijacker.Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("clear hijacked connection deadlines: %w", err)
+	}
+	return conn, rw, nil
 }
