@@ -148,9 +148,9 @@ func checkWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "invalid origin", http.StatusForbidden)
 		return false
 	}
-	// TODO: Make the allowed origin/host comparison configurable if a reverse
-	// proxy rewrites Host instead of forwarding the original external hostname.
-	if !sameHost(originURL.Host, r.Host) {
+	// TODO: Make the allowed origin comparison configurable if a reverse proxy
+	// rewrites scheme/host instead of forwarding the original external values.
+	if !sameOrigin(originURL, r) {
 		http.Error(w, "cross-origin websocket forbidden", http.StatusForbidden)
 		return false
 	}
@@ -198,18 +198,51 @@ func headerContainsToken(header http.Header, name, expected string) bool {
 	return false
 }
 
-func sameHost(a, b string) bool {
-	return strings.EqualFold(normalizeHost(a), normalizeHost(b))
+func sameOrigin(originURL *url.URL, r *http.Request) bool {
+	requestScheme := requestScheme(r)
+	if !strings.EqualFold(originURL.Scheme, requestScheme) {
+		return false
+	}
+	return strings.EqualFold(normalizeAuthority(originURL), normalizeAuthority(&url.URL{
+		Scheme: requestScheme,
+		Host:   r.Host,
+	}))
 }
 
-func normalizeHost(hostport string) string {
-	host := hostport
-	if parsedHost, _, err := net.SplitHostPort(hostport); err == nil {
-		host = parsedHost
-	} else if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
-		host = strings.TrimPrefix(strings.TrimSuffix(hostport, "]"), "[")
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
 	}
-	return strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if r.URL != nil && r.URL.Scheme != "" {
+		return strings.ToLower(r.URL.Scheme)
+	}
+	return "http"
+}
+
+func normalizeAuthority(u *url.URL) string {
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	} else {
+		host = strings.ToLower(host)
+	}
+
+	port := u.Port()
+	if port == "" {
+		port = defaultPortForScheme(u.Scheme)
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func defaultPortForScheme(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "https", "wss":
+		return "443"
+	case "http", "ws":
+		return "80"
+	default:
+		return ""
+	}
 }
 
 func allowMethods(w http.ResponseWriter, r *http.Request, allowed ...string) bool {

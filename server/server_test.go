@@ -195,6 +195,50 @@ func TestProtectedSocksRejectsCrossOriginWebSocketRequests(t *testing.T) {
 	}
 }
 
+func TestProtectedSocksRejectsOriginWithDifferentScheme(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req.Host = "authunnel.example"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "http://authunnel.example")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	}
+}
+
+func TestProtectedSocksRejectsOriginWithDifferentPort(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example:8443/protected/socks", nil)
+	req.Host = "authunnel.example:8443"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example:444")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	}
+}
+
 func TestProtectedSocksAllowsSameHostOriginToReachAuth(t *testing.T) {
 	socks, err := socks5.New(&socks5.Config{})
 	if err != nil {
@@ -204,6 +248,31 @@ func TestProtectedSocksAllowsSameHostOriginToReachAuth(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
 	req.Host = "authunnel.example"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "forbidden") {
+		t.Fatalf("expected request to pass admission checks and fail in token validation, got %q", rr.Body.String())
+	}
+}
+
+func TestProtectedSocksAllowsOriginWithImplicitDefaultHTTPSPort(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticFailValidator{err: errors.New("token rejected")}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req.Host = "authunnel.example:443"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Origin", "https://authunnel.example")
