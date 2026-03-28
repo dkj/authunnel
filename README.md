@@ -16,6 +16,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 
 - `server/server.go`
   - HTTPS server on `:8443`
+  - Conservative HTTP server timeouts to reduce slow-client resource exhaustion risk
   - JWT access-token validation via OIDC discovery + JWKS
   - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
 - `client/client.go`
@@ -131,6 +132,10 @@ Host internal-host-via-socat
   User myuser
   ProxyCommand socat - SOCKS5:/tmp/authunnel/proxy.sock:%h:%p
 ```
+
+If the unix-socket parent directory does not already exist, the client creates
+it with `0700` permissions. It also tightens the socket itself to `0600` so
+other local users cannot connect by default on shared hosts.
 
 ## OIDC Client Registration
 

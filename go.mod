@@ -4,11 +4,11 @@ go 1.24.10
 
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
+	github.com/coder/websocket v1.8.14
 	github.com/go-jose/go-jose/v4 v4.0.5
 	github.com/gorilla/handlers v1.5.2
 	github.com/zitadel/oidc/v3 v3.45.5
 	golang.org/x/oauth2 v0.35.0
-	nhooyr.io/websocket v1.8.17
 )
 
 require (

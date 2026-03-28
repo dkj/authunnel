@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	socks5 "github.com/armon/go-socks5"
 	"github.com/gorilla/handlers"
@@ -33,5 +34,13 @@ func main() {
 	}
 
 	serverMux := tunnelserver.NewHandler(validator, socks)
-	log.Fatal(http.ListenAndServeTLS(":8443", "../cert.pem", "../key.pem", handlers.LoggingHandler(os.Stderr, serverMux)))
+	httpServer := &http.Server{
+		Addr:              ":8443",
+		Handler:           handlers.LoggingHandler(os.Stderr, serverMux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	log.Fatal(httpServer.ListenAndServeTLS("../cert.pem", "../key.pem"))
 }
