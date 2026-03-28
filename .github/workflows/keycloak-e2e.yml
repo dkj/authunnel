@@ -39,7 +39,7 @@ jobs:
       - name: Run Keycloak-backed E2E test
         env:
           AUTHUNNEL_E2E: "1"
-        run: go test ./client -run TestKeycloakProxyCommandManagedOIDCE2E -count=1
+        run: go test ./client -run TestKeycloakProxyCommandManagedOIDCE2E -count=1 -timeout=2m -v
 
       - name: Dump Keycloak logs on failure
         if: failure()
