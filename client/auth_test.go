@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"strings"
 	"sync"
@@ -215,6 +216,76 @@ func TestManagedOIDCTokenSourceIgnoresMismatchedCacheAndRunsInteractiveFlow(t *t
 	if token != provider.codeAccessToken {
 		t.Fatalf("unexpected token: got %q want %q", token, provider.codeAccessToken)
 	}
+}
+
+func TestAcquireFileLockAllowsReuseOfExistingLockFile(t *testing.T) {
+	lockPath := filepathForTest(t, "tokens.lock")
+	if err := os.WriteFile(lockPath, []byte("leftover-data"), 0o600); err != nil {
+		t.Fatalf("seed lock file: %v", err)
+	}
+	release, err := acquireFileLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer release()
+}
+
+func TestAcquireFileLockCanBeReacquiredAfterHolderProcessExits(t *testing.T) {
+	lockPath := filepathForTest(t, "tokens.lock")
+	cmd := exec.Command(os.Args[0], "-test.run=TestAcquireFileLockHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"AUTHUNNEL_LOCK_HELPER=1",
+		"AUTHUNNEL_LOCK_PATH="+lockPath,
+		"AUTHUNNEL_LOCK_HOLD_MS=100",
+	)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stdout
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stdout.String(), "locked\n") {
+		if time.Now().After(deadline) {
+			t.Fatalf("helper did not report lock acquisition: %s", stdout.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("wait for helper process: %v\noutput:\n%s", err, stdout.String())
+	}
+
+	release, err := acquireFileLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatalf("acquire lock after helper exit: %v", err)
+	}
+	release()
+}
+
+func TestAcquireFileLockHelperProcess(t *testing.T) {
+	if os.Getenv("AUTHUNNEL_LOCK_HELPER") != "1" {
+		return
+	}
+	lockPath := os.Getenv("AUTHUNNEL_LOCK_PATH")
+	if lockPath == "" {
+		t.Fatal("AUTHUNNEL_LOCK_PATH is required")
+	}
+	release, err := acquireFileLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatalf("helper acquire lock: %v", err)
+	}
+	defer release()
+	_, _ = os.Stdout.WriteString("locked\n")
+	holdDuration, err := time.ParseDuration(os.Getenv("AUTHUNNEL_LOCK_HOLD_MS") + "ms")
+	if err != nil {
+		t.Fatalf("parse AUTHUNNEL_LOCK_HOLD_MS: %v", err)
+	}
+	time.Sleep(holdDuration)
 }
 
 type fakeOIDCProvider struct {

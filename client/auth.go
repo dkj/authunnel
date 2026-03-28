@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	oidcclient "github.com/zitadel/oidc/v3/pkg/client"
@@ -130,7 +131,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context) (string, error
 		return "", fmt.Errorf("create cache directory: %w", err)
 	}
 
-	release, err := acquireFileLock(ctx, s.cachePath+".lock", s.now)
+	release, err := acquireFileLock(ctx, s.cachePath+".lock")
 	if err != nil {
 		return "", err
 	}
@@ -346,32 +347,31 @@ func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.
 }
 
 // acquireFileLock coordinates concurrent client processes that share the same
-// token cache. The lock file is adjacent to the cache for easy discovery and is
-// treated as stale after a short window so crashed processes do not wedge login.
-func acquireFileLock(ctx context.Context, lockPath string, now func() time.Time) (func(), error) {
+// token cache using an OS-backed advisory lock. The lock file is never deleted;
+// the kernel releases the lock when the owning process exits, which avoids both
+// age-based lock stealing and stale lock files after crashes.
+func acquireFileLock(ctx context.Context, lockPath string) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create lock directory: %w", err)
 	}
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open cache lock %q: %w", lockPath, err)
+	}
 	for {
-		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			_, _ = file.WriteString(now().UTC().Format(time.RFC3339Nano))
+		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 			return func() {
+				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 				_ = file.Close()
-				_ = os.Remove(lockPath)
 			}, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("create cache lock %q: %w", lockPath, err)
-		}
-
-		if info, statErr := os.Stat(lockPath); statErr == nil && now().Sub(info.ModTime()) > 2*time.Minute {
-			_ = os.Remove(lockPath)
-			continue
+		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = file.Close()
+			return nil, fmt.Errorf("lock cache lock %q: %w", lockPath, err)
 		}
 
 		select {
 		case <-ctx.Done():
+			_ = file.Close()
 			return nil, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
