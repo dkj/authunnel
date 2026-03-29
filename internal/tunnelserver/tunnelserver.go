@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -118,13 +118,28 @@ func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 		// open independently of the HTTP request timeout budget.
 		c, err := websocket.Accept(clearHijackedConnDeadlines(w), r, nil)
 		if err != nil {
+			loggerFromContext(r.Context()).Warn("websocket_upgrade_failed",
+				slog.String("error", err.Error()),
+			)
 			http.Error(w, err.Error(), http.StatusUpgradeRequired)
 			return
 		}
 		defer c.CloseNow()
+		tunnelLogger := loggerFromContext(r.Context()).With(
+			slog.String("tunnel_id", newLogID()),
+		)
+		tunnelStart := time.Now()
+		tunnelLogger.Info("tunnel_open")
+		defer logTunnelClose(tunnelLogger, tunnelStart)
 		socks.ServeConn(websocket.NetConn(r.Context(), c, websocket.MessageBinary))
 	})
 	return mux
+}
+
+func logTunnelClose(logger *slog.Logger, started time.Time) {
+	logger.Info("tunnel_close",
+		slog.Int64("duration_ms", time.Since(started).Milliseconds()),
+	)
 }
 
 // checkWebSocketRequest rejects requests that should never reach the
@@ -132,10 +147,16 @@ func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 // from bearer-token validation and makes browser-origin handling explicit.
 func checkWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method != http.MethodGet {
+		loggerFromContext(r.Context()).Warn("websocket_rejected",
+			slog.String("reason", "method_not_allowed"),
+		)
 		http.Error(w, "websocket upgrade requires GET", http.StatusMethodNotAllowed)
 		return false
 	}
 	if !headerContainsToken(r.Header, "Connection", "upgrade") || !headerContainsToken(r.Header, "Upgrade", "websocket") {
+		loggerFromContext(r.Context()).Warn("websocket_rejected",
+			slog.String("reason", "upgrade_headers_missing"),
+		)
 		http.Error(w, "websocket upgrade required", http.StatusUpgradeRequired)
 		return false
 	}
@@ -145,12 +166,20 @@ func checkWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
 	}
 	originURL, err := url.Parse(origin)
 	if err != nil || originURL.Host == "" {
+		loggerFromContext(r.Context()).Warn("websocket_rejected",
+			slog.String("reason", "invalid_origin"),
+			slog.String("origin", origin),
+		)
 		http.Error(w, "invalid origin", http.StatusForbidden)
 		return false
 	}
 	// TODO: Make the allowed origin comparison configurable if a reverse proxy
 	// rewrites scheme/host instead of forwarding the original external values.
 	if !sameOrigin(originURL, r) {
+		loggerFromContext(r.Context()).Warn("websocket_rejected",
+			slog.String("reason", "cross_origin"),
+			slog.String("origin", origin),
+		)
 		http.Error(w, "cross-origin websocket forbidden", http.StatusForbidden)
 		return false
 	}
@@ -180,7 +209,9 @@ func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator
 		// Do not reflect verifier details (signature, issuer/audience mismatch,
 		// expiry parsing errors, etc.) back to callers. Returning a fixed message
 		// keeps the auth surface predictable while preserving diagnostics in logs.
-		log.Printf("access token validation failed: %v", err)
+		loggerFromContext(r.Context()).Warn("auth_failure",
+			slog.String("error", err.Error()),
+		)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return false
 	}

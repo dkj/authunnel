@@ -6,12 +6,12 @@ import (
 	"flag"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
 	socks5 "github.com/armon/go-socks5"
-	"github.com/gorilla/handlers"
 
 	"authunnel/internal/tunnelserver"
 )
@@ -25,32 +25,47 @@ type serverConfig struct {
 }
 
 func main() {
+	logHandler := slog.NewJSONHandler(os.Stderr, nil)
+	logger := slog.New(logHandler)
+	slog.SetDefault(logger)
+	stdLogger := slog.NewLogLogger(logHandler, slog.LevelInfo)
+	log.SetFlags(0)
+	log.SetOutput(stdLogger.Writer())
+
 	cfg, err := parseServerConfig(os.Args[1:], os.Getenv)
 	if err != nil {
-		log.Fatalf("invalid configuration: %v", err)
+		logger.Error("invalid configuration", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), cfg.Issuer, cfg.TokenAudience, http.DefaultClient)
 	if err != nil {
-		log.Fatalf("error creating token validator: %s", err.Error())
+		logger.Error("create token validator", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
-	socks, err := socks5.New(&socks5.Config{})
+	socks, err := socks5.New(&socks5.Config{
+		Logger: stdLogger,
+	})
 	if err != nil {
-		log.Fatalf("error creating SOCKS5 server: %s", err.Error())
+		logger.Error("create socks5 server", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	serverMux := tunnelserver.NewHandler(validator, socks)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           handlers.LoggingHandler(os.Stderr, serverMux),
+		Handler:           tunnelserver.NewRequestLoggingMiddleware(logger, serverMux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	log.Printf("listening on %s", cfg.ListenAddr)
-	log.Fatal(httpServer.ListenAndServeTLS(cfg.TLSCertPath, cfg.TLSKeyPath))
+	logger.Info("server_listening", slog.String("listen_addr", cfg.ListenAddr))
+	if err := httpServer.ListenAndServeTLS(cfg.TLSCertPath, cfg.TLSKeyPath); err != nil {
+		logger.Error("server_exited", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 }
 
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {

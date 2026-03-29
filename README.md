@@ -17,6 +17,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 - `server/server.go`
   - HTTPS server on a configurable listen address, default `:8443`
   - Conservative HTTP server timeouts to reduce slow-client resource exhaustion risk
+  - Structured JSON request logs with request/trace correlation IDs
   - JWT access-token validation via OIDC discovery + JWKS
   - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
 - `client/client.go`
@@ -33,6 +34,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 3. Verifies bearer-token signature, issuer, expiration, and audience.
 4. Accepts WebSocket connections at `/protected/socks`.
 5. Hands each upgraded connection to the SOCKS5 server implementation.
+6. Emits structured JSON logs for request lifecycle, auth failures, and tunnel open/close events.
 
 ### Client flow
 
