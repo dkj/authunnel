@@ -167,4 +167,40 @@ also gives:
 }
 ```
 
+## Resilience design note
+
+This project may later want tunnels that survive temporary network loss or a
+sleeping client machine for at least a few minutes.
+
+That is not implemented today. Current behavior is still tied closely to a
+single live websocket transport. The important constraint for current work is
+to avoid making that future harder.
+
+Design guardrails:
+
+- Treat tunnel session identity as separate from the current websocket
+  connection. Avoid spreading assumptions that `one websocket == one tunnel's
+  entire lifetime`.
+- Keep short timeouts for HTTP admission and websocket setup, but avoid adding
+  aggressive established-tunnel idle/read/write deadlines as a blanket
+  "resilience" feature. Those would work against sleep tolerance.
+- If connection limits, rate limits, or backpressure are added, prefer to scope
+  them in terms of tunnel sessions, detached sessions, and bounded buffers, not
+  only raw websocket counts.
+- Prefer shutdown logic that can later drain, park, or explicitly expire active
+  sessions instead of assuming that process shutdown must immediately destroy
+  all live tunnels.
+- Avoid burying protocol state only inside one goroutine stack or one live
+  transport object. Resumption would need explicit session state, resume
+  identifiers/tokens, and bounded buffering.
+
+If resumable tunnels are implemented later, the likely model is:
+
+- A tunnel can move between `attached`, `detached`, and `expired` states.
+- Temporary websocket loss moves a session to `detached` instead of immediately
+  closing the target TCP connection.
+- The server keeps detached sessions for a bounded grace period and under
+  bounded memory/session limits.
+- The client reconnects and resumes the existing session using an explicit
+  resume token rather than implicitly creating a new tunnel every time.
 
