@@ -204,3 +204,58 @@ If resumable tunnels are implemented later, the likely model is:
 - The client reconnects and resumes the existing session using an explicit
   resume token rather than implicitly creating a new tunnel every time.
 
+## Multiplexing and control-plane design note
+
+It may be useful later to break the current practical `1 websocket : 1 tunnel`
+shape, but that should be done carefully.
+
+A helpful distinction:
+
+- `session != websocket`
+- `control channel != data multiplexing`
+
+The first likely architectural step is an explicit session/control layer, not
+immediate multiplexing of many TCP tunnels over one websocket.
+
+Why that ordering is preferable:
+
+- A control plane can support resume/reconnect, lease renewal, shutdown/drain
+  notices, diagnostics, and explicit session expiry without immediately making
+  the byte-forwarding path much more complex.
+- Full data multiplexing adds framing, stream IDs, fairness, per-stream flow
+  control, shared-buffer accounting, and more complicated failure handling.
+- A single multiplexed websocket also creates a larger blast radius: one
+  transport failure could drop many active tunnels at once.
+
+Useful future control-plane functions could include:
+
+- session creation and resume tokens
+- attached/detached state transitions
+- heartbeat / liveness signals
+- lease renewal or explicit session expiry
+- reauthentication state for future resumes or live sessions
+- server shutdown or drain notifications
+- structured logging / user-visible diagnostics
+
+For live tunnels, prefer session-lease renewal over tying the tunnel directly to
+the original access token expiry. For example, the server could send a
+`renew_soon` control message a few minutes before expiry; the client would try
+refresh-token renewal first, then browser reauth if needed, and send only a new
+access token over the control plane. The server can then extend the session
+lease, or move the session into grace/expiry if renewal never arrives.
+
+Essential guardrails:
+
+- Send new access tokens over the control plane only. Never send refresh tokens
+  to the Authunnel server.
+- Do not hard-drop a live tunnel exactly at token expiry; use explicit
+  grace/expiry policy.
+- When renewing, validate continuity of identity and audience before extending
+  the session lease.
+- Never log bearer tokens or resume tokens.
+
+Current guardrail:
+
+- Do not spread websocket-specific assumptions deeper into the code than
+  necessary. Future work should be able to introduce a session/control layer
+  while preserving a simple and auditable per-tunnel data path.
