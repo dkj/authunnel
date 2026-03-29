@@ -6,7 +6,6 @@ require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/coder/websocket v1.8.14
 	github.com/go-jose/go-jose/v4 v4.0.5
-	github.com/gorilla/handlers v1.5.2
 	github.com/zitadel/oidc/v3 v3.45.5
 	golang.org/x/oauth2 v0.35.0
 )
@@ -14,7 +13,6 @@ require (
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/felixge/httpsnoop v1.0.3 // indirect
 	github.com/go-chi/chi/v5 v5.2.5 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect

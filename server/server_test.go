@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,108 @@ import (
 
 	"authunnel/internal/tunnelserver"
 )
+
+func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
+	cfg, err := parseServerConfig(
+		[]string{
+			"--oidc-issuer", "https://flag-issuer.example",
+			"--listen-addr", "127.0.0.1:9443",
+			"--tls-cert", "/flags/server.crt",
+			"--tls-key", "/flags/server.key",
+		},
+		func(key string) string {
+			switch key {
+			case "TOKEN_AUDIENCE":
+				return "authunnel-server"
+			case "LISTEN_ADDR":
+				return ":8443"
+			default:
+				return ""
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+
+	want := serverConfig{
+		Issuer:        "https://flag-issuer.example",
+		TokenAudience: "authunnel-server",
+		ListenAddr:    "127.0.0.1:9443",
+		TLSCertPath:   "/flags/server.crt",
+		TLSKeyPath:    "/flags/server.key",
+	}
+	if !reflect.DeepEqual(cfg, want) {
+		t.Fatalf("unexpected config: got %#v want %#v", cfg, want)
+	}
+}
+
+func TestParseServerConfigAcceptsTLSPathsFromEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+
+	if cfg.ListenAddr != ":8443" {
+		t.Fatalf("unexpected default listen addr: got %q want %q", cfg.ListenAddr, ":8443")
+	}
+	if cfg.TLSCertPath != "/env/server.crt" {
+		t.Fatalf("unexpected TLS cert path: got %q", cfg.TLSCertPath)
+	}
+	if cfg.TLSKeyPath != "/env/server.key" {
+		t.Fatalf("unexpected TLS key path: got %q", cfg.TLSKeyPath)
+	}
+}
+
+func TestParseServerConfigRejectsMissingTLSPaths(t *testing.T) {
+	_, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		default:
+			return ""
+		}
+	})
+	if err == nil {
+		t.Fatalf("expected missing TLS path configuration to fail")
+	}
+	if !strings.Contains(err.Error(), "TLS_CERT_FILE") {
+		t.Fatalf("expected error to mention missing TLS cert path, got %q", err.Error())
+	}
+}
+
+func TestParseServerConfigRejectsLegacyIssuerFlag(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{
+			"--issuer", "https://issuer.example",
+			"--token-audience", "authunnel-server",
+			"--tls-cert", "/flags/server.crt",
+			"--tls-key", "/flags/server.key",
+		},
+		func(string) string { return "" },
+	)
+	if err == nil {
+		t.Fatalf("expected legacy --issuer flag to be rejected")
+	}
+	if !strings.Contains(err.Error(), "flag provided but not defined: -issuer") {
+		t.Fatalf("unexpected error for legacy issuer flag: %q", err.Error())
+	}
+}
 
 func TestCheckTokenRequiresAuthorizationHeader(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
