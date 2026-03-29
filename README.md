@@ -15,7 +15,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 ## Components
 
 - `server/server.go`
-  - HTTPS server on `:8443`
+  - HTTPS server on a configurable listen address, default `:8443`
   - Conservative HTTP server timeouts to reduce slow-client resource exhaustion risk
   - JWT access-token validation via OIDC discovery + JWKS
   - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
@@ -28,7 +28,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 
 ### Server flow
 
-1. Reads `ISSUER` and `TOKEN_AUDIENCE`.
+1. Reads OIDC issuer, audience, listen address, and TLS file paths from flags or environment.
 2. Discovers issuer metadata and JWKS.
 3. Verifies bearer-token signature, issuer, expiration, and audience.
 4. Accepts WebSocket connections at `/protected/socks`.
@@ -59,12 +59,22 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 ### Start server
 
 ```bash
-export ISSUER='https://<issuer>'
+export OIDC_ISSUER='https://<issuer>'
 export TOKEN_AUDIENCE='authunnel-server'
+export TLS_CERT_FILE='/etc/authunnel/tls/server.crt'
+export TLS_KEY_FILE='/etc/authunnel/tls/server.key'
 
 cd server
 go run .
 ```
+
+Useful server flags and environment variables:
+
+- `--oidc-issuer` or `OIDC_ISSUER`
+- `--token-audience` or `TOKEN_AUDIENCE`
+- `--listen-addr` or `LISTEN_ADDR` with default `:8443`
+- `--tls-cert` or `TLS_CERT_FILE`
+- `--tls-key` or `TLS_KEY_FILE`
 
 ### Managed OIDC client mode
 
@@ -212,8 +222,10 @@ This imports a realm with:
 ### 2) Start Authunnel server against Keycloak
 
 ```bash
-export ISSUER='http://127.0.0.1:18080/realms/authunnel'
+export OIDC_ISSUER='http://127.0.0.1:18080/realms/authunnel'
 export TOKEN_AUDIENCE='authunnel-server'
+export TLS_CERT_FILE='../cert.pem'
+export TLS_KEY_FILE='../key.pem'
 
 cd server
 go run .
