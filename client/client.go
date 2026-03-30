@@ -40,11 +40,13 @@ type clientConfig struct {
 
 	AccessToken string
 
-	OIDCIssuer    string
-	OIDCClientID  string
-	OIDCScopes    string
-	OIDCCache     string
-	OIDCNoBrowser bool
+	OIDCIssuer       string
+	OIDCClientID     string
+	OIDCAudience     string
+	OIDCScopes       string
+	OIDCCache        string
+	OIDCNoBrowser    bool
+	OIDCRedirectPort int
 
 	WebSocketURL     string
 	UnixSocketPath   string
@@ -103,16 +105,21 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
 	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", "", "OIDC client ID used for managed login")
+	fs.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Audience/resource requested during managed login")
 	fs.StringVar(&cfg.OIDCScopes, "oidc-scopes", "openid offline_access", "Space-delimited OIDC scopes for managed login")
 	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
 	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
+	fs.IntVar(&cfg.OIDCRedirectPort, "oidc-redirect-port", 0, "Loopback port for the OIDC callback listener; 0 chooses a random port")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
 
 	hasOIDC := cfg.OIDCIssuer != "" || cfg.OIDCClientID != ""
-	if cfg.AccessToken != "" && hasOIDC {
-		return cfg, errors.New("ACCESS_TOKEN cannot be combined with --oidc-issuer/--oidc-client-id")
+	if cfg.OIDCRedirectPort < 0 || cfg.OIDCRedirectPort > 65535 {
+		return cfg, errors.New("--oidc-redirect-port must be between 0 and 65535")
+	}
+	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCRedirectPort != 0) {
+		return cfg, errors.New("ACCESS_TOKEN cannot be combined with managed OIDC flags")
 	}
 	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
 		return cfg, errors.New("managed OIDC mode requires both --oidc-issuer and --oidc-client-id")

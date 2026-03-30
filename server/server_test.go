@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -422,7 +423,7 @@ func newJWTTestIssuer(t *testing.T, audience string) (string, *http.Client, stri
 	}
 
 	var issuerURL string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			writeJSON(t, w, map[string]string{
@@ -473,4 +474,17 @@ func writeJSON(t *testing.T, w http.ResponseWriter, payload any) {
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		t.Fatalf("encode JSON: %v", err)
 	}
+}
+
+func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on IPv4 loopback: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
 }

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,15 +48,17 @@ type browserOpener func(context.Context, string) error
 // cached tokens when they are still safely valid, refreshes when possible, and
 // only falls back to interactive PKCE when needed.
 type managedOIDCTokenSource struct {
-	issuer      string
-	clientID    string
-	scopes      string
-	cachePath   string
-	noBrowser   bool
-	httpClient  *http.Client
-	output      io.Writer
-	openBrowser browserOpener
-	now         func() time.Time
+	issuer       string
+	clientID     string
+	audience     string
+	scopes       string
+	cachePath    string
+	noBrowser    bool
+	redirectPort int
+	httpClient   *http.Client
+	output       io.Writer
+	openBrowser  browserOpener
+	now          func() time.Time
 
 	mu        sync.Mutex
 	discovery oauth2.Endpoint
@@ -63,10 +66,11 @@ type managedOIDCTokenSource struct {
 
 // tokenCache is intentionally a single JSON document so developers can inspect
 // and delete it easily during debugging. Cache entries are scoped to issuer,
-// client ID, and scopes to avoid cross-provider token reuse.
+// client ID, audience, and scopes to avoid cross-provider token reuse.
 type tokenCache struct {
 	Issuer       string    `json:"issuer"`
 	ClientID     string    `json:"client_id"`
+	Audience     string    `json:"audience,omitempty"`
 	Scopes       string    `json:"scopes"`
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token"`
@@ -92,15 +96,17 @@ func newAuthTokenSource(cfg clientConfig) (authTokenSource, error) {
 			opener = defaultBrowserOpener
 		}
 		return &managedOIDCTokenSource{
-			issuer:      cfg.OIDCIssuer,
-			clientID:    cfg.OIDCClientID,
-			scopes:      normalizeScopes(cfg.OIDCScopes),
-			cachePath:   cfg.OIDCCache,
-			noBrowser:   cfg.OIDCNoBrowser,
-			httpClient:  client,
-			output:      output,
-			openBrowser: opener,
-			now:         time.Now,
+			issuer:       cfg.OIDCIssuer,
+			clientID:     cfg.OIDCClientID,
+			audience:     cfg.OIDCAudience,
+			scopes:       normalizeScopes(cfg.OIDCScopes),
+			cachePath:    cfg.OIDCCache,
+			noBrowser:    cfg.OIDCNoBrowser,
+			redirectPort: cfg.OIDCRedirectPort,
+			httpClient:   client,
+			output:       output,
+			openBrowser:  opener,
+			now:          time.Now,
 		}, nil
 	default:
 		return nil, errors.New("unknown authentication mode")
@@ -147,7 +153,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context) (string, error
 	if cache.RefreshToken != "" {
 		refreshed, err := s.refreshToken(ctx, cache)
 		if err == nil {
-			nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.scopes, refreshed)
+			nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.scopes, refreshed)
 			if err := s.saveCache(nextCache); err != nil {
 				return "", err
 			}
@@ -159,7 +165,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context) (string, error
 	if err != nil {
 		return "", err
 	}
-	nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.scopes, token)
+	nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.scopes, token)
 	if err := s.saveCache(nextCache); err != nil {
 		return "", err
 	}
@@ -201,7 +207,7 @@ func (s *managedOIDCTokenSource) loadCache() (tokenCache, error) {
 	if err := json.Unmarshal(data, &cache); err != nil {
 		return tokenCache{}, fmt.Errorf("parse OIDC token cache: %w", err)
 	}
-	if cache.Issuer != s.issuer || cache.ClientID != s.clientID || normalizeScopes(cache.Scopes) != s.scopes {
+	if cache.Issuer != s.issuer || cache.ClientID != s.clientID || cache.Audience != s.audience || normalizeScopes(cache.Scopes) != s.scopes {
 		return tokenCache{}, nil
 	}
 	return cache, nil
@@ -253,7 +259,11 @@ func (s *managedOIDCTokenSource) refreshToken(ctx context.Context, cache tokenCa
 }
 
 func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.Token, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listenAddr := "127.0.0.1:0"
+	if s.redirectPort != 0 {
+		listenAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(s.redirectPort))
+	}
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen for OIDC callback: %w", err)
 	}
@@ -311,11 +321,14 @@ func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.
 		}
 	}()
 
-	authURL := config.AuthCodeURL(
-		state,
+	authCodeOptions := []oauth2.AuthCodeOption{
 		oauth2.SetAuthURLParam("code_challenge", challengeValue),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
-	)
+	}
+	if s.audience != "" {
+		authCodeOptions = append(authCodeOptions, oauth2.SetAuthURLParam("audience", s.audience))
+	}
+	authURL := config.AuthCodeURL(state, authCodeOptions...)
 	fmt.Fprintf(s.output, "Open this URL to authenticate:\n%s\n", authURL)
 	if !s.noBrowser {
 		if err := s.openBrowser(ctx, authURL); err != nil {
@@ -390,10 +403,11 @@ func tokenUsable(token *oauth2.Token, now time.Time) bool {
 	return token.Expiry.After(now.Add(tokenReuseWindow))
 }
 
-func tokenCacheFromOAuth2Token(issuer, clientID, scopes string, token *oauth2.Token) tokenCache {
+func tokenCacheFromOAuth2Token(issuer, clientID, audience, scopes string, token *oauth2.Token) tokenCache {
 	cache := tokenCache{
 		Issuer:       issuer,
 		ClientID:     clientID,
+		Audience:     audience,
 		Scopes:       scopes,
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,
