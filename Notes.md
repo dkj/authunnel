@@ -11,6 +11,9 @@ Current auth model:
 
 ### server setup
 
+Assumes the localhost server cert `cert.pem` and key `key.pem` were signed by
+the local dev CA `dev-ca.pem` described below.
+
 ```bash
 export OIDC_ISSUER=https://dev-125016.okta.com/oauth2/default
 export TOKEN_AUDIENCE=authunnel-server
@@ -20,10 +23,11 @@ export TLS_KEY_FILE=$PWD/key.pem
 (cd server; go run .)
 ```
 
-Check self signed cert working ok:
+Check the localhost TLS setup working ok. The smoke test should trust the CA
+certificate `dev-ca.pem`, not the leaf server certificate `cert.pem`:
 
 ```bash
-curl --cacert cert.pem https://localhost:8443; echo
+curl --cacert dev-ca.pem https://localhost:8443; echo
 ```
 should give something like:
 
@@ -92,8 +96,10 @@ should give something like:
 
 ##### to our server
 
+Again, trust `dev-ca.pem` here rather than `cert.pem`:
+
 ```bash
-curl -H "Authorization: Bearer $ACCESS_TOKEN" --cacert cert.pem https://localhost:8443/protected; echo
+curl -H "Authorization: Bearer $ACCESS_TOKEN" --cacert dev-ca.pem https://localhost:8443/protected; echo
 ```
 should return something like:
 ```text
@@ -102,7 +108,7 @@ Protected OK 2024-08-01 11:30:37.729193176 +0000 UTC m=+7.188534380
 
 #### so try to run proper client
 ```bash
-SSL_CERT_FILE=cert.pem go run ./client \
+SSL_CERT_FILE=dev-ca.pem go run ./client \
   --oidc-issuer "$OIDC_ISSUER" \
   --oidc-client-id "$CLIENT_ID" \
   --oidc-audience "$TOKEN_AUDIENCE" \
@@ -126,22 +132,140 @@ audience explicitly with `--oidc-audience`.
 
 ## Dev reminders
 
-### self-signed cert creation
+### local CA and localhost cert creation
 
-https://github.com/denji/golang-tls ?
+For local testing on macOS, prefer a tiny local CA plus a localhost server
+cert signed by that CA. A self-signed leaf often still fails macOS/Go
+verification with:
 
-```bash
-openssl req -newkey rsa:2048 -new -nodes -x509 -days 3650 -keyout key.pem -out cert.pem -addext "subjectAltName = DNS:localhost"
+```text
+x509: "localhost" certificate is not standards compliant
 ```
-and inspect
+
+#### create a local CA
+
 ```bash
-openssl x509 -text -noout -in cert.pem | grep -A1 Alternative
+rm -f dev-ca.key dev-ca.pem dev-ca.srl cert.pem key.pem localhost.csr localhost.ext
+
+openssl req \
+  -x509 \
+  -newkey rsa:2048 \
+  -nodes \
+  -days 3650 \
+  -subj "/CN=Authunnel Local Dev CA" \
+  -keyout dev-ca.key \
+  -out dev-ca.pem \
+  -addext "basicConstraints = critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage = critical,keyCertSign,cRLSign" \
+  -addext "subjectKeyIdentifier = hash"
+chmod 600 dev-ca.key
+```
+
+#### create a localhost server key and CSR
+
+```bash
+openssl req \
+  -newkey rsa:2048 \
+  -new \
+  -nodes \
+  -subj "/CN=localhost" \
+  -keyout key.pem \
+  -out localhost.csr \
+  -addext "subjectAltName = DNS:localhost,IP:127.0.0.1" \
+  -addext "basicConstraints = critical,CA:FALSE" \
+  -addext "keyUsage = critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage = serverAuth"
+chmod 600 key.pem
+```
+
+Write the signing extensions:
+```bash
+cat > localhost.ext <<'EOF'
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+EOF
+```
+
+#### sign the localhost cert with the local CA
+
+```bash
+openssl x509 \
+  -req \
+  -in localhost.csr \
+  -CA dev-ca.pem \
+  -CAkey dev-ca.key \
+  -CAcreateserial \
+  -out cert.pem \
+  -days 825 \
+  -sha256 \
+  -extfile localhost.ext
+```
+
+Inspect the server cert:
+```bash
+openssl x509 -text -noout -in cert.pem | grep -A1 "Issuer:\|Subject:\|Subject Alternative Name\|Basic Constraints\|Key Usage\|Extended Key Usage"
 ```
 gives
 ```
+        Issuer: CN=Authunnel Local Dev CA
+        Subject: CN=localhost
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+            X509v3 Key Usage: critical
+                Digital Signature, Key Encipherment
+            X509v3 Extended Key Usage:
+                TLS Web Server Authentication
             X509v3 Subject Alternative Name: 
-                DNS:localhost
+                DNS:localhost, IP Address:127.0.0.1
 ```
+
+#### trust the local CA on macOS
+
+Either import `dev-ca.pem` into Keychain Access and mark it trusted, or run:
+
+```bash
+security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db dev-ca.pem
+```
+
+If you later want to remove it:
+
+```bash
+security find-certificate -c "Authunnel Local Dev CA" -a -Z ~/Library/Keychains/login.keychain-db
+security delete-certificate -c "Authunnel Local Dev CA" ~/Library/Keychains/login.keychain-db
+```
+
+Then use it with Authunnel:
+
+```bash
+export TLS_CERT_FILE=$PWD/cert.pem
+export TLS_KEY_FILE=$PWD/key.pem
+
+(cd server; go run .)
+```
+
+From another shell, verify the cert and endpoint:
+
+```bash
+curl --cacert dev-ca.pem https://localhost:8443
+```
+
+For the client, if Keychain trust is in place, the default Go/macOS verifier
+should accept the server certificate. Keeping `SSL_CERT_FILE` pointed at the CA
+bundle is still reasonable:
+
+```bash
+SSL_CERT_FILE=$PWD/dev-ca.pem go run ./client \
+  --oidc-issuer "$OIDC_ISSUER" \
+  --oidc-client-id "$CLIENT_ID" \
+  --oidc-audience "$TOKEN_AUDIENCE" \
+  --oidc-redirect-port 38081 \
+  --unix-socket "$PWD/proxy.sock"
+```
+
+This is only for local development. For anything beyond localhost testing, use
+a cert chain the client already trusts instead of shipping a private dev CA.
 
 ## OAuth2 CLI client usage
 
