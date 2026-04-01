@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	socks5 "github.com/armon/go-socks5"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
@@ -134,6 +135,69 @@ func TestLogTunnelCloseEvaluatesDurationWhenDeferredFunctionRuns(t *testing.T) {
 	}
 	if duration < 10 {
 		t.Fatalf("expected duration_ms to reflect elapsed time, got %v", duration)
+	}
+}
+
+func TestLoggerWithAccessTokenClaimsAddsUserIdentity(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	logger = loggerWithAccessTokenClaims(logger, &oidc.AccessTokenClaims{
+		TokenClaims: oidc.TokenClaims{
+			Subject:  "user-123",
+			ClientID: "authunnel-cli",
+		},
+		Claims: map[string]any{
+			"preferred_username": "dev-user",
+			"email":              "dev-user@example.com",
+		},
+	})
+
+	logger.Info("tunnel_open")
+
+	entry := parseLogEntryByMessage(t, logBuf.String(), "tunnel_open")
+	if got := entry["user"]; got != "dev-user" {
+		t.Fatalf("unexpected user: got %#v", got)
+	}
+	if got := entry["email"]; got != "dev-user@example.com" {
+		t.Fatalf("unexpected email: got %#v", got)
+	}
+	if got := entry["subject"]; got != "user-123" {
+		t.Fatalf("unexpected subject: got %#v", got)
+	}
+	if got := entry["client_id"]; got != "authunnel-cli" {
+		t.Fatalf("unexpected client_id: got %#v", got)
+	}
+}
+
+func TestObservedSOCKSRuleSetLogsRequestedDestinationAtDebug(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, ok := observedSOCKSRuleSet{logger: logger}.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			FQDN: "db.internal",
+			Port: 5432,
+		},
+	})
+	if !ok {
+		t.Fatal("expected CONNECT request to be allowed")
+	}
+
+	details := socksConnectDetailsFromContext(ctx)
+	if details.TargetHost != "db.internal" {
+		t.Fatalf("unexpected target host: got %q", details.TargetHost)
+	}
+	if details.TargetPort != 5432 {
+		t.Fatalf("unexpected target port: got %d", details.TargetPort)
+	}
+
+	entry := parseLogEntryByMessage(t, logBuf.String(), "socks_connect_requested")
+	if got := entry["target_host"]; got != "db.internal" {
+		t.Fatalf("unexpected target_host: got %#v", got)
+	}
+	if got := entry["target_port"]; got != float64(5432) {
+		t.Fatalf("unexpected target_port: got %#v", got)
 	}
 }
 

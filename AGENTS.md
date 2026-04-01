@@ -17,6 +17,7 @@ Instructions for contributors and coding agents working in this repository.
 
 2. **Preserve auditability**
    - Add comments for protocol logic (OAuth2, SOCKS5, websocket bridging), especially where byte-level behavior is implemented.
+   - Keep code comments up to date when behavior changes; stale comments are treated as bugs because they make review and auditing less reliable.
    - Avoid hidden side effects and global mutable state.
    - Favor deterministic behavior and clear startup/runtime failure modes.
 

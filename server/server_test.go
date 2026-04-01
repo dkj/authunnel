@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,7 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 		ListenAddr:    "127.0.0.1:9443",
 		TLSCertPath:   "/flags/server.crt",
 		TLSKeyPath:    "/flags/server.key",
+		LogLevel:      slog.LevelInfo,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("unexpected config: got %#v want %#v", cfg, want)
@@ -84,6 +86,82 @@ func TestParseServerConfigAcceptsTLSPathsFromEnv(t *testing.T) {
 	}
 	if cfg.TLSKeyPath != "/env/server.key" {
 		t.Fatalf("unexpected TLS key path: got %q", cfg.TLSKeyPath)
+	}
+	if cfg.LogLevel != slog.LevelInfo {
+		t.Fatalf("unexpected default log level: got %v want %v", cfg.LogLevel, slog.LevelInfo)
+	}
+}
+
+func TestParseServerConfigAcceptsLogLevelFromFlagAndEnv(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--log-level", "debug",
+		"--tls-cert", "/flags/server.crt",
+		"--tls-key", "/flags/server.key",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "LOG_LEVEL":
+			return "warn"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.LogLevel != slog.LevelDebug {
+		t.Fatalf("unexpected log level: got %v want %v", cfg.LogLevel, slog.LevelDebug)
+	}
+}
+
+func TestParseServerConfigAllowsValidFlagWhenEnvLogLevelIsInvalid(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--log-level", "debug",
+		"--tls-cert", "/flags/server.crt",
+		"--tls-key", "/flags/server.key",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "LOG_LEVEL":
+			return "verbose"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.LogLevel != slog.LevelDebug {
+		t.Fatalf("unexpected log level: got %v want %v", cfg.LogLevel, slog.LevelDebug)
+	}
+}
+
+func TestParseServerConfigRejectsInvalidLogLevel(t *testing.T) {
+	_, err := parseServerConfig([]string{
+		"--log-level", "verbose",
+		"--tls-cert", "/flags/server.crt",
+		"--tls-key", "/flags/server.key",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		default:
+			return ""
+		}
+	})
+	if err == nil {
+		t.Fatal("expected invalid log level to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid log level") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
