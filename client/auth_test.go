@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"flag"
 	"io"
 	"net"
 	"net/http"
@@ -20,6 +22,35 @@ import (
 	"testing"
 	"time"
 )
+
+func TestParseClientConfigHelpFlag(t *testing.T) {
+	for _, arg := range []string{"-h", "--help"} {
+		_, err := parseClientConfig([]string{arg}, func(string) string { return "" })
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("parseClientConfig(%q) error = %v, want flag.ErrHelp", arg, err)
+		}
+	}
+}
+
+func TestParseClientConfigHelpPositional(t *testing.T) {
+	_, err := parseClientConfig([]string{"help"}, func(string) string { return "" })
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("parseClientConfig(\"help\") error = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestParseClientConfigAccessTokenFlag(t *testing.T) {
+	cfg, err := parseClientConfig([]string{"--access-token", "tok123"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("parseClientConfig failed: %v", err)
+	}
+	if cfg.AccessToken != "tok123" {
+		t.Fatalf("unexpected AccessToken: got %q want %q", cfg.AccessToken, "tok123")
+	}
+	if cfg.AuthMode != authModeManual {
+		t.Fatalf("unexpected AuthMode: got %q want %q", cfg.AuthMode, authModeManual)
+	}
+}
 
 func TestParseClientConfigRejectsMixedManualAndOIDCAuth(t *testing.T) {
 	_, err := parseClientConfig([]string{"--oidc-issuer", "http://issuer", "--oidc-client-id", "client"}, func(key string) string {
@@ -69,8 +100,22 @@ func TestParseClientConfigRejectsManualAuthWithManagedOIDCFlags(t *testing.T) {
 		}
 		return ""
 	})
-	if err == nil || !strings.Contains(err.Error(), "ACCESS_TOKEN cannot be combined") {
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
 		t.Fatalf("expected manual/OIDC validation error, got %v", err)
+	}
+}
+
+func TestParseClientConfigRejectsAccessTokenWithOIDCCacheOrNoBrowser(t *testing.T) {
+	for _, extra := range [][]string{
+		{"--oidc-cache", "/tmp/tokens.json"},
+		{"--oidc-no-browser"},
+		{"--oidc-scopes", "openid"},
+	} {
+		args := append([]string{"--access-token", "tok"}, extra...)
+		_, err := parseClientConfig(args, func(string) string { return "" })
+		if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+			t.Errorf("parseClientConfig(%v) expected conflict error, got %v", args, err)
+		}
 	}
 }
 

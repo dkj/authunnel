@@ -40,7 +40,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 ### Client flow
 
 1. Either:
-   - uses `ACCESS_TOKEN` as a manual fallback, or
+   - uses a bearer token supplied via `--access-token` or the `ACCESS_TOKEN` environment variable, or
    - runs managed OIDC mode when `--oidc-issuer` and `--oidc-client-id` are configured.
 2. In managed mode the client:
    - reuses a cached token when it remains valid for more than 60 seconds,
@@ -106,15 +106,16 @@ Useful client flags:
 - `--oidc-scopes` with default `openid offline_access`
 - `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json`
 - `--oidc-no-browser` to print the URL without attempting automatic browser launch
+- `--access-token` to supply a bearer token directly (not recommended; mutually exclusive with all OIDC flags)
 - `--ws-url`
 - `--unix-socket`
 - `--proxycommand`
 
 On first use the client prints the authorization URL to `stderr` and tries to open the system browser. Subsequent runs reuse the cache or refresh token when possible.
 
-### Manual `ACCESS_TOKEN` fallback
+### Manual token (not recommended; for testing only)
 
-This remains available for non-interactive workflows.
+A pre-obtained bearer token can be supplied via the `ACCESS_TOKEN` environment variable or the `--access-token` flag. This is mutually exclusive with all managed OIDC flags.
 
 ```bash
 export ACCESS_TOKEN='<access-token>'
@@ -125,7 +126,8 @@ SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
 ProxyCommand example with a pre-supplied token:
 
 ```bash
-ACCESS_TOKEN="$ACCESS_TOKEN" /path/to/authunnel-client \
+/path/to/authunnel-client \
+  --access-token "$ACCESS_TOKEN" \
   --ws-url https://localhost:8443/protected/socks \
   --proxycommand internal-host 22
 ```
