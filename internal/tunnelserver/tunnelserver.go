@@ -8,18 +8,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/zitadel/oidc/v3/pkg/client"
+	"github.com/zitadel/oidc/v3/pkg/client/rp"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
+	"github.com/zitadel/oidc/v3/pkg/op"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
-
-	socks5 "github.com/armon/go-socks5"
-	"github.com/zitadel/oidc/v3/pkg/client"
-	"github.com/zitadel/oidc/v3/pkg/client/rp"
-	"github.com/zitadel/oidc/v3/pkg/oidc"
-	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"github.com/coder/websocket"
 )
@@ -77,7 +75,7 @@ func (v *JWTTokenValidator) ValidateAccessToken(ctx context.Context, token strin
 //   - "/" for a simple liveness response
 //   - "/protected" for token-validation smoke testing
 //   - "/protected/socks" for the authenticated websocket-to-SOCKS bridge
-func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
+func NewHandler(validator TokenValidator, socks SOCKSServer) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
@@ -94,8 +92,7 @@ func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 			return
 		}
-		ok := CheckToken(w, r, validator)
-		if !ok {
+		if _, ok := validateRequestToken(w, r, validator); !ok {
 			return
 		}
 		if r.Method == http.MethodHead {
@@ -109,7 +106,7 @@ func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 		if !checkWebSocketRequest(w, r) {
 			return
 		}
-		ok := CheckToken(w, r, validator)
+		claims, ok := validateRequestToken(w, r, validator)
 		if !ok {
 			return
 		}
@@ -127,11 +124,23 @@ func NewHandler(validator TokenValidator, socks *socks5.Server) *http.ServeMux {
 		defer c.CloseNow()
 		tunnelLogger := loggerFromContext(r.Context()).With(
 			slog.String("tunnel_id", newLogID()),
+			slog.String("remote_ip", requestRemoteIP(r)),
 		)
+		// Carry token identity into the long-lived tunnel logger once, so tunnel
+		// lifecycle and per-destination SOCKS logs do not need to re-parse or
+		// re-validate bearer claims after the websocket upgrade succeeds.
+		tunnelLogger = loggerWithAccessTokenClaims(tunnelLogger, claims)
 		tunnelStart := time.Now()
 		tunnelLogger.Info("tunnel_open")
 		defer logTunnelClose(tunnelLogger, tunnelStart)
-		socks.ServeConn(websocket.NetConn(r.Context(), c, websocket.MessageBinary))
+		// Wrap the upgraded websocket connection so the SOCKS layer can recover the
+		// per-tunnel logger and emit destination logs with the same request/tunnel
+		// correlation fields.
+		if err := socks.ServeConn(newObservedTunnelConn(websocket.NetConn(r.Context(), c, websocket.MessageBinary), tunnelLogger)); err != nil {
+			tunnelLogger.Warn("socks_session_failed",
+				slog.String("error", err.Error()),
+			)
+		}
 	})
 	return mux
 }
@@ -190,22 +199,32 @@ func checkWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
 // verification to the configured validator. The caller decides which routes
 // require protection and how to continue once validation succeeds.
 func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator) bool {
+	_, ok := validateRequestToken(w, r, validator)
+	return ok
+}
+
+// validateRequestToken is the internal variant used by websocket routes that
+// need the validated claims for downstream logging. The public CheckToken
+// helper intentionally keeps the older bool-only contract for existing tests
+// and handlers that only need admission control.
+func validateRequestToken(w http.ResponseWriter, r *http.Request, validator TokenValidator) (*oidc.AccessTokenClaims, bool) {
 	auth := r.Header.Get("authorization")
 	if auth == "" {
 		http.Error(w, "auth header missing", http.StatusUnauthorized)
-		return false
+		return nil, false
 	}
 	if !strings.HasPrefix(auth, oidc.PrefixBearer) {
 		http.Error(w, "invalid header", http.StatusUnauthorized)
-		return false
+		return nil, false
 	}
 	if validator == nil {
 		http.Error(w, "token validator unavailable", http.StatusInternalServerError)
-		return false
+		return nil, false
 	}
 
 	token := strings.TrimPrefix(auth, oidc.PrefixBearer)
-	if _, err := validator.ValidateAccessToken(r.Context(), token); err != nil {
+	claims, err := validator.ValidateAccessToken(r.Context(), token)
+	if err != nil {
 		// Do not reflect verifier details (signature, issuer/audience mismatch,
 		// expiry parsing errors, etc.) back to callers. Returning a fixed message
 		// keeps the auth surface predictable while preserving diagnostics in logs.
@@ -213,9 +232,9 @@ func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator
 			slog.String("error", err.Error()),
 		)
 		http.Error(w, "forbidden", http.StatusForbidden)
-		return false
+		return nil, false
 	}
-	return true
+	return claims, true
 }
 
 func headerContainsToken(header http.Header, name, expected string) bool {

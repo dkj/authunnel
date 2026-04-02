@@ -2,25 +2,32 @@
 
 ## PoC reminders
 
-using two Okta, https://dev-125016-admin.okta.com, "Apps":
-- for real client `CLIENT_ID`
-- for token checking on server `CC_CLIENT_ID` (should not be  needed?)
+Current auth model:
 
-### server server/server.go setup
+- The client is a public OIDC client and uses Authorization Code + PKCE.
+- The server validates JWT access tokens locally via issuer discovery + JWKS.
+- The server requires a configured token audience in the access-token `aud` claim.
+- No separate resource-server client secret is needed for Authunnel startup.
+
+### server setup
+
+Assumes the localhost server cert `cert.pem` and key `key.pem` were signed by
+the local dev CA `dev-ca.pem` described below.
 
 ```bash
-export ISSUER=https://dev-125016.okta.com/oauth2/default
-export CC_CLIENT_ID=0oaigwf79lMMYlvA64x7
-export CC_CLIENT_SECRET=EB-SrGvgMQY8jVQaKJP7JEHImDLWWYZ7YDHO6yyXdCYLlmmVe71rSHxYBl9eA7i_
+export OIDC_ISSUER=https://dev-125016.okta.com/oauth2/default
+export TOKEN_AUDIENCE=authunnel-server
+export TLS_CERT_FILE=$PWD/cert.pem
+export TLS_KEY_FILE=$PWD/key.pem
 
-(cd server; CLIENT_ID=$CC_CLIENT_ID CLIENT_SECRET=$CC_CLIENT_SECRET go run server.go )
+(cd server; go run .)
 ```
-####
 
-Check self signed cert working ok:
+Check the localhost TLS setup working ok. The smoke test should trust the CA
+certificate `dev-ca.pem`, not the leaf server certificate `cert.pem`:
 
 ```bash
-curl --cacert cert.pem https://localhost:8443; echo
+curl --cacert dev-ca.pem https://localhost:8443; echo
 ```
 should give something like:
 
@@ -28,21 +35,29 @@ should give something like:
 OK 2024-08-01 11:16:24.39347267 +0000 UTC m=+2361.464048826
 ```
 
-### client client/client.go setup
+### client setup for manual token testing
 
 
 ```bash
 export ISSUER=https://dev-125016.okta.com/oauth2/default
-export CLIENT_ID=0oaig0t59zmBb32vX4x7
+export CLIENT_ID=<public-client-id>
 ```
 
-and get an access token:
+Get an access token:
 
 ```bash
-oauth2c $ISSUER --client-id=$CLIENT_ID --grant-type=authorization_code --auth-method=none --response-mode=form_post --response-types=code  --scopes=openid,email,profile --pkce | tee tmp.json | jq -c .
+oauth2c "$ISSUER" \
+  --client-id="$CLIENT_ID" \
+  --grant-type=authorization_code \
+  --auth-method=none \
+  --response-mode=form_post \
+  --response-types=code \
+  --scopes=openid,email,profile \
+  --pkce | tee tmp.json | jq -c .
 ```
 
-will go via web browser and login, which will need to access local port created by `outh2c`. Then get access token:
+This goes via the browser and a local callback port opened by `oauth2c`.
+Then get the access token:
 
 ```bash
 export ACCESS_TOKEN=$(jq -r .access_token tmp.json)
@@ -50,20 +65,41 @@ export ACCESS_TOKEN=$(jq -r .access_token tmp.json)
 
 #### check access token access
 
-##### direct with IdP:
-(duplicated below ... )
+##### inspect the JWT payload locally
+
+The important field now is `aud`. It must include the Authunnel server audience
+configured in `TOKEN_AUDIENCE`.
+
 ```bash
-curl -s --location --request POST  $ISSUER/v1/introspect --header 'Content-Type: application/x-www-form-urlencoded' --header 'Authorization: Basic '$(echo -n "$CC_CLIENT_ID:$CC_CLIENT_SECRET" | base64 -w0)  --data-urlencode 'token_type_hint=access_token' --data-urlencode token=$ACCESS_TOKEN | jq -c .
+jq -R '
+  split(".")[1]
+  | gsub("-"; "+")
+  | gsub("_"; "/")
+  | . + (if (length % 4) == 2 then "==" elif (length % 4) == 3 then "=" else "" end)
+  | @base64d
+  | fromjson
+' <<<"$ACCESS_TOKEN"
 ```
+
 should give something like:
 ```json
-{"active":true,"scope":"email profile openid","username":"david.jackson+okta@sanger.ac.uk","exp":1722514880,"iat":1722511280,"sub":"david.jackson+okta@sanger.ac.uk","aud":"api://default","iss":"https://dev-125016.okta.com/oauth2/default","jti":"AT.MNy0cnGf9MNx6vvxMPSsje4AF-9saYgtoCd2B_YhPNE","token_type":"Bearer","client_id":"0oaig0t59zmBb32vX4x7","uid":"00uxr08tjdMUabnxA4x6"}
+{
+  "aud": [
+    "authunnel-server"
+  ],
+  "iss": "https://dev-125016.okta.com/oauth2/default",
+  "sub": "user@example.com",
+  "exp": 1722514880,
+  "iat": 1722511280
+}
 ```
 
 ##### to our server
 
+Again, trust `dev-ca.pem` here rather than `cert.pem`:
+
 ```bash
-curl -H "Authorization: Bearer $ACCESS_TOKEN" --cacert cert.pem https://localhost:8443/protected; echo
+curl -H "Authorization: Bearer $ACCESS_TOKEN" --cacert dev-ca.pem https://localhost:8443/protected; echo
 ```
 should return something like:
 ```text
@@ -72,32 +108,164 @@ Protected OK 2024-08-01 11:30:37.729193176 +0000 UTC m=+7.188534380
 
 #### so try to run proper client
 ```bash
-SSL_CERT_FILE=cert.pem go run client/client.go
+SSL_CERT_FILE=dev-ca.pem go run ./client \
+  --oidc-issuer "$OIDC_ISSUER" \
+  --oidc-client-id "$CLIENT_ID" \
+  --oidc-audience "$TOKEN_AUDIENCE" \
+  --oidc-redirect-port 38081 \
+  --unix-socket "$PWD/proxy.sock"
 ```
 and use the unix socket that provides for the proxy:
 ```bash
 all_proxy=socks5h://localhost$PWD/proxy.sock curl https://www.bbc.co.uk
 ```
 
+For providers that require an exact loopback callback URL, register:
+
+```text
+http://127.0.0.1:38081/callback
+```
+
+For Auth0-style custom APIs, also make sure the managed client sends the API
+audience explicitly with `--oidc-audience`.
+
 
 ## Dev reminders
 
-### self-signed cert creation
+### local CA and localhost cert creation
 
-https://github.com/denji/golang-tls ?
+For local testing on macOS, prefer a tiny local CA plus a localhost server
+cert signed by that CA. A self-signed leaf often still fails macOS/Go
+verification with:
 
-```bash
-openssl req -newkey rsa:2048 -new -nodes -x509 -days 3650 -keyout key.pem -out cert.pem -addext "subjectAltName = DNS:localhost"
+```text
+x509: "localhost" certificate is not standards compliant
 ```
-and inspect
+
+#### create a local CA
+
 ```bash
-openssl x509 -text -noout -in cert.pem | grep -A1 Alternative
+rm -f dev-ca.key dev-ca.pem dev-ca.srl cert.pem key.pem localhost.csr localhost.ext
+
+openssl req \
+  -x509 \
+  -newkey rsa:2048 \
+  -nodes \
+  -days 3650 \
+  -subj "/CN=Authunnel Local Dev CA" \
+  -keyout dev-ca.key \
+  -out dev-ca.pem \
+  -addext "basicConstraints = critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage = critical,keyCertSign,cRLSign" \
+  -addext "subjectKeyIdentifier = hash"
+chmod 600 dev-ca.key
+```
+
+#### create a localhost server key and CSR
+
+```bash
+openssl req \
+  -newkey rsa:2048 \
+  -new \
+  -nodes \
+  -subj "/CN=localhost" \
+  -keyout key.pem \
+  -out localhost.csr \
+  -addext "subjectAltName = DNS:localhost,IP:127.0.0.1" \
+  -addext "basicConstraints = critical,CA:FALSE" \
+  -addext "keyUsage = critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage = serverAuth"
+chmod 600 key.pem
+```
+
+Write the signing extensions:
+```bash
+cat > localhost.ext <<'EOF'
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+EOF
+```
+
+#### sign the localhost cert with the local CA
+
+```bash
+openssl x509 \
+  -req \
+  -in localhost.csr \
+  -CA dev-ca.pem \
+  -CAkey dev-ca.key \
+  -CAcreateserial \
+  -out cert.pem \
+  -days 825 \
+  -sha256 \
+  -extfile localhost.ext
+```
+
+Inspect the server cert:
+```bash
+openssl x509 -text -noout -in cert.pem | grep -A1 "Issuer:\|Subject:\|Subject Alternative Name\|Basic Constraints\|Key Usage\|Extended Key Usage"
 ```
 gives
 ```
+        Issuer: CN=Authunnel Local Dev CA
+        Subject: CN=localhost
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+            X509v3 Key Usage: critical
+                Digital Signature, Key Encipherment
+            X509v3 Extended Key Usage:
+                TLS Web Server Authentication
             X509v3 Subject Alternative Name: 
-                DNS:localhost
+                DNS:localhost, IP Address:127.0.0.1
 ```
+
+#### trust the local CA on macOS
+
+Either import `dev-ca.pem` into Keychain Access and mark it trusted, or run:
+
+```bash
+security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db dev-ca.pem
+```
+
+If you later want to remove it:
+
+```bash
+security find-certificate -c "Authunnel Local Dev CA" -a -Z ~/Library/Keychains/login.keychain-db
+security delete-certificate -c "Authunnel Local Dev CA" ~/Library/Keychains/login.keychain-db
+```
+
+Then use it with Authunnel:
+
+```bash
+export TLS_CERT_FILE=$PWD/cert.pem
+export TLS_KEY_FILE=$PWD/key.pem
+
+(cd server; go run .)
+```
+
+From another shell, verify the cert and endpoint:
+
+```bash
+curl --cacert dev-ca.pem https://localhost:8443
+```
+
+For the client, if Keychain trust is in place, the default Go/macOS verifier
+should accept the server certificate. Keeping `SSL_CERT_FILE` pointed at the CA
+bundle is still reasonable:
+
+```bash
+SSL_CERT_FILE=$PWD/dev-ca.pem go run ./client \
+  --oidc-issuer "$OIDC_ISSUER" \
+  --oidc-client-id "$CLIENT_ID" \
+  --oidc-audience "$TOKEN_AUDIENCE" \
+  --oidc-redirect-port 38081 \
+  --unix-socket "$PWD/proxy.sock"
+```
+
+This is only for local development. For anything beyond localhost testing, use
+a cert chain the client already trusts instead of shipping a private dev CA.
 
 ## OAuth2 CLI client usage
 
@@ -108,64 +276,53 @@ Using
 - "auth-method" of "none" as the client can have no secret
   - pkce as recommended/ okta-enforced for such a flow
 - response-mode of "query" or "form_post" work
+- the IdP must be configured so the resulting access token includes the
+  Authunnel audience, for example `authunnel-server`
 
 ```bash
 export ISSUER=https://dev-125016.okta.com/oauth2/default
-export CLIENT_ID=0oaig0t59zmBb32vX4x7
-oauth2c $ISSUER --client-id=$CLIENT_ID --grant-type=authorization_code --auth-method=none --response-mode=form_post --response-types=code  --scopes=openid,email,profile --pkce
+export CLIENT_ID=<public-client-id>
+oauth2c "$ISSUER" --client-id="$CLIENT_ID" --grant-type=authorization_code --auth-method=none --response-mode=form_post --response-types=code --scopes=openid,email,profile --pkce
 ```
 
 If the resulting access token is set in `ACCESS_TOKEN`...
 
-### Resource Server style validation of Access Token
+### Access-token validation notes
 
-#### same client ID
+Authunnel no longer depends on token introspection with a separate server-side
+client secret. The server startup inputs are:
 
-```bash
-curl -s --location --request POST  $ISSUER/v1/introspect --header 'Content-Type: application/x-www-form-urlencoded'  --data-urlencode 'token_type_hint=access_token' --data-urlencode token=$ACCESS_TOKEN --data-urlencode client_id=$CLIENT_ID | jq .
-```
-gives
-```json
-{
-  "active": true,
-  "scope": "email profile openid",
-  "username": "david.jackson+okta@sanger.ac.uk",
-  "exp": 1713100341,
-  "iat": 1713096741,
-  "sub": "david.jackson+okta@sanger.ac.uk",
-  "aud": "api://default",
-  "iss": "https://dev-125016.okta.com/oauth2/default",
-  "jti": "AT.CyrlgVQhwUUGinMZw2qFa_P1HiY4B8lrKybxd8r7EA0",
-  "token_type": "Bearer",
-  "client_id": "0oaig0t59zmBb32vX4x7",
-  "uid": "00uxr08tjdMUabnxA4x6"
-}
-```
+- `OIDC_ISSUER`
+- `TOKEN_AUDIENCE`
+- `TLS_CERT_FILE`
+- `TLS_KEY_FILE`
 
-#### separate client credential ID and secret
+At runtime the server validates:
 
-where separate client ID and secret are set in `CC_CLIENT_ID` and `CC_CLIENT_SECRET`. (This secret is on the resource server so can be kept).
+- JWT signature via issuer JWKS
+- issuer
+- expiry
+- audience
 
-```bash
-curl -s --location --request POST  $ISSUER/v1/introspect --header 'Content-Type: application/x-www-form-urlencoded' --header 'Authorization: Basic '$(echo -n "$CC_CLIENT_ID:$CC_CLIENT_SECRET" | base64 -w0)  --data-urlencode 'token_type_hint=access_token' --data-urlencode token=$ACCESS_TOKEN | jq .
-```
-also gives:
-```json
-{
-  "active": true,
-  "scope": "email profile openid",
-  "username": "david.jackson+okta@sanger.ac.uk",
-  "exp": 1713100341,
-  "iat": 1713096741,
-  "sub": "david.jackson+okta@sanger.ac.uk",
-  "aud": "api://default",
-  "iss": "https://dev-125016.okta.com/oauth2/default",
-  "jti": "AT.CyrlgVQhwUUGinMZw2qFa_P1HiY4B8lrKybxd8r7EA0",
-  "token_type": "Bearer",
-  "client_id": "0oaig0t59zmBb32vX4x7",
-  "uid": "00uxr08tjdMUabnxA4x6"
-}
-```
+For manual debugging, either decode the JWT locally to inspect `aud`, or hit
+`/protected` with the bearer token and expect a `200 OK` only when the token is
+valid for the configured audience.
+
+### Managed OIDC client notes
+
+Managed login now has two extra knobs that matter for some IdPs:
+
+- `--oidc-audience` requests a specific API/resource audience during the
+  authorization flow.
+- `--oidc-redirect-port` binds the loopback callback listener to a fixed local
+  port instead of a random ephemeral port.
+
+Those are mainly useful when the IdP:
+
+- will not issue the right API access token unless `audience` is passed on the
+  authorize request
+- requires an exact callback URL to be pre-registered instead of allowing
+  `http://127.0.0.1/*`
 
 ## Resilience design note
 

@@ -18,6 +18,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
   - HTTPS server on a configurable listen address, default `:8443`
   - Conservative HTTP server timeouts to reduce slow-client resource exhaustion risk
   - Structured JSON request logs with request/trace correlation IDs
+  - Tunnel logs include the authenticated user, with per-destination SOCKS CONNECT logs at debug level
   - JWT access-token validation via OIDC discovery + JWKS
   - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
 - `client/client.go`
@@ -34,7 +35,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 3. Verifies bearer-token signature, issuer, expiration, and audience.
 4. Accepts WebSocket connections at `/protected/socks`.
 5. Hands each upgraded connection to the SOCKS5 server implementation.
-6. Emits structured JSON logs for request lifecycle, auth failures, and tunnel open/close events.
+6. Emits structured JSON logs for request lifecycle, auth failures, tunnel open/close events, and debug-level SOCKS CONNECT destinations.
 
 ### Client flow
 
@@ -75,6 +76,7 @@ Useful server flags and environment variables:
 - `--oidc-issuer` or `OIDC_ISSUER`
 - `--token-audience` or `TOKEN_AUDIENCE`
 - `--listen-addr` or `LISTEN_ADDR` with default `:8443`
+- `--log-level` or `LOG_LEVEL` with default `info`
 - `--tls-cert` or `TLS_CERT_FILE`
 - `--tls-key` or `TLS_KEY_FILE`
 
@@ -99,6 +101,8 @@ Useful client flags:
 
 - `--oidc-issuer`
 - `--oidc-client-id`
+- `--oidc-audience` to request a specific API/resource audience during managed login
+- `--oidc-redirect-port` to use a fixed loopback callback port instead of a random one
 - `--oidc-scopes` with default `openid offline_access`
 - `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json`
 - `--oidc-no-browser` to print the URL without attempting automatic browser launch
@@ -155,10 +159,14 @@ For managed client mode, register a **public** OIDC client with:
 
 - standard authorization code flow enabled
 - PKCE required with `S256`
-- loopback redirect URIs allowed for `http://127.0.0.1/*`
+- loopback redirect URIs allowed for `http://127.0.0.1/*` or for a specific fixed callback such as `http://127.0.0.1:38081/callback`
 - refresh tokens enabled
 - scopes that include `openid` and `offline_access`
 - an access-token audience that includes the Authunnel resource, for example `authunnel-server`
+
+Some providers, including Auth0 custom APIs, require an explicit audience/resource parameter on the authorization request. Use `--oidc-audience` in those environments.
+
+Some providers require an exact loopback callback URL instead of allowing a random local port. Use `--oidc-redirect-port` when you need to register a fixed callback URL in the IdP.
 
 Some providers require extra configuration before `offline_access` can be requested successfully. When that is not configured, override the client with `--oidc-scopes openid` and rely on cached access tokens only.
 

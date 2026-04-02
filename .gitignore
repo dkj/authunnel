@@ -23,3 +23,11 @@ go.work.sum
 
 # env file
 .env
+
+# temporary/test certificates and keys
+*.crt
+*.key
+*.pem
+*.srl
+*.csr
+*.ext

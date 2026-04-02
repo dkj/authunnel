@@ -7,12 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +30,47 @@ func TestParseClientConfigRejectsMixedManualAndOIDCAuth(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected mutual exclusivity validation error")
+	}
+}
+
+func TestParseClientConfigAcceptsOIDCAudienceAndRedirectPort(t *testing.T) {
+	cfg, err := parseClientConfig([]string{
+		"--oidc-issuer", "http://issuer",
+		"--oidc-client-id", "client",
+		"--oidc-audience", "authunnel-server",
+		"--oidc-redirect-port", "38081",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("parseClientConfig failed: %v", err)
+	}
+	if cfg.OIDCAudience != "authunnel-server" {
+		t.Fatalf("unexpected OIDC audience: got %q", cfg.OIDCAudience)
+	}
+	if cfg.OIDCRedirectPort != 38081 {
+		t.Fatalf("unexpected OIDC redirect port: got %d", cfg.OIDCRedirectPort)
+	}
+}
+
+func TestParseClientConfigRejectsInvalidOIDCRedirectPort(t *testing.T) {
+	_, err := parseClientConfig([]string{
+		"--oidc-issuer", "http://issuer",
+		"--oidc-client-id", "client",
+		"--oidc-redirect-port", "70000",
+	}, func(string) string { return "" })
+	if err == nil || !strings.Contains(err.Error(), "between 0 and 65535") {
+		t.Fatalf("expected redirect-port validation error, got %v", err)
+	}
+}
+
+func TestParseClientConfigRejectsManualAuthWithManagedOIDCFlags(t *testing.T) {
+	_, err := parseClientConfig([]string{"--oidc-audience", "authunnel-server"}, func(key string) string {
+		if key == "ACCESS_TOKEN" {
+			return "token"
+		}
+		return ""
+	})
+	if err == nil || !strings.Contains(err.Error(), "ACCESS_TOKEN cannot be combined") {
+		t.Fatalf("expected manual/OIDC validation error, got %v", err)
 	}
 }
 
@@ -184,12 +227,90 @@ func TestManagedOIDCTokenSourceRejectsCallbackStateMismatch(t *testing.T) {
 	}
 }
 
+func TestManagedOIDCTokenSourceIncludesAudienceAndConfiguredRedirectPortInAuthURL(t *testing.T) {
+	provider := newFakeOIDCProvider(t)
+	redirectPort := freeLoopbackPortForTest(t)
+
+	source := &managedOIDCTokenSource{
+		issuer:       provider.issuer(),
+		clientID:     "authunnel-cli",
+		audience:     "authunnel-server",
+		scopes:       normalizeScopes("openid offline_access"),
+		cachePath:    filepathForTest(t, "tokens.json"),
+		redirectPort: redirectPort,
+		httpClient:   provider.server.Client(),
+		output:       io.Discard,
+		openBrowser: func(ctx context.Context, authURL string) error {
+			parsed, err := url.Parse(authURL)
+			if err != nil {
+				return err
+			}
+			if got := parsed.Query().Get("audience"); got != "authunnel-server" {
+				t.Fatalf("unexpected audience query parameter: got %q", got)
+			}
+			redirectURI, err := url.Parse(parsed.Query().Get("redirect_uri"))
+			if err != nil {
+				return err
+			}
+			if got := redirectURI.Port(); got != strconv.Itoa(redirectPort) {
+				t.Fatalf("unexpected redirect port: got %q want %q", got, strconv.Itoa(redirectPort))
+			}
+			return provider.completeBrowserAuth(authURL)
+		},
+		now: time.Now,
+	}
+
+	token, err := source.AccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected interactive flow to succeed, got error: %v", err)
+	}
+	if token != provider.codeAccessToken {
+		t.Fatalf("unexpected token: got %q want %q", token, provider.codeAccessToken)
+	}
+}
+
+func TestManagedOIDCTokenSourceFailsClosedWhenRedirectPortInUse(t *testing.T) {
+	provider := newFakeOIDCProvider(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve loopback port: %v", err)
+	}
+	defer listener.Close()
+
+	redirectPort := listener.Addr().(*net.TCPAddr).Port
+	browserCalls := 0
+	source := &managedOIDCTokenSource{
+		issuer:       provider.issuer(),
+		clientID:     "authunnel-cli",
+		audience:     "authunnel-server",
+		scopes:       normalizeScopes("openid offline_access"),
+		cachePath:    filepathForTest(t, "tokens.json"),
+		redirectPort: redirectPort,
+		httpClient:   provider.server.Client(),
+		output:       io.Discard,
+		openBrowser: func(context.Context, string) error {
+			browserCalls++
+			return nil
+		},
+		now: time.Now,
+	}
+
+	_, err = source.AccessToken(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "listen for OIDC callback") {
+		t.Fatalf("expected callback-listener failure, got %v", err)
+	}
+	if browserCalls != 0 {
+		t.Fatalf("expected browser opener not to be called when the redirect port is unavailable")
+	}
+}
+
 func TestManagedOIDCTokenSourceIgnoresMismatchedCacheAndRunsInteractiveFlow(t *testing.T) {
 	provider := newFakeOIDCProvider(t)
 	cachePath := filepathForTest(t, "tokens.json")
 	writeTokenCacheForTest(t, cachePath, tokenCache{
 		Issuer:      "http://other-issuer",
 		ClientID:    "other-client",
+		Audience:    "other-audience",
 		Scopes:      "openid",
 		AccessToken: "stale",
 		TokenType:   "Bearer",
@@ -199,6 +320,43 @@ func TestManagedOIDCTokenSourceIgnoresMismatchedCacheAndRunsInteractiveFlow(t *t
 	source := &managedOIDCTokenSource{
 		issuer:     provider.issuer(),
 		clientID:   "authunnel-cli",
+		audience:   "authunnel-server",
+		scopes:     normalizeScopes("openid offline_access"),
+		cachePath:  cachePath,
+		httpClient: provider.server.Client(),
+		output:     io.Discard,
+		openBrowser: func(ctx context.Context, authURL string) error {
+			return provider.completeBrowserAuth(authURL)
+		},
+		now: time.Now,
+	}
+
+	token, err := source.AccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected interactive flow to succeed, got error: %v", err)
+	}
+	if token != provider.codeAccessToken {
+		t.Fatalf("unexpected token: got %q want %q", token, provider.codeAccessToken)
+	}
+}
+
+func TestManagedOIDCTokenSourceIgnoresCacheWhenAudienceChanges(t *testing.T) {
+	provider := newFakeOIDCProvider(t)
+	cachePath := filepathForTest(t, "tokens.json")
+	writeTokenCacheForTest(t, cachePath, tokenCache{
+		Issuer:      provider.issuer(),
+		ClientID:    "authunnel-cli",
+		Audience:    "old-audience",
+		Scopes:      normalizeScopes("openid offline_access"),
+		AccessToken: "stale",
+		TokenType:   "Bearer",
+		Expiry:      time.Now().Add(5 * time.Minute),
+	})
+
+	source := &managedOIDCTokenSource{
+		issuer:     provider.issuer(),
+		clientID:   "authunnel-cli",
+		audience:   "authunnel-server",
 		scopes:     normalizeScopes("openid offline_access"),
 		cachePath:  cachePath,
 		httpClient: provider.server.Client(),
@@ -318,7 +476,7 @@ func newFakeOIDCProvider(t *testing.T) *fakeOIDCProvider {
 	}
 
 	var issuer string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/issuer/.well-known/openid-configuration":
 			writeJSONForTest(t, w, map[string]string{
@@ -496,4 +654,40 @@ func writeJSONForTest(t *testing.T, w http.ResponseWriter, payload any) {
 func filepathForTest(t *testing.T, name string) string {
 	t.Helper()
 	return path.Join(t.TempDir(), name)
+}
+
+func freeLoopbackPortForTest(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve loopback port: %v", err)
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on IPv4 loopback: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
+}
+
+func newIPv4TLSTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on IPv4 loopback: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return server
 }

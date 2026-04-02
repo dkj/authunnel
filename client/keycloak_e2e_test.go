@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"regexp"
@@ -43,8 +42,7 @@ func TestKeycloakProxyCommandManagedOIDCE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create SOCKS5 server: %v", err)
 	}
-	server := httptest.NewTLSServer(tunnelserver.NewHandler(validator, socks))
-	defer server.Close()
+	server := newIPv4TLSTestServer(t, tunnelserver.NewHandler(validator, socks))
 
 	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -92,8 +90,10 @@ func TestKeycloakProxyCommandManagedOIDCE2E(t *testing.T) {
 		AuthMode:         authModeOIDC,
 		OIDCIssuer:       issuer,
 		OIDCClientID:     clientID,
+		OIDCAudience:     audience,
 		OIDCScopes:       normalizeScopes("openid"),
 		OIDCCache:        cachePath,
+		OIDCRedirectPort: freeLoopbackPortForTest(t),
 		WebSocketURL:     server.URL + "/protected/socks",
 		ProxyCommandMode: true,
 		TargetHost:       "127.0.0.1",

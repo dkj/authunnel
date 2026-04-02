@@ -9,9 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
-
-	socks5 "github.com/armon/go-socks5"
 
 	"authunnel/internal/tunnelserver"
 )
@@ -22,17 +21,18 @@ type serverConfig struct {
 	ListenAddr    string
 	TLSCertPath   string
 	TLSKeyPath    string
+	LogLevel      slog.Level
 }
 
 func main() {
-	logHandler := slog.NewJSONHandler(os.Stderr, nil)
+	cfg, err := parseServerConfig(os.Args[1:], os.Getenv)
+	logHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel})
 	logger := slog.New(logHandler)
 	slog.SetDefault(logger)
-	stdLogger := slog.NewLogLogger(logHandler, slog.LevelInfo)
+	stdLogger := slog.NewLogLogger(logHandler, slog.LevelError)
 	log.SetFlags(0)
 	log.SetOutput(stdLogger.Writer())
 
-	cfg, err := parseServerConfig(os.Args[1:], os.Getenv)
 	if err != nil {
 		logger.Error("invalid configuration", slog.String("error", err.Error()))
 		os.Exit(1)
@@ -44,15 +44,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	socks, err := socks5.New(&socks5.Config{
-		Logger: stdLogger,
-	})
-	if err != nil {
-		logger.Error("create socks5 server", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
-	serverMux := tunnelserver.NewHandler(validator, socks)
+	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger))
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           tunnelserver.NewRequestLoggingMiddleware(logger, serverMux),
@@ -75,10 +67,14 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		ListenAddr:    ":8443",
 		TLSCertPath:   getenv("TLS_CERT_FILE"),
 		TLSKeyPath:    getenv("TLS_KEY_FILE"),
+		LogLevel:      slog.LevelInfo,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
 	}
+
+	envLogLevel := getenv("LOG_LEVEL")
+	logLevelFlagSet := false
 
 	fs := flag.NewFlagSet("authunnel-server", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -87,8 +83,24 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	fs.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTPS listen address")
 	fs.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "Path to the TLS certificate PEM file")
 	fs.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "Path to the TLS private key PEM file")
+	fs.Func("log-level", "Structured log level: debug, info, warn, or error", func(value string) error {
+		level, err := parseServerLogLevel(value)
+		if err != nil {
+			return err
+		}
+		cfg.LogLevel = level
+		logLevelFlagSet = true
+		return nil
+	})
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
+	}
+	if !logLevelFlagSet && envLogLevel != "" {
+		level, err := parseServerLogLevel(envLogLevel)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.LogLevel = level
 	}
 
 	if cfg.Issuer == "" {
@@ -108,4 +120,12 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 
 	return cfg, nil
+}
+
+func parseServerLogLevel(value string) (slog.Level, error) {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(strings.ToLower(strings.TrimSpace(value)))); err != nil {
+		return slog.LevelInfo, errors.New("invalid log level: use debug, info, warn, or error")
+	}
+	return level, nil
 }
