@@ -25,6 +25,7 @@ type serverConfig struct {
 	TLSCertPath   string
 	TLSKeyPath    string
 	LogLevel      slog.Level
+	AllowRules    tunnelserver.Allowlist
 }
 
 func serverUsage(w io.Writer) {
@@ -38,6 +39,9 @@ Flags and their environment variable equivalents:
   --tls-cert <path>          Path to the TLS certificate PEM file (env: TLS_CERT_FILE)
   --tls-key <path>           Path to the TLS private key PEM file (env: TLS_KEY_FILE)
   --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)
+  --allow <rule>             Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated).
+                             Rule formats: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi.
+                             With no rules, all connections are allowed.
 `)
 }
 
@@ -64,7 +68,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger))
+	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules))
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           tunnelserver.NewRequestLoggingMiddleware(logger, serverMux),
@@ -104,6 +108,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 
 	envLogLevel := getenv("LOG_LEVEL")
+	envAllowRules := getenv("ALLOW_RULES")
 	logLevelFlagSet := false
 
 	if len(args) > 0 && args[0] == "help" {
@@ -118,6 +123,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	fs.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTPS listen address")
 	fs.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "Path to the TLS certificate PEM file")
 	fs.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "Path to the TLS private key PEM file")
+	fs.Var(&tunnelserver.AllowlistFlag{Rules: &cfg.AllowRules}, "allow",
+		"Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated). Rule: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi. With no rules all connections are allowed.")
 	fs.Func("log-level", "Structured log level: debug, info, warn, or error", func(value string) error {
 		level, err := parseServerLogLevel(value)
 		if err != nil {
@@ -139,6 +146,15 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 			return cfg, err
 		}
 		cfg.LogLevel = level
+	}
+	if envAllowRules != "" {
+		envRules, err := tunnelserver.ParseAllowlistFromCSV(envAllowRules)
+		if err != nil {
+			return cfg, fmt.Errorf("ALLOW_RULES: %w", err)
+		}
+		// Env rules form the baseline; --allow flags (already appended during
+		// fs.Parse) are additive on top.
+		cfg.AllowRules = append(envRules, cfg.AllowRules...)
 	}
 
 	if cfg.Issuer == "" {

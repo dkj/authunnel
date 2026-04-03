@@ -1,6 +1,6 @@
 
 
-## PoC reminders
+## Auth model notes
 
 Current auth model:
 
