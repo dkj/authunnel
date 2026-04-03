@@ -8,11 +8,13 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"authunnel/internal/security"
 	"authunnel/internal/tunnelserver"
 )
 
@@ -71,8 +73,18 @@ func main() {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	// Bind first so CAP_NET_BIND_SERVICE (needed for port < 1024) is used
+	// before capabilities are dropped.
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		logger.Error("server_listen_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if err := security.Harden(); err != nil {
+		logger.Warn("harden_failed", slog.String("error", err.Error()))
+	}
 	logger.Info("server_listening", slog.String("listen_addr", cfg.ListenAddr))
-	if err := httpServer.ListenAndServeTLS(cfg.TLSCertPath, cfg.TLSKeyPath); err != nil {
+	if err := httpServer.ServeTLS(ln, cfg.TLSCertPath, cfg.TLSKeyPath); err != nil {
 		logger.Error("server_exited", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
