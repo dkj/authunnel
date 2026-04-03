@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"flag"
 	"log/slog"
 	"net"
 	"net/http"
@@ -181,6 +182,22 @@ func TestParseServerConfigRejectsMissingTLSPaths(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "TLS_CERT_FILE") {
 		t.Fatalf("expected error to mention missing TLS cert path, got %q", err.Error())
+	}
+}
+
+func TestParseServerConfigHelpFlag(t *testing.T) {
+	for _, arg := range []string{"-h", "--help"} {
+		_, err := parseServerConfig([]string{arg}, func(string) string { return "" })
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("parseServerConfig(%q) error = %v, want flag.ErrHelp", arg, err)
+		}
+	}
+}
+
+func TestParseServerConfigHelpPositional(t *testing.T) {
+	_, err := parseServerConfig([]string{"help"}, func(string) string { return "" })
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("parseServerConfig(\"help\") error = %v, want flag.ErrHelp", err)
 	}
 }
 

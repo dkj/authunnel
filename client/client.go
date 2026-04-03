@@ -62,8 +62,43 @@ type clientConfig struct {
 	BrowserOpener  browserOpener
 }
 
+func clientUsage(w io.Writer) {
+	fmt.Fprintf(w, `Usage: authunnel-client [flags] [host port]
+
+Choose one operating mode (mutually exclusive):
+
+  --proxycommand               SSH ProxyCommand mode; requires host and port arguments
+                               (all other flags still apply)
+  --unix-socket <path>         Expose a local SOCKS5 unix socket (default: proxy.sock)
+                               (default mode when --proxycommand is not set)
+
+Choose one authentication method (mutually exclusive):
+
+  Managed OIDC (typical):
+    --oidc-issuer <url>          OIDC issuer for managed login (required with --oidc-client-id)
+    --oidc-client-id <id>        OIDC client ID (required with --oidc-issuer)
+    --oidc-audience <string>     Audience/resource requested during managed login
+    --oidc-scopes <scopes>       Space-delimited OIDC scopes (default: openid offline_access)
+    --oidc-cache <path>          Token cache path for managed OIDC login
+    --oidc-no-browser            Print the authorization URL without opening a browser
+    --oidc-redirect-port <port>  Loopback port for OIDC callback; 0 = random port
+
+  Manual token (not recommended; for testing only):
+    --access-token <token>       Bearer token passed as a flag
+    ACCESS_TOKEN                 Bearer token via environment variable
+
+Connection:
+
+  --ws-url <url>               WebSocket tunnel endpoint URL
+                               (default: https://localhost:8443/protected/socks)
+`)
+}
+
 func main() {
 	cfg, err := parseClientConfig(os.Args[1:], os.Getenv)
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
+	}
 	if err != nil {
 		log.Fatalf("invalid configuration: %v", err)
 	}
@@ -98,8 +133,14 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 		BrowserOpener: defaultBrowserOpener,
 	}
 
+	if len(args) > 0 && args[0] == "help" {
+		clientUsage(os.Stdout)
+		return cfg, flag.ErrHelp
+	}
+
 	fs := flag.NewFlagSet("authunnel-client", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	fs.StringVar(&cfg.AccessToken, "access-token", cfg.AccessToken, "Bearer token for manual authentication (not recommended; prefer OIDC or ACCESS_TOKEN env var)")
 	fs.StringVar(&cfg.WebSocketURL, "ws-url", "https://localhost:8443/protected/socks", "WebSocket URL for the authenticated socks tunnel endpoint")
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
@@ -111,15 +152,25 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
 	fs.IntVar(&cfg.OIDCRedirectPort, "oidc-redirect-port", 0, "Loopback port for the OIDC callback listener; 0 chooses a random port")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			clientUsage(os.Stdout)
+		}
 		return cfg, err
 	}
+
+	var oidcScopesSet bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "oidc-scopes" {
+			oidcScopesSet = true
+		}
+	})
 
 	hasOIDC := cfg.OIDCIssuer != "" || cfg.OIDCClientID != ""
 	if cfg.OIDCRedirectPort < 0 || cfg.OIDCRedirectPort > 65535 {
 		return cfg, errors.New("--oidc-redirect-port must be between 0 and 65535")
 	}
-	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCRedirectPort != 0) {
-		return cfg, errors.New("ACCESS_TOKEN cannot be combined with managed OIDC flags")
+	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
+		return cfg, errors.New("--access-token / ACCESS_TOKEN cannot be combined with managed OIDC flags")
 	}
 	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
 		return cfg, errors.New("managed OIDC mode requires both --oidc-issuer and --oidc-client-id")

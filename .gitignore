@@ -31,3 +31,9 @@ go.work.sum
 *.srl
 *.csr
 *.ext
+
+# Apple specific file that should not be committed
+.DS_Store
+
+# Build artifacts
+dist/

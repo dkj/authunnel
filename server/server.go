@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -24,8 +25,25 @@ type serverConfig struct {
 	LogLevel      slog.Level
 }
 
+func serverUsage(w io.Writer) {
+	fmt.Fprintf(w, `Usage: authunnel-server [flags]
+
+Flags and their environment variable equivalents:
+
+  --oidc-issuer <url>        OIDC issuer URL for JWT discovery and validation (env: OIDC_ISSUER)
+  --token-audience <string>  Audience required in validated access tokens (env: TOKEN_AUDIENCE)
+  --listen-addr <addr>       HTTPS listen address (env: LISTEN_ADDR, default: :8443)
+  --tls-cert <path>          Path to the TLS certificate PEM file (env: TLS_CERT_FILE)
+  --tls-key <path>           Path to the TLS private key PEM file (env: TLS_KEY_FILE)
+  --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)
+`)
+}
+
 func main() {
 	cfg, err := parseServerConfig(os.Args[1:], os.Getenv)
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
+	}
 	logHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel})
 	logger := slog.New(logHandler)
 	slog.SetDefault(logger)
@@ -76,6 +94,11 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	envLogLevel := getenv("LOG_LEVEL")
 	logLevelFlagSet := false
 
+	if len(args) > 0 && args[0] == "help" {
+		serverUsage(os.Stdout)
+		return cfg, flag.ErrHelp
+	}
+
 	fs := flag.NewFlagSet("authunnel-server", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&cfg.Issuer, "oidc-issuer", cfg.Issuer, "OIDC issuer used for JWT discovery and validation")
@@ -93,6 +116,9 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		return nil
 	})
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			serverUsage(os.Stdout)
+		}
 		return cfg, err
 	}
 	if !logLevelFlagSet && envLogLevel != "" {
