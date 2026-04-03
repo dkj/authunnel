@@ -28,11 +28,9 @@ func TestParseAllowRuleValid(t *testing.T) {
 		{"10.0.0.0/8:443", "", "10.0.0.0/8", 443, 443},
 		{"10.0.0.0/8:1-65535", "", "10.0.0.0/8", 1, 65535},
 		{"192.168.0.0/16:22", "", "192.168.0.0/16", 22, 22},
-		// Bare IPv4 and IPv6 literals must be normalised to host-route CIDRs,
-		// not stored as hostname globs, so they match IP-type SOCKS5 requests.
+		// Bare IPv4 literals — normalized to host-route CIDRs.
 		{"10.0.0.1:443", "", "10.0.0.1/32", 443, 443},
-		{"::1:22", "", "::1/128", 22, 22},
-		// Bracketed IPv6 notation (conventional host:port form).
+		// Bracketed IPv6 notation (required for unambiguous host:port parsing).
 		{"[::1]:22", "", "::1/128", 22, 22},
 		{"[2001:db8::1]:443", "", "2001:db8::1/128", 443, 443},
 		{"[::1/128]:22", "", "::1/128", 22, 22},
@@ -81,6 +79,9 @@ func TestParseAllowRuleInvalid(t *testing.T) {
 		":22",              // empty host
 		"[notanip]:22",     // brackets but not a valid IP or CIDR
 		"[]:22",            // empty brackets
+		"::1:22",           // unbracketed IPv6 — ambiguous whether :22 is port or address tail
+		"2001:db8::1",      // unbracketed IPv6, no port — LastIndex splits wrong
+		"2001:db8::1:443",  // unbracketed IPv6, port ambiguous — LastIndex splits wrong
 	}
 
 	for _, tc := range cases {
@@ -138,8 +139,7 @@ func TestAllowlistPermits(t *testing.T) {
 	ruleCIDRPort := mustParseAllowRule(t, "10.0.0.0/8:443")
 	ruleHostRange := mustParseAllowRule(t, "*.internal:22-2222")
 	ruleBareIPv4 := mustParseAllowRule(t, "10.0.0.1:443")
-	ruleBareIPv6 := mustParseAllowRule(t, "::1:22")
-	ruleBracketedIPv6 := mustParseAllowRule(t, "[::1]:22")
+	ruleIPv6 := mustParseAllowRule(t, "[::1]:22")
 
 	cases := []struct {
 		name    string
@@ -254,15 +254,23 @@ func TestAllowlistPermits(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "bare IPv6 rule matches IP-type request",
-			al:   Allowlist{ruleBareIPv6},
+			name: "IPv6 rule matches IP-type request",
+			al:   Allowlist{ruleIPv6},
 			fqdn: "", ip: net.ParseIP("::1"), port: 22,
 			want: true,
 		},
 		{
-			name: "bracketed IPv6 rule matches IP-type request",
-			al:   Allowlist{ruleBracketedIPv6},
-			fqdn: "", ip: net.ParseIP("::1"), port: 22,
+			name: "IPv6 rule does not match different address",
+			al:   Allowlist{ruleIPv6},
+			fqdn: "", ip: net.ParseIP("::2"), port: 22,
+			want: false,
+		},
+		// filepath.Match uses '/' as separator so '*' matches '.', meaning
+		// *.internal matches multi-level subdomains like a.b.internal.
+		{
+			name: "glob wildcard matches multi-level subdomain",
+			al:   Allowlist{ruleHostPort},
+			fqdn: "a.b.internal", ip: nil, port: 5432,
 			want: true,
 		},
 	}

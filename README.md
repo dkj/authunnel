@@ -91,13 +91,17 @@ Useful server flags and environment variables:
 - `--tls-key` or `TLS_KEY_FILE`
 - `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable; if unset all connections are allowed
 
-Rule formats: `host-glob:port`, `host-glob:lo-hi`, `CIDR:port`, `CIDR:lo-hi`
+Rule formats: `host-glob:port`, `host-glob:lo-hi`, `CIDR:port`, `CIDR:lo-hi`, `[IPv6]:port`, `[IPv6]:lo-hi`
+
+IPv6 addresses must use bracketed notation (`[addr]:port`). Unbracketed IPv6 is rejected at startup because the last-colon port split is otherwise ambiguous.
 
 ```bash
 # Only allow SSH to *.internal and HTTPS to the 10.x network
 authunnel-server --allow '*.internal:22' --allow '10.0.0.0/8:443'
 # Or via environment variable (comma-separated)
 ALLOW_RULES='*.internal:22,10.0.0.0/8:443' authunnel-server
+# IPv6 example
+authunnel-server --allow '[::1]:22' --allow '[2001:db8::1]:443'
 ```
 
 ### Managed OIDC client mode

@@ -73,6 +73,9 @@ func (al Allowlist) Permits(fqdn string, ip net.IP, port int) bool {
 //
 // The host part is treated as a CIDR when it contains a '/', otherwise as a
 // case-insensitive glob pattern matched with filepath.Match semantics.
+// filepath.Match uses '/' as its path separator, so '*' matches any sequence
+// of characters including '.', meaning *.internal matches both foo.internal
+// and a.b.internal (multi-level subdomains). '**' is not special.
 func ParseAllowRule(s string) (allowRule, error) {
 	// Split on the final colon to separate host from port part.
 	// We use the last colon so IPv6 CIDRs such as ::1/128:22 would work,
@@ -114,10 +117,18 @@ func ParseAllowRule(s string) (allowRule, error) {
 		}
 		rule.cidr = network
 	} else if ip := net.ParseIP(effectiveHost); ip != nil {
-		// Bare IP literal — normalise to a host-route CIDR (/32 for IPv4,
+		// Bare IP literal — normalize to a host-route CIDR (/32 for IPv4,
 		// /128 for IPv6) so it matches IP-type SOCKS5 requests correctly.
 		// Without this, the rule would be stored as a hostname glob and silently
 		// never fire, because IP-type SOCKS5 requests arrive with FQDN == "".
+		//
+		// Unbracketed IPv6 addresses are rejected even when net.ParseIP accepts
+		// the host part, because the last-colon split is ambiguous: the segment
+		// after the final colon could be the port or the tail of the address.
+		// Require [addr]:port notation to make intent unambiguous.
+		if ip.To4() == nil && !bracketed {
+			return allowRule{}, fmt.Errorf("allow rule %q: IPv6 address %q must use bracketed notation e.g. [%s]:%s", s, effectiveHost, effectiveHost, portPart)
+		}
 		if ip4 := ip.To4(); ip4 != nil {
 			rule.cidr = &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
 		} else {
@@ -127,8 +138,14 @@ func ParseAllowRule(s string) (allowRule, error) {
 		// Brackets were present but the content is not a valid IP or CIDR.
 		return allowRule{}, fmt.Errorf("allow rule %q: bracketed host %q is not a valid IP address or CIDR", s, effectiveHost)
 	} else {
-		// Hostname glob rule — validate the pattern and normalise to lower case.
+		// Hostname glob rule — validate the pattern and normalize to lower case.
+		// DNS host names never contain colons; a colon here means the operator
+		// wrote an unbracketed IPv6 literal and the port split was wrong.
+		// Fail fast rather than storing a glob that will never match.
 		lower := strings.ToLower(effectiveHost)
+		if strings.Contains(lower, ":") {
+			return allowRule{}, fmt.Errorf("allow rule %q: host %q looks like an IPv6 address; use bracketed notation e.g. [%s]:%s", s, effectiveHost, effectiveHost, portPart)
+		}
 		if _, err := filepath.Match(lower, ""); errors.Is(err, filepath.ErrBadPattern) {
 			return allowRule{}, fmt.Errorf("allow rule %q: invalid glob pattern %q: %w", s, host, err)
 		}
