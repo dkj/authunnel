@@ -71,11 +71,32 @@ func (v *JWTTokenValidator) ValidateAccessToken(ctx context.Context, token strin
 	return claims, nil
 }
 
+// HandlerOptions controls optional behavior of the HTTP handler.
+type HandlerOptions struct {
+	// TrustForwardedProto instructs the same-origin WebSocket check to use
+	// X-Forwarded-Proto and X-Forwarded-Host as the effective scheme and host,
+	// for deployments where a TLS-terminating reverse proxy forwards plain HTTP
+	// to the backend. Without this flag the check infers scheme from r.TLS and
+	// host from r.Host, so browser clients behind such a proxy would be
+	// rejected as cross-origin: their Origin carries https://<public-host> but
+	// the backend sees plain HTTP and possibly a rewritten Host header.
+	// Enable only when the server is in plaintext mode and the reverse proxy is
+	// known to set these headers reliably. Caddy, AWS ALB, Traefik, and HAProxy
+	// forward the original Host by default; nginx requires an explicit
+	// "proxy_set_header Host $host;" directive. The headers are never consulted
+	// in TLS modes because r.TLS != nil short-circuits before they are reached.
+	TrustForwardedProto bool
+}
+
 // NewHandler installs the small HTTP surface used by the server:
 //   - "/" for a simple liveness response
 //   - "/protected" for token-validation smoke testing
 //   - "/protected/socks" for the authenticated websocket-to-SOCKS bridge
-func NewHandler(validator TokenValidator, socks SOCKSServer) *http.ServeMux {
+func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOptions) *http.ServeMux {
+	var opt HandlerOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
@@ -103,7 +124,7 @@ func NewHandler(validator TokenValidator, socks SOCKSServer) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/protected/socks", func(w http.ResponseWriter, r *http.Request) {
-		if !checkWebSocketRequest(w, r) {
+		if !checkWebSocketRequest(w, r, opt.TrustForwardedProto) {
 			return
 		}
 		claims, ok := validateRequestToken(w, r, validator)
@@ -154,7 +175,9 @@ func logTunnelClose(logger *slog.Logger, started time.Time) {
 // checkWebSocketRequest rejects requests that should never reach the
 // authenticated upgrade path. This keeps protocol admission checks separate
 // from bearer-token validation and makes browser-origin handling explicit.
-func checkWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
+// trustForwardedProto enables X-Forwarded-Proto and X-Forwarded-Host for
+// scheme and host inference; see HandlerOptions.TrustForwardedProto.
+func checkWebSocketRequest(w http.ResponseWriter, r *http.Request, trustForwardedProto bool) bool {
 	if r.Method != http.MethodGet {
 		loggerFromContext(r.Context()).Warn("websocket_rejected",
 			slog.String("reason", "method_not_allowed"),
@@ -182,9 +205,9 @@ func checkWebSocketRequest(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "invalid origin", http.StatusForbidden)
 		return false
 	}
-	// TODO: Make the allowed origin comparison configurable if a reverse proxy
-	// rewrites scheme/host instead of forwarding the original external values.
-	if !sameOrigin(originURL, r) {
+	scheme := requestScheme(r, trustForwardedProto)
+	host := requestHost(r, trustForwardedProto)
+	if !sameOrigin(originURL, scheme, host) {
 		loggerFromContext(r.Context()).Warn("websocket_rejected",
 			slog.String("reason", "cross_origin"),
 			slog.String("origin", origin),
@@ -248,20 +271,41 @@ func headerContainsToken(header http.Header, name, expected string) bool {
 	return false
 }
 
-func sameOrigin(originURL *url.URL, r *http.Request) bool {
-	requestScheme := requestScheme(r)
-	if !strings.EqualFold(originURL.Scheme, requestScheme) {
+func sameOrigin(originURL *url.URL, scheme, host string) bool {
+	if !strings.EqualFold(originURL.Scheme, scheme) {
 		return false
 	}
 	return strings.EqualFold(normalizeAuthority(originURL), normalizeAuthority(&url.URL{
-		Scheme: requestScheme,
-		Host:   r.Host,
+		Scheme: scheme,
+		Host:   host,
 	}))
 }
 
-func requestScheme(r *http.Request) string {
+func requestHost(r *http.Request, trustForwardedProto bool) string {
+	if trustForwardedProto {
+		if fwd := r.Header.Get("X-Forwarded-Host"); fwd != "" {
+			// X-Forwarded-Host is comma-separated in multi-proxy deployments;
+			// the leftmost entry is the original client-facing host.
+			if host := strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0]); host != "" {
+				return host
+			}
+		}
+	}
+	return r.Host
+}
+
+func requestScheme(r *http.Request, trustForwardedProto bool) string {
 	if r.TLS != nil {
 		return "https"
+	}
+	if trustForwardedProto {
+		if fwd := r.Header.Get("X-Forwarded-Proto"); fwd != "" {
+			// X-Forwarded-Proto is comma-separated in multi-proxy deployments;
+			// the leftmost entry is the original client-facing scheme.
+			if proto := strings.ToLower(strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])); proto != "" {
+				return proto
+			}
+		}
 	}
 	if r.URL != nil && r.URL.Scheme != "" {
 		return strings.ToLower(r.URL.Scheme)
