@@ -91,6 +91,13 @@ func main() {
 
 	logger.Info("server_starting", slog.String("version", version))
 
+	if len(cfg.ACMEDomains) > 0 {
+		if err := checkACMECacheDir(cfg.ACMECacheDir); err != nil {
+			logger.Error("acme_cache_dir_error", slog.String("path", cfg.ACMECacheDir), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}
+
 	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), cfg.Issuer, cfg.TokenAudience, http.DefaultClient)
 	if err != nil {
 		logger.Error("create token validator", slog.String("error", err.Error()))
@@ -310,6 +317,19 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 
 	return cfg, nil
+}
+
+func checkACMECacheDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create ACME cache directory: %w", err)
+	}
+	f, err := os.CreateTemp(dir, ".acme-probe-*")
+	if err != nil {
+		return fmt.Errorf("ACME cache directory is not writable: %w", err)
+	}
+	f.Close()
+	os.Remove(f.Name())
+	return nil
 }
 
 func parseServerLogLevel(value string) (slog.Level, error) {
