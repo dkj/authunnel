@@ -20,6 +20,10 @@ import (
 // (which may be scheduled onto any thread) retains elevated privileges after
 // this returns.
 //
+// IMPORTANT: this binary must be built with CGO_ENABLED=0. When cgo is enabled,
+// AllThreadsSyscall6 returns ENOTSUP and the syscalls are never applied, causing
+// this function to fail silently with "operation not supported".
+//
 // Call this after binding any low-numbered ports (< 1024) but before handling
 // untrusted input, so that CAP_NET_BIND_SERVICE is consumed before it is dropped.
 func Harden() error {

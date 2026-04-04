@@ -81,7 +81,7 @@ export TOKEN_AUDIENCE='authunnel-server'
 export TLS_CERT_FILE='/etc/authunnel/tls/server.crt'
 export TLS_KEY_FILE='/etc/authunnel/tls/server.key'
 
-cd server && go run .
+cd server && CGO_ENABLED=0 go run .
 ```
 
 **ACME / Let's Encrypt** (default `:443`; server must be reachable on port 443):
@@ -92,7 +92,7 @@ export TOKEN_AUDIENCE='authunnel-server'
 export ACME_DOMAINS='authunnel.example.com'
 export ACME_CACHE_DIR='/var/cache/authunnel/acme'
 
-cd server && go run .
+cd server && CGO_ENABLED=0 go run .
 ```
 
 Certificates are obtained and renewed automatically using the TLS-ALPN-01 challenge. The cache directory must be writable by the server process and should persist across restarts to avoid hitting Let's Encrypt rate limits.
@@ -103,7 +103,7 @@ Certificates are obtained and renewed automatically using the TLS-ALPN-01 challe
 export OIDC_ISSUER='https://<issuer>'
 export TOKEN_AUDIENCE='authunnel-server'
 
-cd server && go run . --plaintext-behind-reverse-proxy
+cd server && CGO_ENABLED=0 go run . --plaintext-behind-reverse-proxy
 ```
 
 The server trusts `X-Forwarded-Proto` and `X-Forwarded-Host` for WebSocket origin checks. Most proxies forward these automatically; nginx requires explicit configuration:
@@ -187,7 +187,7 @@ A pre-obtained bearer token can be supplied via the `ACCESS_TOKEN` environment v
 ```bash
 export ACCESS_TOKEN='<access-token>'
 cd client
-SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
+CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
 ```
 
 ProxyCommand example with a pre-supplied token:
@@ -203,7 +203,7 @@ ProxyCommand example with a pre-supplied token:
 
 ```bash
 cd client
-SSL_CERT_FILE=../cert.pem go run . \
+CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
   --oidc-issuer https://<issuer> \
   --oidc-client-id authunnel-cli \
   --unix-socket /tmp/authunnel/proxy.sock
@@ -307,14 +307,14 @@ export TLS_CERT_FILE='../cert.pem'
 export TLS_KEY_FILE='../key.pem'
 
 cd server
-go run .
+CGO_ENABLED=0 go run .
 ```
 
 ### 3) Start Authunnel client in managed mode
 
 ```bash
 cd client
-SSL_CERT_FILE=../cert.pem go run . \
+CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
   --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
   --oidc-client-id authunnel-cli \
   --oidc-scopes openid \
