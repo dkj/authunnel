@@ -1,0 +1,29 @@
+<svg viewBox="330 140 435 285" fill="none" stroke="none" stroke-linecap="square" stroke-miterlimit="10" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <g id="lock">
+            <path fill="#efefef" d="m350.02493 271.62732c0 -18.122498 14.691193 -32.813675 32.81366 -32.813675l112.60892 0c8.702698 0 17.049011 3.4571533 23.202759 9.610901c6.1537476 6.153763 9.610901 14.500046 9.610901 23.202774l0 97.868744c0 18.122467 -14.691162 32.81366 -32.81366 32.81366l-112.60892 0c-18.122467 0 -32.81366 -14.691193 -32.81366 -32.81366z" fill-rule="evenodd"/>
+            <path stroke="#efefef" stroke-width="1.0" stroke-linejoin="round" stroke-linecap="butt" d="m350.02493 271.62732c0 -18.122498 14.691193 -32.813675 32.81366 -32.813675l112.60892 0c8.702698 0 17.049011 3.4571533 23.202759 9.610901c6.1537476 6.153763 9.610901 14.500046 9.610901 23.202774l0 97.868744c0 18.122467 -14.691162 32.81366 -32.81366 32.81366l-112.60892 0c-18.122467 0 -32.81366 -14.691193 -32.81366 -32.81366z" fill-rule="evenodd"/>
+            <path fill="#efefef" d="m374.7651 209.32283l18.740143 0l0 64.535446l-18.740143 0z" fill-rule="evenodd"/>
+            <path stroke="#efefef" stroke-width="1.0" stroke-linejoin="round" stroke-linecap="butt" d="m374.7651 209.32283l18.740143 0l0 64.535446l-18.740143 0z" fill-rule="evenodd"/>
+            <path fill="#efefef" d="m484.78085 209.32283l18.740143 0l0 64.535446l-18.740143 0z" fill-rule="evenodd"/>
+            <path stroke="#efefef" stroke-width="1.0" stroke-linejoin="round" stroke-linecap="butt" d="m484.78085 209.32283l18.740143 0l0 64.535446l-18.740143 0z" fill-rule="evenodd"/>
+            <path fill="#000000" d="m423.36353 309.91208c0 -8.923523 7.064728 -16.15747 15.7795105 -16.15747c4.1849976 0 8.198578 1.702301 11.157806 4.7323914c2.959259 3.0301208 4.6217346 7.1398315 4.6217346 11.425079c0 8.923523 -7.064728 16.15747 -15.779541 16.15747c-8.714783 0 -15.7795105 -7.2339478 -15.7795105 -16.15747z" fill-rule="evenodd"/>
+            <path stroke="#000000" stroke-width="0.963254593175853" stroke-linejoin="round" stroke-linecap="butt" d="m423.36353 309.91208c0 -8.923523 7.064728 -16.15747 15.7795105 -16.15747c4.1849976 0 8.198578 1.702301 11.157806 4.7323914c2.959259 3.0301208 4.6217346 7.1398315 4.6217346 11.425079c0 8.923523 -7.064728 16.15747 -15.779541 16.15747c-8.714783 0 -15.7795105 -7.2339478 -15.7795105 -16.15747z" fill-rule="evenodd"/>
+            <path fill="#000000" d="m432.17212 318.64322l13.952759 0l0 28.724426l-13.952759 0z" fill-rule="evenodd"/>
+            <path stroke="#000000" stroke-width="0.963254593175853" stroke-linejoin="round" stroke-linecap="butt" d="m432.17212 318.64322l13.952759 0l0 28.724426l-13.952759 0z" fill-rule="evenodd"/>
+            <path fill="#efefef" d="m374.7651 213.00787c0 -21.88002 12.427826 -42.07553 32.549194 -52.893112c20.121338 -10.817566 44.837982 -10.591568 64.73413 0.5919342c19.89618 11.183487 31.908356 31.602478 31.46051 53.47841l-18.64148 -0.34094238c0.3258667 -15.175354 -8.202911 -29.343506 -22.336517 -37.10565c-14.133575 -7.762146 -31.695007 -7.9227295 -45.992493 -0.4205475c-14.297485 7.502182 -23.128815 21.511581 -23.128815 36.68991z" fill-rule="evenodd"/>
+            <path stroke="#efefef" stroke-width="1.0" stroke-linejoin="round" stroke-linecap="butt" d="m374.7651 213.00787c0 -21.88002 12.427826 -42.07553 32.549194 -52.893112c20.121338 -10.817566 44.837982 -10.591568 64.73413 0.5919342c19.89618 11.183487 31.908356 31.602478 31.46051 53.47841l-18.64148 -0.34094238c0.3258667 -15.175354 -8.202911 -29.343506 -22.336517 -37.10565c-14.133575 -7.762146 -31.695007 -7.9227295 -45.992493 -0.4205475c-14.297485 7.502182 -23.128815 21.511581 -23.128815 36.68991z" fill-rule="evenodd"/>
+        </g>
+    </defs>
+    <!-- back-to-front: smallest/furthest/darkest first -->
+    <use href="#lock" transform="translate(595, 202) scale(0.28)" style="filter: brightness(0.1)"/>
+    <use href="#lock" transform="translate(547, 191) scale(0.32)" style="filter: brightness(0.2)"/>
+    <use href="#lock" transform="translate(494, 177) scale(0.37)" style="filter: brightness(0.3)"/>
+    <use href="#lock" transform="translate(436, 160) scale(0.43)" style="filter: brightness(0.4)"/>
+    <use href="#lock" transform="translate(374, 141) scale(0.50)" style="filter: brightness(0.5)"/>
+    <use href="#lock" transform="translate(313, 121) scale(0.57)" style="filter: brightness(0.6)"/>
+    <use href="#lock" transform="translate(242, 96) scale(0.66)" style="filter: brightness(0.7)"/>
+    <use href="#lock" transform="translate(168, 68) scale(0.76)" style="filter: brightness(0.8)"/>
+    <use href="#lock" transform="translate(88, 37) scale(0.87)" style="filter: brightness(0.9)"/>
+    <use href="#lock"/>
+</svg>

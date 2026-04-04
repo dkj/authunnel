@@ -1,5 +1,7 @@
 # Authunnel
 
+![Lock](Lock.svg)
+
 Authunnel is an authenticated tunnel for reaching private TCP services, including SSH, through an OAuth2-protected TLS WebSocket conduit.
 
 The target workflow is:
