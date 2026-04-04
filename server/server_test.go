@@ -53,6 +53,7 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 		ListenAddr:    "127.0.0.1:9443",
 		TLSCertPath:   "/flags/server.crt",
 		TLSKeyPath:    "/flags/server.key",
+		ACMECacheDir:  "/var/cache/authunnel/acme",
 		LogLevel:      slog.LevelInfo,
 	}
 	if !reflect.DeepEqual(cfg, want) {
@@ -180,8 +181,8 @@ func TestParseServerConfigRejectsMissingTLSPaths(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected missing TLS path configuration to fail")
 	}
-	if !strings.Contains(err.Error(), "TLS_CERT_FILE") {
-		t.Fatalf("expected error to mention missing TLS cert path, got %q", err.Error())
+	if !strings.Contains(err.Error(), "--tls-cert") && !strings.Contains(err.Error(), "--acme-domain") && !strings.Contains(err.Error(), "--plaintext-behind-reverse-proxy") {
+		t.Fatalf("expected error to mention TLS mode options, got %q", err.Error())
 	}
 }
 
@@ -198,6 +199,15 @@ func TestParseServerConfigHelpPositional(t *testing.T) {
 	_, err := parseServerConfig([]string{"help"}, func(string) string { return "" })
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("parseServerConfig(\"help\") error = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestParseServerConfigVersionFlag(t *testing.T) {
+	for _, arg := range []string{"--version", "version"} {
+		_, err := parseServerConfig([]string{arg}, func(string) string { return "" })
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("parseServerConfig(%q) error = %v, want flag.ErrHelp", arg, err)
+		}
 	}
 }
 
@@ -650,6 +660,435 @@ func TestParseServerConfigRejectsInvalidAllowRule(t *testing.T) {
 	}, minimalServerEnv)
 	if err == nil {
 		t.Fatal("expected error for invalid allow rule, got nil")
+	}
+}
+
+func TestParseServerConfigACMEDomainFromFlag(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--acme-domain", "authunnel.example.com",
+		"--acme-domain", "www.example.com",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if len(cfg.ACMEDomains) != 2 || cfg.ACMEDomains[0] != "authunnel.example.com" || cfg.ACMEDomains[1] != "www.example.com" {
+		t.Fatalf("unexpected ACME domains: %v", cfg.ACMEDomains)
+	}
+	if cfg.ListenAddr != ":443" {
+		t.Fatalf("expected ACME mode to default listen addr to :443, got %q", cfg.ListenAddr)
+	}
+	if cfg.ACMECacheDir != "/var/cache/authunnel/acme" {
+		t.Fatalf("expected default ACME cache dir, got %q", cfg.ACMECacheDir)
+	}
+}
+
+func TestParseServerConfigACMEDomainFromEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "ACME_DOMAINS":
+			return "authunnel.example.com, www.example.com"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if len(cfg.ACMEDomains) != 2 || cfg.ACMEDomains[0] != "authunnel.example.com" || cfg.ACMEDomains[1] != "www.example.com" {
+		t.Fatalf("unexpected ACME domains: %v", cfg.ACMEDomains)
+	}
+}
+
+func TestParseServerConfigACMEFlagAndEnvCombined(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--acme-domain", "flag.example.com",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "ACME_DOMAINS":
+			return "env.example.com"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	// env domains come first, flag domains are additive
+	if len(cfg.ACMEDomains) != 2 || cfg.ACMEDomains[0] != "env.example.com" || cfg.ACMEDomains[1] != "flag.example.com" {
+		t.Fatalf("unexpected ACME domains: %v", cfg.ACMEDomains)
+	}
+}
+
+func TestParseServerConfigACMECacheDirOverride(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--acme-domain", "authunnel.example.com",
+		"--acme-cache-dir", "/tmp/acme-cache",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.ACMECacheDir != "/tmp/acme-cache" {
+		t.Fatalf("expected overridden ACME cache dir, got %q", cfg.ACMECacheDir)
+	}
+}
+
+func TestParseServerConfigPlaintextMode(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--plaintext-behind-reverse-proxy",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if !cfg.PlaintextBehindProxy {
+		t.Fatal("expected PlaintextHTTP to be true")
+	}
+	if cfg.ListenAddr != ":8080" {
+		t.Fatalf("expected plaintext mode to default listen addr to :8080, got %q", cfg.ListenAddr)
+	}
+}
+
+func TestParseServerConfigPlaintextModeFromEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "PLAINTEXT_BEHIND_REVERSE_PROXY":
+			return "true"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if !cfg.PlaintextBehindProxy {
+		t.Fatal("expected PlaintextHTTP to be true from env")
+	}
+}
+
+func TestParseServerConfigACMEDomainsEnvFiltersEmptyEntries(t *testing.T) {
+	// Trailing comma and whitespace-only entries must not be appended as empty
+	// strings; they should be silently dropped so the effective domain list
+	// only contains real hostnames.
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "ACME_DOMAINS":
+			return "authunnel.example.com, , ,other.example.com,"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if len(cfg.ACMEDomains) != 2 {
+		t.Fatalf("expected 2 domains after filtering, got %v", cfg.ACMEDomains)
+	}
+}
+
+func TestParseServerConfigACMEDomainsOnlyEmptyEntriesSelectsNoMode(t *testing.T) {
+	// ACME_DOMAINS containing only commas/whitespace should not trigger ACME
+	// mode — the server must fail at startup rather than starting with an
+	// empty host whitelist.
+	_, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "ACME_DOMAINS":
+			return ", ,"
+		default:
+			return ""
+		}
+	})
+	if err == nil {
+		t.Fatal("expected error when ACME_DOMAINS contains only empty entries")
+	}
+	if !strings.Contains(err.Error(), "--acme-domain") && !strings.Contains(err.Error(), "--tls-cert") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseServerConfigListenAddrOverridesACMEDefault(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--acme-domain", "authunnel.example.com",
+		"--listen-addr", ":8443",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.ListenAddr != ":8443" {
+		t.Fatalf("expected explicit --listen-addr to override ACME default, got %q", cfg.ListenAddr)
+	}
+}
+
+func TestParseServerConfigRejectsMultipleTLSModes(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		env  func(string) string
+	}{
+		{
+			name: "tls-files and plaintext",
+			args: []string{"--tls-cert", "/c.pem", "--tls-key", "/k.pem", "--plaintext-behind-reverse-proxy"},
+			env:  minimalACMElessEnv,
+		},
+		{
+			name: "tls-files and acme",
+			args: []string{"--tls-cert", "/c.pem", "--tls-key", "/k.pem", "--acme-domain", "x.example.com"},
+			env:  minimalACMElessEnv,
+		},
+		{
+			name: "acme and plaintext",
+			args: []string{"--acme-domain", "x.example.com", "--plaintext-behind-reverse-proxy"},
+			env:  minimalACMElessEnv,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseServerConfig(tc.args, tc.env)
+			if err == nil {
+				t.Fatal("expected error for multiple TLS modes, got nil")
+			}
+			if !strings.Contains(err.Error(), "only one of") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestPlaintextModeAcceptsBrowserOriginViaForwardedProto(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(
+		staticFailValidator{err: errors.New("token rejected")},
+		socks,
+		tunnelserver.HandlerOptions{TrustForwardedProto: true},
+	)
+
+	// Simulate a browser WebSocket request forwarded by a TLS-terminating
+	// reverse proxy: Origin is https:// but the backend sees plain HTTP.
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/socks", nil)
+	req.Host = "authunnel.example"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	// Should pass origin check and reach token validation (not be rejected as cross-origin).
+	if rr.Code == http.StatusForbidden && strings.Contains(rr.Body.String(), "cross-origin") {
+		t.Fatal("expected request to pass origin check in plaintext+TrustForwardedProto mode, but was rejected as cross-origin")
+	}
+}
+
+func TestPlaintextModeAcceptsBrowserOriginViaForwardedHost(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(
+		staticFailValidator{err: errors.New("token rejected")},
+		socks,
+		tunnelserver.HandlerOptions{TrustForwardedProto: true},
+	)
+
+	// Proxy rewrites Host to the backend address but sets X-Forwarded-Host
+	// and X-Forwarded-Proto to the external values.
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req.Host = "localhost:8080"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "authunnel.example.com")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusForbidden && strings.Contains(rr.Body.String(), "cross-origin") {
+		t.Fatal("expected request to pass origin check with X-Forwarded-Host set, but was rejected as cross-origin")
+	}
+}
+
+func TestPlaintextModeAcceptsBrowserOriginViaForwardedProtoMultiProxy(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(
+		staticFailValidator{err: errors.New("token rejected")},
+		socks,
+		tunnelserver.HandlerOptions{TrustForwardedProto: true},
+	)
+
+	// Multi-proxy deployment: X-Forwarded-Proto is comma-separated; the
+	// leftmost entry is the original client-facing scheme.
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example.com/protected/socks", nil)
+	req.Host = "authunnel.example.com"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https, http")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusForbidden && strings.Contains(rr.Body.String(), "cross-origin") {
+		t.Fatal("expected leftmost X-Forwarded-Proto entry to be used for origin check, but was rejected as cross-origin")
+	}
+}
+
+func TestPlaintextModeAcceptsBrowserOriginViaForwardedHostMultiProxy(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(
+		staticFailValidator{err: errors.New("token rejected")},
+		socks,
+		tunnelserver.HandlerOptions{TrustForwardedProto: true},
+	)
+
+	// Multi-proxy deployment: X-Forwarded-Host is comma-separated; the
+	// leftmost entry is the original client-facing host.
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req.Host = "localhost:8080"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "authunnel.example.com, proxy.internal")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusForbidden && strings.Contains(rr.Body.String(), "cross-origin") {
+		t.Fatal("expected leftmost X-Forwarded-Host entry to be used for origin check, but was rejected as cross-origin")
+	}
+}
+
+func TestPlaintextModeIgnoresForwardedHostWhenNotEnabled(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req.Host = "localhost:8080"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "authunnel.example.com")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected cross-origin rejection without TrustForwardedProto, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "cross-origin") {
+		t.Fatalf("expected cross-origin error, got %q", rr.Body.String())
+	}
+}
+
+func TestPlaintextModeIgnoresForwardedProtoWhenNotEnabled(t *testing.T) {
+	socks, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+	// Default handler: TrustForwardedProto not set.
+	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
+
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/socks", nil)
+	req.Host = "authunnel.example"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Origin", "https://authunnel.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Authorization", "Bearer valid-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected cross-origin rejection without TrustForwardedProto, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "cross-origin") {
+		t.Fatalf("expected cross-origin error, got %q", rr.Body.String())
+	}
+}
+
+func minimalACMElessEnv(key string) string {
+	switch key {
+	case "OIDC_ISSUER":
+		return "https://issuer.example"
+	case "TOKEN_AUDIENCE":
+		return "authunnel-server"
+	default:
+		return ""
 	}
 }
 

@@ -15,7 +15,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 ## Components
 
 - `server/server.go`
-  - HTTPS server on a configurable listen address, default `:8443`
+  - HTTPS server on a configurable listen address (default `:8443` for TLS-files, `:443` for ACME, `:8080` for plaintext-behind-reverse-proxy)
   - Conservative HTTP server timeouts to reduce slow-client resource exhaustion risk
   - Structured JSON request logs with request/trace correlation IDs
   - Tunnel logs include the authenticated user, with per-destination SOCKS CONNECT logs at debug level
@@ -30,7 +30,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 
 ### Server flow
 
-1. Reads OIDC issuer, audience, listen address, and TLS file paths from flags or environment.
+1. Reads OIDC issuer, audience, listen address, and TLS mode configuration from flags or environment.
 2. Discovers issuer metadata and JWKS.
 3. Verifies bearer-token signature, issuer, expiration, and audience.
 4. Accepts WebSocket connections at `/protected/socks`.
@@ -67,9 +67,13 @@ Authunnel enforces authentication (JWT validation) at the WebSocket layer before
 - Go 1.24.10+
 - An OIDC provider that issues JWT access tokens
 - A server audience configured in the IdP and emitted into access-token `aud`
-- A local TLS certificate trusted by the client runtime
+- A TLS certificate trusted by the client runtime (for TLS-files mode; not required for ACME or plaintext-behind-reverse-proxy modes)
 
 ### Start server
+
+Choose one TLS mode. All modes also accept `--oidc-issuer`, `--token-audience`, `--listen-addr`, `--log-level`, and `--allow`.
+
+**TLS certificate files** (default `:8443`):
 
 ```bash
 export OIDC_ISSUER='https://<issuer>'
@@ -77,18 +81,57 @@ export TOKEN_AUDIENCE='authunnel-server'
 export TLS_CERT_FILE='/etc/authunnel/tls/server.crt'
 export TLS_KEY_FILE='/etc/authunnel/tls/server.key'
 
-cd server
-go run .
+cd server && go run .
 ```
+
+**ACME / Let's Encrypt** (default `:443`; server must be reachable on port 443):
+
+```bash
+export OIDC_ISSUER='https://<issuer>'
+export TOKEN_AUDIENCE='authunnel-server'
+export ACME_DOMAINS='authunnel.example.com'
+export ACME_CACHE_DIR='/var/cache/authunnel/acme'
+
+cd server && go run .
+```
+
+Certificates are obtained and renewed automatically using the TLS-ALPN-01 challenge. The cache directory must be writable by the server process and should persist across restarts to avoid hitting Let's Encrypt rate limits.
+
+**Plaintext HTTP** (default `:8080`; for use behind a TLS-terminating reverse proxy):
+
+```bash
+export OIDC_ISSUER='https://<issuer>'
+export TOKEN_AUDIENCE='authunnel-server'
+
+cd server && go run . --plaintext-behind-reverse-proxy
+```
+
+The server trusts `X-Forwarded-Proto` and `X-Forwarded-Host` for WebSocket origin checks. Most proxies forward these automatically; nginx requires explicit configuration:
+
+```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+**Security note:** The reverse proxy must strip or overwrite any `X-Forwarded-Proto` and `X-Forwarded-Host` headers supplied by clients before forwarding requests to the backend. If client-supplied headers are forwarded unchanged, a malicious client can set them to arbitrary values and influence the WebSocket origin check. Add the following to your nginx configuration to ensure this:
+
+```nginx
+proxy_set_header X-Forwarded-Host $host;
+```
+
+Caddy, AWS ALB, Traefik, and HAProxy overwrite these headers with trusted values by default.
 
 Useful server flags and environment variables:
 
 - `--oidc-issuer` or `OIDC_ISSUER`
 - `--token-audience` or `TOKEN_AUDIENCE`
-- `--listen-addr` or `LISTEN_ADDR` with default `:8443`
+- `--listen-addr` or `LISTEN_ADDR` (default varies by TLS mode; see above)
 - `--log-level` or `LOG_LEVEL` with default `info`
-- `--tls-cert` or `TLS_CERT_FILE`
-- `--tls-key` or `TLS_KEY_FILE`
+- `--tls-cert` or `TLS_CERT_FILE` — path to TLS certificate PEM
+- `--tls-key` or `TLS_KEY_FILE` — path to TLS private key PEM
+- `--acme-domain` or `ACME_DOMAINS` (comma-separated) — domain(s) for automatic ACME certificate; repeatable
+- `--acme-cache-dir` or `ACME_CACHE_DIR` with default `/var/cache/authunnel/acme`
+- `--plaintext-behind-reverse-proxy` or `PLAINTEXT_BEHIND_REVERSE_PROXY=true` — serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; `X-Forwarded-Proto` and `X-Forwarded-Host` are used for WebSocket origin checks
 - `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable; if unset all connections are allowed
 
 Rule formats: `host-glob:port`, `host-glob:lo-hi`, `CIDR:port`, `CIDR:lo-hi`, `[IPv6]:port`, `[IPv6]:lo-hi`

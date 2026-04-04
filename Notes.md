@@ -294,8 +294,7 @@ client secret. The server startup inputs are:
 
 - `OIDC_ISSUER`
 - `TOKEN_AUDIENCE`
-- `TLS_CERT_FILE`
-- `TLS_KEY_FILE`
+- One TLS mode: `TLS_CERT_FILE`+`TLS_KEY_FILE`, or `ACME_DOMAINS`, or `PLAINTEXT_BEHIND_REVERSE_PROXY=true`
 
 At runtime the server validates:
 

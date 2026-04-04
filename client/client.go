@@ -20,6 +20,8 @@ import (
 	"authunnel/internal/security"
 )
 
+var version = "dev"
+
 const (
 	socksVersion5       = 0x05
 	socksCmdConnect     = 0x01
@@ -93,6 +95,10 @@ Connection:
 
   --ws-url <url>               WebSocket tunnel endpoint URL
                                (default: https://localhost:8443/protected/socks)
+
+Other:
+
+  version, --version           Print version and exit
 `)
 }
 
@@ -143,9 +149,15 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 		clientUsage(os.Stdout)
 		return cfg, flag.ErrHelp
 	}
+	if len(args) > 0 && args[0] == "version" {
+		fmt.Fprintln(os.Stdout, version)
+		return cfg, flag.ErrHelp
+	}
 
 	fs := flag.NewFlagSet("authunnel-client", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	var showVersion bool
+	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.AccessToken, "access-token", cfg.AccessToken, "Bearer token for manual authentication (not recommended; prefer OIDC or ACCESS_TOKEN env var)")
 	fs.StringVar(&cfg.WebSocketURL, "ws-url", "https://localhost:8443/protected/socks", "WebSocket URL for the authenticated socks tunnel endpoint")
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
@@ -162,6 +174,10 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 			clientUsage(os.Stdout)
 		}
 		return cfg, err
+	}
+	if showVersion {
+		fmt.Fprintln(os.Stdout, version)
+		return cfg, flag.ErrHelp
 	}
 
 	var oidcScopesSet bool

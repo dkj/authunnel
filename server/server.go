@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,16 +15,26 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/acme/autocert"
+
 	"authunnel/internal/security"
 	"authunnel/internal/tunnelserver"
 )
+
+var version = "dev"
 
 type serverConfig struct {
 	Issuer        string
 	TokenAudience string
 	ListenAddr    string
-	TLSCertPath   string
-	TLSKeyPath    string
+	// TLS files mode
+	TLSCertPath string
+	TLSKeyPath  string
+	// ACME mode
+	ACMEDomains  []string
+	ACMECacheDir string
+	// Plaintext mode (behind a TLS-terminating reverse proxy)
+	PlaintextBehindProxy bool
 	LogLevel      slog.Level
 	AllowRules    tunnelserver.Allowlist
 }
@@ -35,14 +46,29 @@ Flags and their environment variable equivalents:
 
   --oidc-issuer <url>        OIDC issuer URL for JWT discovery and validation (env: OIDC_ISSUER)
   --token-audience <string>  Audience required in validated access tokens (env: TOKEN_AUDIENCE)
-  --listen-addr <addr>       HTTPS listen address (env: LISTEN_ADDR, default: :8443)
-  --tls-cert <path>          Path to the TLS certificate PEM file (env: TLS_CERT_FILE)
-  --tls-key <path>           Path to the TLS private key PEM file (env: TLS_KEY_FILE)
+  --listen-addr <addr>       Listen address (env: LISTEN_ADDR, default: :8443 for TLS-files, :443 for ACME, :8080 for plaintext-behind-reverse-proxy)
   --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)
   --allow <rule>             Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated).
                              Rule formats: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi.
                              IPv6 addresses must use bracketed notation, e.g. [::1]:22.
                              With no rules, all connections are allowed.
+
+TLS mode (choose exactly one):
+
+  --tls-cert <path>          Path to the TLS certificate PEM file (env: TLS_CERT_FILE)
+  --tls-key <path>           Path to the TLS private key PEM file (env: TLS_KEY_FILE)
+
+  --acme-domain <host>       Domain for automatic ACME/Let's Encrypt certificate (repeatable; env: ACME_DOMAINS comma-separated)
+  --acme-cache-dir <dir>     Directory to cache ACME certificates (env: ACME_CACHE_DIR, default: /var/cache/authunnel/acme)
+
+  --plaintext-behind-reverse-proxy
+                             Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security.
+                             X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks.
+                             (env: PLAINTEXT_BEHIND_REVERSE_PROXY=true)
+
+Other:
+
+  version, --version         Print version and exit
 `)
 }
 
@@ -63,13 +89,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	logger.Info("server_starting", slog.String("version", version))
+
+	if len(cfg.ACMEDomains) > 0 {
+		if err := checkACMECacheDir(cfg.ACMECacheDir); err != nil {
+			logger.Error("acme_cache_dir_error", slog.String("path", cfg.ACMECacheDir), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}
+
 	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), cfg.Issuer, cfg.TokenAudience, http.DefaultClient)
 	if err != nil {
 		logger.Error("create token validator", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules))
+	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules),
+		tunnelserver.HandlerOptions{TrustForwardedProto: cfg.PlaintextBehindProxy})
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           tunnelserver.NewRequestLoggingMiddleware(logger, serverMux),
@@ -88,10 +124,32 @@ func main() {
 	if err := security.Harden(); err != nil {
 		logger.Warn("harden_failed", slog.String("error", err.Error()))
 	}
-	logger.Info("server_listening", slog.String("listen_addr", cfg.ListenAddr))
-	if err := httpServer.ServeTLS(ln, cfg.TLSCertPath, cfg.TLSKeyPath); err != nil {
-		logger.Error("server_exited", slog.String("error", err.Error()))
-		os.Exit(1)
+
+	switch {
+	case len(cfg.ACMEDomains) > 0:
+		m := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(cfg.ACMEDomains...),
+			Cache:      autocert.DirCache(cfg.ACMECacheDir),
+		}
+		logger.Info("server_listening", slog.String("listen_addr", cfg.ListenAddr), slog.String("mode", "acme"))
+		tlsListener := tls.NewListener(ln, m.TLSConfig())
+		if err := httpServer.Serve(tlsListener); err != nil {
+			logger.Error("server_exited", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	case cfg.PlaintextBehindProxy:
+		logger.Info("server_listening", slog.String("listen_addr", cfg.ListenAddr), slog.String("mode", "plaintext"))
+		if err := httpServer.Serve(ln); err != nil {
+			logger.Error("server_exited", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	default:
+		logger.Info("server_listening", slog.String("listen_addr", cfg.ListenAddr), slog.String("mode", "tls"))
+		if err := httpServer.ServeTLS(ln, cfg.TLSCertPath, cfg.TLSKeyPath); err != nil {
+			logger.Error("server_exited", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
 	}
 }
 
@@ -99,31 +157,59 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	cfg := serverConfig{
 		Issuer:        getenv("OIDC_ISSUER"),
 		TokenAudience: getenv("TOKEN_AUDIENCE"),
-		ListenAddr:    ":8443",
 		TLSCertPath:   getenv("TLS_CERT_FILE"),
 		TLSKeyPath:    getenv("TLS_KEY_FILE"),
+		ACMECacheDir:  "/var/cache/authunnel/acme",
 		LogLevel:      slog.LevelInfo,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
 	}
+	if cacheDir := getenv("ACME_CACHE_DIR"); cacheDir != "" {
+		cfg.ACMECacheDir = cacheDir
+	}
+	if getenv("PLAINTEXT_BEHIND_REVERSE_PROXY") == "true" {
+		cfg.PlaintextBehindProxy = true
+	}
 
 	envLogLevel := getenv("LOG_LEVEL")
 	envAllowRules := getenv("ALLOW_RULES")
+	envACMEDomains := getenv("ACME_DOMAINS")
 	logLevelFlagSet := false
+	listenAddrFlagSet := false
 
 	if len(args) > 0 && args[0] == "help" {
 		serverUsage(os.Stdout)
 		return cfg, flag.ErrHelp
 	}
+	if len(args) > 0 && args[0] == "version" {
+		fmt.Fprintln(os.Stdout, version)
+		return cfg, flag.ErrHelp
+	}
 
 	fs := flag.NewFlagSet("authunnel-server", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	var showVersion bool
+	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.Issuer, "oidc-issuer", cfg.Issuer, "OIDC issuer used for JWT discovery and validation")
 	fs.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "Audience required in validated access tokens")
-	fs.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTPS listen address")
 	fs.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "Path to the TLS certificate PEM file")
 	fs.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "Path to the TLS private key PEM file")
+	fs.StringVar(&cfg.ACMECacheDir, "acme-cache-dir", cfg.ACMECacheDir, "Directory to cache ACME certificates")
+	fs.BoolVar(&cfg.PlaintextBehindProxy, "plaintext-behind-reverse-proxy", cfg.PlaintextBehindProxy,
+		"Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks")
+	fs.Func("listen-addr", "Listen address", func(value string) error {
+		cfg.ListenAddr = value
+		listenAddrFlagSet = true
+		return nil
+	})
+	fs.Func("acme-domain", "Domain for ACME certificate (repeatable)", func(value string) error {
+		if strings.TrimSpace(value) == "" {
+			return errors.New("--acme-domain value cannot be empty")
+		}
+		cfg.ACMEDomains = append(cfg.ACMEDomains, strings.TrimSpace(value))
+		return nil
+	})
 	fs.Var(&tunnelserver.AllowlistFlag{Rules: &cfg.AllowRules}, "allow",
 		"Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated). Rule: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi. IPv6 requires bracketed notation e.g. [::1]:22. With no rules all connections are allowed.")
 	fs.Func("log-level", "Structured log level: debug, info, warn, or error", func(value string) error {
@@ -141,6 +227,10 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		}
 		return cfg, err
 	}
+	if showVersion {
+		fmt.Fprintln(os.Stdout, version)
+		return cfg, flag.ErrHelp
+	}
 	if !logLevelFlagSet && envLogLevel != "" {
 		level, err := parseServerLogLevel(envLogLevel)
 		if err != nil {
@@ -157,6 +247,31 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		// fs.Parse) are additive on top.
 		cfg.AllowRules = append(envRules, cfg.AllowRules...)
 	}
+	if envACMEDomains != "" {
+		// Env domains form the baseline; --acme-domain flags are additive on top.
+		// Filter empty entries so that ACME_DOMAINS=example.com, (trailing comma)
+		// or ACME_DOMAINS=, don't silently inject empty strings into the whitelist.
+		flagDomains := cfg.ACMEDomains
+		cfg.ACMEDomains = nil
+		for _, d := range strings.Split(envACMEDomains, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				cfg.ACMEDomains = append(cfg.ACMEDomains, d)
+			}
+		}
+		cfg.ACMEDomains = append(cfg.ACMEDomains, flagDomains...)
+	}
+
+	// Apply per-mode listen address defaults if not explicitly set.
+	if cfg.ListenAddr == "" && !listenAddrFlagSet {
+		switch {
+		case len(cfg.ACMEDomains) > 0:
+			cfg.ListenAddr = ":443"
+		case cfg.PlaintextBehindProxy:
+			cfg.ListenAddr = ":8080"
+		default:
+			cfg.ListenAddr = ":8443"
+		}
+	}
 
 	if cfg.Issuer == "" {
 		return cfg, errors.New("--oidc-issuer or OIDC_ISSUER is required")
@@ -164,17 +279,57 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	if cfg.TokenAudience == "" {
 		return cfg, errors.New("--token-audience or TOKEN_AUDIENCE is required")
 	}
-	if cfg.TLSCertPath == "" {
-		return cfg, errors.New("--tls-cert or TLS_CERT_FILE is required")
-	}
-	if cfg.TLSKeyPath == "" {
-		return cfg, errors.New("--tls-key or TLS_KEY_FILE is required")
-	}
 	if cfg.ListenAddr == "" {
 		return cfg, errors.New("--listen-addr or LISTEN_ADDR cannot be empty")
 	}
 
+	// Validate TLS mode mutual exclusion.
+	tlsFilesMode := cfg.TLSCertPath != "" || cfg.TLSKeyPath != ""
+	acmeMode := len(cfg.ACMEDomains) > 0
+	plaintextMode := cfg.PlaintextBehindProxy
+
+	modes := 0
+	for _, active := range []bool{tlsFilesMode, acmeMode, plaintextMode} {
+		if active {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return cfg, errors.New("only one of --tls-cert/--tls-key, --acme-domain, or --plaintext-behind-reverse-proxy may be specified")
+	}
+	if modes == 0 {
+		return cfg, errors.New("one of --tls-cert/--tls-key, --acme-domain, or --plaintext-behind-reverse-proxy is required")
+	}
+
+	// Per-mode sub-validation.
+	switch {
+	case tlsFilesMode:
+		if cfg.TLSCertPath == "" {
+			return cfg, errors.New("--tls-cert or TLS_CERT_FILE is required when --tls-key is provided")
+		}
+		if cfg.TLSKeyPath == "" {
+			return cfg, errors.New("--tls-key or TLS_KEY_FILE is required when --tls-cert is provided")
+		}
+	case acmeMode:
+		if cfg.ACMECacheDir == "" {
+			return cfg, errors.New("--acme-cache-dir or ACME_CACHE_DIR cannot be empty")
+		}
+	}
+
 	return cfg, nil
+}
+
+func checkACMECacheDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create ACME cache directory: %w", err)
+	}
+	f, err := os.CreateTemp(dir, ".acme-probe-*")
+	if err != nil {
+		return fmt.Errorf("ACME cache directory is not writable: %w", err)
+	}
+	f.Close()
+	os.Remove(f.Name())
+	return nil
 }
 
 func parseServerLogLevel(value string) (slog.Level, error) {
