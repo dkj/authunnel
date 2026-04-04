@@ -201,6 +201,64 @@ func TestObservedSOCKSRuleSetLogsRequestedDestinationAtDebug(t *testing.T) {
 	}
 }
 
+func TestObservedSOCKSRuleSetDeniesConnectionNotMatchingAllowlist(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	rule, err := ParseAllowRule("*.internal:22")
+	if err != nil {
+		t.Fatalf("ParseAllowRule: %v", err)
+	}
+	ruleset := observedSOCKSRuleSet{
+		logger:     logger,
+		allowRules: Allowlist{rule},
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			FQDN: "evil.external",
+			Port: 22,
+		},
+	})
+	if ok {
+		t.Fatal("expected connection to evil.external to be denied")
+	}
+
+	entry := parseLogEntryByMessage(t, logBuf.String(), "socks_connect_denied")
+	if got := entry["target_host"]; got != "evil.external" {
+		t.Fatalf("unexpected target_host in deny log: got %#v", got)
+	}
+	if got := entry["level"]; got != "WARN" {
+		t.Fatalf("expected warn level, got %#v", got)
+	}
+}
+
+func TestObservedSOCKSRuleSetAllowsConnectionMatchingAllowlist(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	rule, err := ParseAllowRule("*.internal:22")
+	if err != nil {
+		t.Fatalf("ParseAllowRule: %v", err)
+	}
+	ruleset := observedSOCKSRuleSet{
+		logger:     logger,
+		allowRules: Allowlist{rule},
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			FQDN: "db.internal",
+			Port: 22,
+		},
+	})
+	if !ok {
+		t.Fatal("expected connection to db.internal:22 to be allowed")
+	}
+}
+
 type staticFailValidator struct {
 	err error
 }

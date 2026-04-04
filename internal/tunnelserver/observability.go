@@ -37,7 +37,8 @@ type SOCKSServer interface {
 }
 
 type observedSOCKSServer struct {
-	stdLogger *log.Logger
+	stdLogger  *log.Logger
+	allowRules Allowlist
 }
 
 type observedTunnelConn struct {
@@ -51,8 +52,8 @@ type socksConnectDetails struct {
 	TargetPort int
 }
 
-func NewObservedSOCKSServer(stdLogger *log.Logger) SOCKSServer {
-	return &observedSOCKSServer{stdLogger: stdLogger}
+func NewObservedSOCKSServer(stdLogger *log.Logger, rules Allowlist) SOCKSServer {
+	return &observedSOCKSServer{stdLogger: stdLogger, allowRules: rules}
 }
 
 // newObservedTunnelConn preserves the concrete net.Conn behavior used by the
@@ -198,7 +199,7 @@ func (s *observedSOCKSServer) ServeConn(conn net.Conn) error {
 
 	server, err := socks5.New(&socks5.Config{
 		Logger: s.stdLogger,
-		Rules:  observedSOCKSRuleSet{logger: logger},
+		Rules:  observedSOCKSRuleSet{logger: logger, allowRules: s.allowRules},
 		Dial:   observedSOCKSDial(logger),
 	})
 	if err != nil {
@@ -208,7 +209,8 @@ func (s *observedSOCKSServer) ServeConn(conn net.Conn) error {
 }
 
 type observedSOCKSRuleSet struct {
-	logger *slog.Logger
+	logger     *slog.Logger
+	allowRules Allowlist
 }
 
 func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (context.Context, bool) {
@@ -233,6 +235,17 @@ func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (c
 			slog.String("target_host", details.TargetHost),
 			slog.Int("target_port", details.TargetPort),
 		)
+	}
+	// Security decision: apply operator-configured allowlist.
+	// Empty allowlist = open mode (allow all). Non-empty = deny unless a rule matches.
+	// Pass the raw FQDN and IP separately so CIDR rules and hostname-glob rules
+	// are evaluated independently — details.TargetHost collapses the two.
+	if !r.allowRules.Permits(req.DestAddr.FQDN, req.DestAddr.IP, req.DestAddr.Port) {
+		logger.Warn("socks_connect_denied",
+			slog.String("target_host", details.TargetHost),
+			slog.Int("target_port", details.TargetPort),
+		)
+		return ctx, false
 	}
 	return context.WithValue(ctx, socksConnectContextKey, details), true
 }

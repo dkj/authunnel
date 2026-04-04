@@ -1,6 +1,6 @@
 # Authunnel
 
-Authunnel is a proof-of-concept authenticated tunnel for reaching private TCP services, including SSH, through an OAuth2-protected TLS WebSocket conduit.
+Authunnel is an authenticated tunnel for reaching private TCP services, including SSH, through an OAuth2-protected TLS WebSocket conduit.
 
 The target workflow is:
 
@@ -50,6 +50,16 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 4. In ProxyCommand mode it performs a SOCKS5 CONNECT for `%h:%p` and bridges `stdin/stdout`.
 5. In unix-socket mode it exposes a local SOCKS5 endpoint and opens a dedicated tunnel per local connection.
 
+## Security Posture
+
+Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. The `--allow` option provides a second layer of control over *where* an authenticated user can connect.
+
+**Open mode (no `--allow` rules — the default):** Any destination reachable by the server process is accessible to authenticated clients. This is convenient and gives operators full visibility: every SOCKS CONNECT destination is logged at debug level.
+
+**Allowlist mode (one or more `--allow` rules):** Only destinations matching a rule are permitted. Denied attempts are logged at warn level. This limits exposure if a credential is compromised, at the cost of requiring explicit enumeration of allowed targets.
+
+**The "tunnels within tunnels" trade-off:** Authunnel is itself a tunneling tool. In open mode a client could make a SOCKS CONNECT to another proxy or tunnel that then reaches a second destination the Authunnel server cannot observe or log. Allowlisting reduces this surface — but it cannot eliminate it for destinations that are themselves allowed. Operators should treat `--allow` rules as defence-in-depth rather than a complete control boundary. Conversely, locking down the allowlist too aggressively can impede the visibility that makes Authunnel useful as a monitored ingress point, since permitted connections can still forward traffic opaquely once the tunnel is open.
+
 ## Usage
 
 ### Prerequisites
@@ -79,6 +89,20 @@ Useful server flags and environment variables:
 - `--log-level` or `LOG_LEVEL` with default `info`
 - `--tls-cert` or `TLS_CERT_FILE`
 - `--tls-key` or `TLS_KEY_FILE`
+- `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable; if unset all connections are allowed
+
+Rule formats: `host-glob:port`, `host-glob:lo-hi`, `CIDR:port`, `CIDR:lo-hi`, `[IPv6]:port`, `[IPv6]:lo-hi`
+
+IPv6 addresses must use bracketed notation (`[addr]:port`). Unbracketed IPv6 is rejected at startup because the last-colon port split is otherwise ambiguous.
+
+```bash
+# Only allow SSH to *.internal and HTTPS to the 10.x network
+authunnel-server --allow '*.internal:22' --allow '10.0.0.0/8:443'
+# Or via environment variable (comma-separated)
+ALLOW_RULES='*.internal:22,10.0.0.0/8:443' authunnel-server
+# IPv6 example
+authunnel-server --allow '[::1]:22' --allow '[2001:db8::1]:443'
+```
 
 ### Managed OIDC client mode
 

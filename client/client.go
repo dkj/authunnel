@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"authunnel/internal/security"
 )
 
 const (
@@ -108,6 +110,10 @@ func main() {
 		log.Fatalf("invalid configuration: %v", err)
 	}
 
+	if err := security.Harden(); err != nil {
+		log.Printf("warning: harden failed: %v", err)
+	}
+
 	ctx := context.Background()
 	if cfg.ProxyCommandMode {
 		if err := runProxyCommandMode(ctx, cfg, source); err != nil {
@@ -168,6 +174,9 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	hasOIDC := cfg.OIDCIssuer != "" || cfg.OIDCClientID != ""
 	if cfg.OIDCRedirectPort < 0 || cfg.OIDCRedirectPort > 65535 {
 		return cfg, errors.New("--oidc-redirect-port must be between 0 and 65535")
+	}
+	if cfg.OIDCRedirectPort != 0 && cfg.OIDCRedirectPort < 1024 {
+		return cfg, errors.New("--oidc-redirect-port must be 0 (random) or >= 1024; low ports are unavailable after capability hardening")
 	}
 	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
 		return cfg, errors.New("--access-token / ACCESS_TOKEN cannot be combined with managed OIDC flags")

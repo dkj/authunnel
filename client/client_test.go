@@ -203,7 +203,7 @@ func TestEnsureUnixSocketDirLeavesExistingDirectoryPermissionsAlone(t *testing.T
 }
 
 func TestTightenUnixSocketPermissionsSetsOwnerOnlyMode(t *testing.T) {
-	socketDir, err := os.MkdirTemp(".", "socktest-")
+	socketDir, err := os.MkdirTemp("", "socktest-")
 	if err != nil {
 		t.Fatalf("create temp socket dir: %v", err)
 	}

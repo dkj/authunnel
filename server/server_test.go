@@ -583,3 +583,84 @@ func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	t.Cleanup(server.Close)
 	return server
 }
+
+func minimalServerEnv(key string) string {
+	switch key {
+	case "OIDC_ISSUER":
+		return "https://issuer.example"
+	case "TOKEN_AUDIENCE":
+		return "authunnel-server"
+	case "TLS_CERT_FILE":
+		return "/env/server.crt"
+	case "TLS_KEY_FILE":
+		return "/env/server.key"
+	default:
+		return ""
+	}
+}
+
+func TestParseServerConfigAllowFlag(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--allow", "*.internal:22",
+		"--allow", "10.0.0.0/8:443",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if len(cfg.AllowRules) != 2 {
+		t.Fatalf("expected 2 allow rules, got %d", len(cfg.AllowRules))
+	}
+}
+
+func TestParseServerConfigAllowRulesEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		if key == "ALLOW_RULES" {
+			return "*.internal:22,10.0.0.0/8:443"
+		}
+		return minimalServerEnv(key)
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if len(cfg.AllowRules) != 2 {
+		t.Fatalf("expected 2 allow rules from env, got %d", len(cfg.AllowRules))
+	}
+}
+
+func TestParseServerConfigAllowFlagAndEnvAreCombined(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--allow", "10.0.0.0/8:443",
+	}, func(key string) string {
+		if key == "ALLOW_RULES" {
+			return "*.internal:22"
+		}
+		return minimalServerEnv(key)
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if len(cfg.AllowRules) != 2 {
+		t.Fatalf("expected 2 allow rules (env + flag), got %d", len(cfg.AllowRules))
+	}
+}
+
+func TestParseServerConfigRejectsInvalidAllowRule(t *testing.T) {
+	_, err := parseServerConfig([]string{
+		"--allow", "notarule",
+	}, minimalServerEnv)
+	if err == nil {
+		t.Fatal("expected error for invalid allow rule, got nil")
+	}
+}
+
+func TestParseServerConfigRejectsInvalidAllowRulesEnv(t *testing.T) {
+	_, err := parseServerConfig(nil, func(key string) string {
+		if key == "ALLOW_RULES" {
+			return "*.internal:notaport"
+		}
+		return minimalServerEnv(key)
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid ALLOW_RULES env, got nil")
+	}
+}

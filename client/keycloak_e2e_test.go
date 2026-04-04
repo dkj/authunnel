@@ -22,12 +22,32 @@ import (
 	"authunnel/internal/tunnelserver"
 )
 
+func waitForKeycloak(issuer string, timeout time.Duration) error {
+	discovery := issuer + "/.well-known/openid-configuration"
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(discovery)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("keycloak not ready at %s after %s", discovery, timeout)
+}
+
 func TestKeycloakProxyCommandManagedOIDCE2E(t *testing.T) {
 	if os.Getenv("AUTHUNNEL_E2E") != "1" {
 		t.Skip("set AUTHUNNEL_E2E=1 to run Keycloak-backed end-to-end tests")
 	}
 
 	issuer := getenvDefault("KEYCLOAK_ISSUER", "http://127.0.0.1:18080/realms/authunnel")
+	if err := waitForKeycloak(issuer, 60*time.Second); err != nil {
+		t.Fatalf("keycloak readiness check failed: %v", err)
+	}
 	clientID := getenvDefault("KEYCLOAK_CLIENT_ID", "authunnel-cli")
 	username := getenvDefault("KEYCLOAK_USERNAME", "dev-user")
 	password := getenvDefault("KEYCLOAK_PASSWORD", "dev-password")
