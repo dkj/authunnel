@@ -1,5 +1,7 @@
 # Authunnel
 
+![Lock](Lock.svg)
+
 Authunnel is an authenticated tunnel for reaching private TCP services, including SSH, through an OAuth2-protected TLS WebSocket conduit.
 
 The target workflow is:
@@ -52,19 +54,21 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 
 ## Security Posture
 
+Authunnel is deliberately simple in both functionality and implementation — a small, focused codebase that is intended to be easy to read and audit in full. Complexity is kept low by design; if a feature would make the security model harder to reason about, that is a reason not to add it.
+
 Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. The `--allow` option provides a second layer of control over *where* an authenticated user can connect.
 
 **Open mode (no `--allow` rules — the default):** Any destination reachable by the server process is accessible to authenticated clients. This is convenient and gives operators full visibility: every SOCKS CONNECT destination is logged at debug level.
 
 **Allowlist mode (one or more `--allow` rules):** Only destinations matching a rule are permitted. Denied attempts are logged at warn level. This limits exposure if a credential is compromised, at the cost of requiring explicit enumeration of allowed targets.
 
-**The "tunnels within tunnels" trade-off:** Authunnel is itself a tunneling tool. In open mode a client could make a SOCKS CONNECT to another proxy or tunnel that then reaches a second destination the Authunnel server cannot observe or log. Allowlisting reduces this surface — but it cannot eliminate it for destinations that are themselves allowed. Operators should treat `--allow` rules as defence-in-depth rather than a complete control boundary. Conversely, locking down the allowlist too aggressively can impede the visibility that makes Authunnel useful as a monitored ingress point, since permitted connections can still forward traffic opaquely once the tunnel is open.
+**Note:** Like any tunnel, Authunnel can only log and control the connections it directly brokers; what an authenticated client does once a connection is open is outside its scope — for example, a client could SOCKS CONNECT to a second tunnel or proxy, creating a chain that Authunnel cannot observe.
 
 ## Usage
 
 ### Prerequisites
 
-- Go 1.24.10+
+- Go 1.25.0+
 - An OIDC provider that issues JWT access tokens
 - A server audience configured in the IdP and emitted into access-token `aud`
 - A TLS certificate trusted by the client runtime (for TLS-files mode; not required for ACME or plaintext-behind-reverse-proxy modes)
@@ -81,7 +85,7 @@ export TOKEN_AUDIENCE='authunnel-server'
 export TLS_CERT_FILE='/etc/authunnel/tls/server.crt'
 export TLS_KEY_FILE='/etc/authunnel/tls/server.key'
 
-cd server && go run .
+cd server && CGO_ENABLED=0 go run .
 ```
 
 **ACME / Let's Encrypt** (default `:443`; server must be reachable on port 443):
@@ -92,7 +96,7 @@ export TOKEN_AUDIENCE='authunnel-server'
 export ACME_DOMAINS='authunnel.example.com'
 export ACME_CACHE_DIR='/var/cache/authunnel/acme'
 
-cd server && go run .
+cd server && CGO_ENABLED=0 go run .
 ```
 
 Certificates are obtained and renewed automatically using the TLS-ALPN-01 challenge. The cache directory must be writable by the server process and should persist across restarts to avoid hitting Let's Encrypt rate limits.
@@ -103,7 +107,7 @@ Certificates are obtained and renewed automatically using the TLS-ALPN-01 challe
 export OIDC_ISSUER='https://<issuer>'
 export TOKEN_AUDIENCE='authunnel-server'
 
-cd server && go run . --plaintext-behind-reverse-proxy
+cd server && CGO_ENABLED=0 go run . --plaintext-behind-reverse-proxy
 ```
 
 The server trusts `X-Forwarded-Proto` and `X-Forwarded-Host` for WebSocket origin checks. Most proxies forward these automatically; nginx requires explicit configuration:
@@ -187,7 +191,7 @@ A pre-obtained bearer token can be supplied via the `ACCESS_TOKEN` environment v
 ```bash
 export ACCESS_TOKEN='<access-token>'
 cd client
-SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
+CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
 ```
 
 ProxyCommand example with a pre-supplied token:
@@ -203,7 +207,7 @@ ProxyCommand example with a pre-supplied token:
 
 ```bash
 cd client
-SSL_CERT_FILE=../cert.pem go run . \
+CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
   --oidc-issuer https://<issuer> \
   --oidc-client-id authunnel-cli \
   --unix-socket /tmp/authunnel/proxy.sock
@@ -307,14 +311,14 @@ export TLS_CERT_FILE='../cert.pem'
 export TLS_KEY_FILE='../key.pem'
 
 cd server
-go run .
+CGO_ENABLED=0 go run .
 ```
 
 ### 3) Start Authunnel client in managed mode
 
 ```bash
 cd client
-SSL_CERT_FILE=../cert.pem go run . \
+CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
   --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
   --oidc-client-id authunnel-cli \
   --oidc-scopes openid \

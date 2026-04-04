@@ -117,7 +117,7 @@ func main() {
 	}
 
 	if err := security.Harden(); err != nil {
-		log.Printf("warning: harden failed: %v", err)
+		log.Fatalf("harden failed: %v", err)
 	}
 
 	ctx := context.Background()

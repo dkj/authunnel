@@ -122,7 +122,8 @@ func main() {
 		os.Exit(1)
 	}
 	if err := security.Harden(); err != nil {
-		logger.Warn("harden_failed", slog.String("error", err.Error()))
+		logger.Error("harden_failed", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	switch {
