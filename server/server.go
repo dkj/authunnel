@@ -21,6 +21,8 @@ import (
 	"authunnel/internal/tunnelserver"
 )
 
+var version = "dev"
+
 type serverConfig struct {
 	Issuer        string
 	TokenAudience string
@@ -63,6 +65,10 @@ TLS mode (choose exactly one):
                              Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security.
                              X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks.
                              (env: PLAINTEXT_BEHIND_REVERSE_PROXY=true)
+
+Other:
+
+  version, --version         Print version and exit
 `)
 }
 
@@ -82,6 +88,8 @@ func main() {
 		logger.Error("invalid configuration", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+
+	logger.Info("server_starting", slog.String("version", version))
 
 	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), cfg.Issuer, cfg.TokenAudience, http.DefaultClient)
 	if err != nil {
@@ -167,9 +175,15 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		serverUsage(os.Stdout)
 		return cfg, flag.ErrHelp
 	}
+	if len(args) > 0 && args[0] == "version" {
+		fmt.Fprintln(os.Stdout, version)
+		return cfg, flag.ErrHelp
+	}
 
 	fs := flag.NewFlagSet("authunnel-server", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	var showVersion bool
+	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.Issuer, "oidc-issuer", cfg.Issuer, "OIDC issuer used for JWT discovery and validation")
 	fs.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "Audience required in validated access tokens")
 	fs.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "Path to the TLS certificate PEM file")
@@ -205,6 +219,10 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 			serverUsage(os.Stdout)
 		}
 		return cfg, err
+	}
+	if showVersion {
+		fmt.Fprintln(os.Stdout, version)
+		return cfg, flag.ErrHelp
 	}
 	if !logLevelFlagSet && envLogLevel != "" {
 		level, err := parseServerLogLevel(envLogLevel)

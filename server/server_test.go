@@ -202,6 +202,15 @@ func TestParseServerConfigHelpPositional(t *testing.T) {
 	}
 }
 
+func TestParseServerConfigVersionFlag(t *testing.T) {
+	for _, arg := range []string{"--version", "version"} {
+		_, err := parseServerConfig([]string{arg}, func(string) string { return "" })
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("parseServerConfig(%q) error = %v, want flag.ErrHelp", arg, err)
+		}
+	}
+}
+
 func TestParseServerConfigRejectsLegacyIssuerFlag(t *testing.T) {
 	_, err := parseServerConfig(
 		[]string{

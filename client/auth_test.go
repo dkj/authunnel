@@ -39,6 +39,15 @@ func TestParseClientConfigHelpPositional(t *testing.T) {
 	}
 }
 
+func TestParseClientConfigVersionFlag(t *testing.T) {
+	for _, arg := range []string{"--version", "version"} {
+		_, err := parseClientConfig([]string{arg}, func(string) string { return "" })
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("parseClientConfig(%q) error = %v, want flag.ErrHelp", arg, err)
+		}
+	}
+}
+
 func TestParseClientConfigAccessTokenFlag(t *testing.T) {
 	cfg, err := parseClientConfig([]string{"--access-token", "tok123"}, func(string) string { return "" })
 	if err != nil {
