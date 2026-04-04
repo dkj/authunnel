@@ -113,6 +113,14 @@ proxy_set_header Host $host;
 proxy_set_header X-Forwarded-Proto $scheme;
 ```
 
+**Security note:** The reverse proxy must strip or overwrite any `X-Forwarded-Proto` and `X-Forwarded-Host` headers supplied by clients before forwarding requests to the backend. If client-supplied headers are forwarded unchanged, a malicious client can set them to arbitrary values and influence the WebSocket origin check. Add the following to your nginx configuration to ensure this:
+
+```nginx
+proxy_set_header X-Forwarded-Host $host;
+```
+
+Caddy, AWS ALB, Traefik, and HAProxy overwrite these headers with trusted values by default.
+
 Useful server flags and environment variables:
 
 - `--oidc-issuer` or `OIDC_ISSUER`
