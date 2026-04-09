@@ -34,8 +34,10 @@ type JWTTokenValidator struct {
 	verifier *op.AccessTokenVerifier
 }
 
-// NewJWTTokenValidator performs provider discovery up front so configuration
-// errors fail at startup rather than on the first protected request.
+// NewJWTTokenValidator performs OIDC discovery once at startup, using it only
+// to locate the issuer's JWKS endpoint. All subsequent token validation is
+// done locally against that key set. Configuration errors fail at startup
+// rather than on the first protected request.
 func NewJWTTokenValidator(ctx context.Context, issuer, audience string, httpClient *http.Client) (*JWTTokenValidator, error) {
 	if issuer == "" {
 		return nil, errors.New("issuer is required")
