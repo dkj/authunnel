@@ -6,7 +6,7 @@ Remote access to internal SSH services is a common need across the institute. Th
 
 - **Teleport** integrates with Okta SSO and works well, but escalating licence fees are a growing concern for what is mostly used as an "SSH to an internal host" use case.
 - **VPN** is often effective for staff on Sanger laptops. However, it is not available to those working from non-Sanger machines, and it grants broader network access than some use cases require.
-- **The legacy bastion** (ssh-gateway) was decommissioned several years ago due to a lack of resource to maintain it and no integration with SSO.
+- **The legacy bastion** (ssh-gateway) was decommissioned several years ago due to a lack of resource to maintain it and no integration with SSO. _(Is this correct?)_
 
 Authunnel is a lightweight, purpose-built tool that fills these gaps. It tunnels SSH connections over an Okta-authenticated WebSocket, using infrastructure the institute already operates. Initially, it can complement existing access methods rather than necessarily replacing them.
 
@@ -16,9 +16,9 @@ Authunnel is an authenticated tunnel for reaching internal SSH services. Users r
 
 ## Why Authunnel
 
-1. **Zero licence cost, permanently.** Authunnel is a single Go binary with no commercial dependencies. There is no per-seat fee, no annual renewal, no vendor lock-in. The total infrastructure cost is one small VM.
+1. **Zero licence cost** Authunnel is a single Go binary with no commercial dependencies. There is no per-seat fee, no annual renewal, no vendor lock-in. The total infrastructure cost is one or two small VMs.
 
-2. **Uses existing Okta SSO.** No new identity system is required. Users authenticate via the same Okta login they already use. When someone is offboarded in Okta, they immediately lose Authunnel access. The server is a standard OAuth2 resource server — it uses OIDC discovery to locate the issuer's signing keys, then validates JWT access tokens locally. It requires only an issuer URL and a token audience — no client secrets, no synced user database.
+2. **Uses existing Okta SSO.** Users authenticate via the same Okta login they already use. When someone is offboarded in Okta, they immediately lose Authunnel access. It requires only an issuer URL and a token audience — no client secrets, no synced user database.
 
 3. **Can run behind Ivanti Traffic Manager.** Authunnel can run in plaintext mode behind a TLS-terminating reverse proxy, benefiting from the team's existing knowledge and experience of Ivanti as an external interface. Ivanti handles TLS certificates and termination as it already does for other services. No new TLS infrastructure is needed.
 
@@ -28,15 +28,15 @@ Authunnel is an authenticated tunnel for reaching internal SSH services. Users r
    - **Application layer:** The `--allow` option restricts which destinations authenticated users can reach, using host glob patterns and CIDR rules (e.g. `*.internal:22`, `10.0.0.0/8:22`).
    - **Network layer:** VMware or OpenStack security groups on the server VM control both inbound access (who can reach the Authunnel server) and outbound access (which internal hosts the server can connect to).
 
-   These layers are independent and composable — security groups provide a hard network boundary regardless of application configuration, while `--allow` rules provide finer-grained, operator-configurable control within that boundary. This is useful for granting access to specific services only, or for users who prefer not to route all traffic through the full network.
+   This is useful for granting access to specific services only, or for limiting exposure to the broader network.
 
-6. **Works from any machine.** The client is a statically compiled binary available for macOS and Linux (amd64 and arm64). It requires no special network configuration and no Sanger-issued hardware. This makes it suitable for staff working from personal machines, university desktops, or cloud development environments where the VPN is not an option.
+6. **Works from macOS or Linux machines.** The client is a statically compiled binary available for macOS and Linux (amd64 and arm64). It requires no special network configuration and no Sanger-issued hardware. This makes it suitable for staff working from personal machines, university desktops, or cloud development environments where the VPN is not an option. If Windows clients are required this should be a small amount of work to deliver.
 
 7. **Transparent audit trail.** Every tunnel is logged with the authenticated user's identity and destination. Denied connections are logged at warn level. Logs are structured JSON with request and trace correlation IDs, ready for ingestion into ELK or Splunk without custom parsing (see Logging & Observability below).
 
 8. **Familiar user experience.** Users add a `ProxyCommand` entry to their SSH config. On first use, a browser tab opens for Okta login. Subsequent SSH sessions reuse cached or refreshed tokens silently — SSH "just works" without re-authenticating each time.
 
-9. **Maintainable by design.** The codebase is deliberately kept small and simple. Any developer comfortable with Go can understand and patch the entire system. This directly addresses the skills gap that led to the decommissioning of the legacy bastion.
+9. **Maintainable by design.** The codebase is deliberately kept small and simple. Any developer comfortable with Go should be able to understand and patch the code if required.
 
 10. **Horizontally scalable.** Server instances share no state. Multiple instances can run behind Ivanti load balancing for high availability. Scaling is simply adding another VM.
 
@@ -130,10 +130,7 @@ Authunnel emits structured JSON logs to stderr via Go's `slog.JSONHandler`. Ever
 
 **Integration with ELK / Splunk:**
 
-Since the output is already structured JSON, no grok patterns or custom parsing are needed.
-
-- **ELK (Filebeat):** Configure Filebeat to read from the systemd journal (or a log file if stderr is redirected). Use the `json` input options for automatic field extraction. All fields are immediately available in Kibana.
-- **Splunk (Universal Forwarder):** Monitor the journal or log file. Set `INDEXED_EXTRACTIONS = json` in `props.conf` for automatic field extraction.
+Since the output is already structured JSON, integration with ELK (via Filebeat) or Splunk (via Universal Forwarder) requires only a standard JSON input — no grok patterns or custom parsing.
 
 Setting `--log-level debug` enables per-connection destination logging, providing full audit visibility of which internal hosts each user connects to.
 
@@ -147,17 +144,21 @@ Setting `--log-level debug` enables per-connection destination logging, providin
 | Maintainability over time | The codebase is ~2,000 lines of Go with an explicit design goal of auditability. It has significantly lower maintenance burden than a full platform like Teleport. |
 | Security of non-Sanger client machines | Authunnel does not trust the client machine. It provides only a tunnel — the SSH host still requires its own authentication (keys, certificates, etc.). Allow rules and VM security groups independently limit which destinations a tunnel can reach. |
 
+## Scope & Limitations
+
+Authunnel's current functionality is SSH tunnelling. It does not provide the additional capabilities that Teleport offers, such as Okta-gated access to internal web applications. Where those capabilities are needed, it may be worth exploring whether existing infrastructure — such as the Ivanti Traffic Manager or other systems — could provide them independently.
+
 ## Security Review
 
-The codebase is deliberately small (~2,000 lines of Go excluding tests) to make a thorough review practical. We would like the security team to review both the code and the deployment architecture before any production rollout. Specific areas where their input would be valuable:
+We would like the security team to consider reviewing the deployment architecture and the code with the prospect of a production rollout. A non-exhaustive list where their input would be valuable:
 
-- **Authentication model** — the server validates JWT access tokens locally via OIDC discovery and JWKS. Is the token validation (signature, issuer, expiry, audience) sufficient? Are there additional claims or checks that should be enforced?
+- **Authentication model** — the server validates JWT access tokens locally via OIDC discovery and JWKS. Is the token validation (signature, issuer, expiry, audience) sufficient? 
 - **Network architecture** — the server runs behind Ivanti with security groups restricting inbound and outbound traffic. Are the proposed security group rules and allow rules appropriate?
 - **Capability dropping** — on Linux, the server drops all capabilities and sets `PR_SET_NO_NEW_PRIVS` after binding ports. Is this hardening adequate for the deployment environment?
 - **Logging and monitoring** — are the logged fields sufficient for incident response and audit purposes? Are there additional events or fields the security team would want to see?
 - **Threat model** — what residual risks does the security team see with an authenticated WebSocket tunnel to internal SSH hosts, how do these compare with the existing Teleport provision, and what additional controls (if any) would they recommend?
 
-The codebase is open for review at any point. Given its size, a full read-through is realistic within a single session.
+The [codebase is open](https://github.com/dkj/authunnel/blob/main/README.md) and so avialable for review now. Given its size (~2,000 lines of Go excluding tests), a full read-through is realistic within a single session.
 
 ## Proposed Rollout
 
