@@ -8,7 +8,7 @@ The target workflow is:
 
 1. `ssh` launches the Authunnel client as `ProxyCommand`.
 2. The client reuses a cached token, refreshes it, or completes Authorization Code + PKCE in a browser.
-3. The Authunnel server validates the JWT access token against issuer discovery and JWKS.
+3. The Authunnel server, acting as an OAuth2 resource server, uses OIDC discovery to locate the issuer's JWKS endpoint and validates the JWT access token locally.
 4. The server hosts a SOCKS5 backend and opens the requested `%h:%p` destination.
 5. SSH stdio is bridged over that authenticated path.
 
@@ -19,9 +19,12 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 - `server/server.go`
   - HTTPS server on a configurable listen address (default `:8443` for TLS-files, `:443` for ACME, `:8080` for plaintext-behind-reverse-proxy)
   - Conservative HTTP server timeouts to reduce slow-client resource exhaustion risk
-  - Structured JSON request logs with request/trace correlation IDs
-  - Tunnel logs include the authenticated user, with per-destination SOCKS CONNECT logs at debug level
-  - JWT access-token validation via OIDC discovery + JWKS
+  - Structured JSON logs with three correlation IDs:
+    - `request_id` — generated per HTTP request; scoped to a single request/response cycle
+    - `trace_id` — extracted from an incoming `Traceparent` header (W3C Trace Context) when present, otherwise generated; allows correlation with upstream infrastructure such as a load balancer or reverse proxy
+    - `tunnel_id` — generated when a WebSocket upgrade succeeds; scoped to the lifetime of the SOCKS tunnel and inherited by all subsequent tunnel events (open, SOCKS CONNECT, close)
+  - Tunnel logs include the authenticated user identity, with per-destination SOCKS CONNECT logs at debug level; all three correlation IDs are carried through so HTTP admission, tunnel lifecycle, and per-destination events can be joined
+  - OAuth2 resource-server JWT validation: OIDC discovery used only to bootstrap the JWKS endpoint, all token verification done locally
   - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
 - `client/client.go`
   - **ProxyCommand mode**: stdio bridge for direct SSH integration
@@ -33,7 +36,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 ### Server flow
 
 1. Reads OIDC issuer, audience, listen address, and TLS mode configuration from flags or environment.
-2. Discovers issuer metadata and JWKS.
+2. Performs OIDC discovery once at startup, solely to locate the issuer's JWKS endpoint.
 3. Verifies bearer-token signature, issuer, expiration, and audience.
 4. Accepts WebSocket connections at `/protected/socks`.
 5. Hands each upgraded connection to the SOCKS5 server implementation.
