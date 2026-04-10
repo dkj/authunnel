@@ -66,6 +66,25 @@ func (c *observedTunnelConn) TunnelLogger() *slog.Logger {
 	return c.logger
 }
 
+// NewRequestLoggingMiddleware wraps an HTTP handler with structured logging and
+// correlation ID management. Three IDs are used to correlate log events:
+//
+//   - request_id: generated fresh for every HTTP request. Scoped to a single
+//     request/response cycle and returned to the client in the X-Request-ID
+//     response header.
+//   - trace_id: extracted from an incoming Traceparent header (W3C Trace
+//     Context) when present, otherwise generated. This allows Authunnel logs
+//     to correlate with upstream infrastructure such as a load balancer or
+//     reverse proxy that is already assigning trace IDs.
+//   - tunnel_id: generated later, when a WebSocket upgrade succeeds and a
+//     SOCKS tunnel is established (see Handler). It is added to a child logger
+//     that inherits request_id and trace_id, so all tunnel lifecycle events
+//     (open, SOCKS CONNECT, close) carry all three IDs.
+//
+// For a /protected/socks request the relationship is 1:1 — one HTTP request
+// produces one tunnel. The IDs serve different scopes: request_id is for HTTP
+// admission, trace_id is for cross-system tracing, and tunnel_id is for the
+// long-lived tunnel session and its per-destination SOCKS events.
 func NewRequestLoggingMiddleware(baseLogger *slog.Logger, next http.Handler) http.Handler {
 	if baseLogger == nil {
 		baseLogger = slog.Default()

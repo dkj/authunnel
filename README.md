@@ -19,8 +19,11 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 - `server/server.go`
   - HTTPS server on a configurable listen address (default `:8443` for TLS-files, `:443` for ACME, `:8080` for plaintext-behind-reverse-proxy)
   - Conservative HTTP server timeouts to reduce slow-client resource exhaustion risk
-  - Structured JSON request logs with request/trace correlation IDs
-  - Tunnel logs include the authenticated user, with per-destination SOCKS CONNECT logs at debug level
+  - Structured JSON logs with three correlation IDs:
+    - `request_id` — generated per HTTP request; scoped to a single request/response cycle
+    - `trace_id` — extracted from an incoming `Traceparent` header (W3C Trace Context) when present, otherwise generated; allows correlation with upstream infrastructure such as a load balancer or reverse proxy
+    - `tunnel_id` — generated when a WebSocket upgrade succeeds; scoped to the lifetime of the SOCKS tunnel and inherited by all subsequent tunnel events (open, SOCKS CONNECT, close)
+  - Tunnel logs include the authenticated user identity, with per-destination SOCKS CONNECT logs at debug level; all three correlation IDs are carried through so HTTP admission, tunnel lifecycle, and per-destination events can be joined
   - OAuth2 resource-server JWT validation: OIDC discovery used only to bootstrap the JWKS endpoint, all token verification done locally
   - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
 - `client/client.go`
