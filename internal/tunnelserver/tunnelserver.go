@@ -349,18 +349,32 @@ func manageTunnelLongevity(
 			}
 
 			newExpiry := newClaims.GetExpiration()
-			if !newExpiry.After(tokenExpiry) {
-				logger.Warn("token_refresh_rejected_expiry_not_extended",
+			if newExpiry.Before(tokenExpiry) {
+				logger.Warn("token_refresh_rejected_expiry_reduced",
 					slog.Time("current", tokenExpiry),
 					slog.Time("received", newExpiry),
 				)
 				_ = conn.SendControl(wsconn.ControlMessage{
 					Type: "token_rejected",
-					Data: mustMarshal(map[string]string{"reason": "expiry_not_extended"}),
+					Data: mustMarshal(map[string]string{"reason": "expiry_reduced"}),
 				})
 				continue
 			}
 
+			if newExpiry.Equal(tokenExpiry) {
+				// Same expiry — common with providers like Auth0 that
+				// cache access tokens and return the same one until it
+				// expires. The token is valid, so accept it, but don't
+				// reset timers (they're already correct for this expiry).
+				logger.Info("token_refresh_accepted_unchanged", slog.Time("expiry", tokenExpiry))
+				_ = conn.SendControl(wsconn.ControlMessage{
+					Type: "token_accepted",
+					Data: mustMarshal(map[string]string{"expires_at": tokenExpiry.Format(time.RFC3339)}),
+				})
+				continue
+			}
+
+			// Expiry extended — reset timers.
 			tokenExpiry = newExpiry
 			drainTimer(tokenWarnTimer)
 			drainTimer(tokenDeadlineTimer)

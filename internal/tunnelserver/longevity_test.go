@@ -356,7 +356,10 @@ func TestTokenRefreshRejectedWhenExpiryNotEnforced(t *testing.T) {
 	}
 }
 
-func TestTokenRefreshRejectedExpiryNotExtended(t *testing.T) {
+// TestTokenRefreshAcceptsSameExpiry verifies that a refreshed token with the
+// same expiry is accepted (common with providers like Auth0 that cache access
+// tokens) but timers are not reset.
+func TestTokenRefreshAcceptsSameExpiry(t *testing.T) {
 	serverConn, clientConn := wsPair(t)
 	drainBinary(t, clientConn)
 	drainBinary(t, serverConn)
@@ -365,9 +368,7 @@ func TestTokenRefreshRejectedExpiryNotExtended(t *testing.T) {
 	claims := makeClaims("user-1", sameExpiry)
 	validator := &mockValidator{
 		tokens: map[string]*oidc.AccessTokenClaims{
-			// Refreshed token has the same expiry — should be rejected.
-			"same-exp-token":    makeClaims("user-1", sameExpiry),
-			"earlier-exp-token": makeClaims("user-1", sameExpiry.Add(-time.Minute)),
+			"same-exp-token": makeClaims("user-1", sameExpiry),
 		},
 	}
 
@@ -379,7 +380,6 @@ func TestTokenRefreshRejectedExpiryNotExtended(t *testing.T) {
 		ExpiryWarning:    time.Minute,
 	}, time.Now(), slog.Default())
 
-	// Refresh with same expiry.
 	err := clientConn.SendControl(wsconn.ControlMessage{
 		Type: "token_refresh",
 		Data: mustMarshal(map[string]string{"access_token": "same-exp-token"}),
@@ -390,7 +390,47 @@ func TestTokenRefreshRejectedExpiryNotExtended(t *testing.T) {
 
 	msg, ok := readControl(t, clientConn, 2*time.Second)
 	if !ok {
-		t.Fatal("timed out waiting for token_rejected (same expiry)")
+		t.Fatal("timed out waiting for response")
+	}
+	if msg.Type != "token_accepted" {
+		t.Fatalf("expected token_accepted, got %s", msg.Type)
+	}
+}
+
+// TestTokenRefreshRejectedExpiryReduced verifies that a refreshed token with
+// an earlier expiry than the current one is rejected.
+func TestTokenRefreshRejectedExpiryReduced(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	currentExpiry := time.Now().Add(10 * time.Minute)
+	claims := makeClaims("user-1", currentExpiry)
+	validator := &mockValidator{
+		tokens: map[string]*oidc.AccessTokenClaims{
+			"earlier-exp-token": makeClaims("user-1", currentExpiry.Add(-time.Minute)),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    time.Minute,
+	}, time.Now(), slog.Default())
+
+	err := clientConn.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: mustMarshal(map[string]string{"access_token": "earlier-exp-token"}),
+	})
+	if err != nil {
+		t.Fatalf("send token_refresh: %v", err)
+	}
+
+	msg, ok := readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for token_rejected")
 	}
 	if msg.Type != "token_rejected" {
 		t.Fatalf("expected token_rejected, got %s", msg.Type)
@@ -399,31 +439,8 @@ func TestTokenRefreshRejectedExpiryNotExtended(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &data); err != nil {
 		t.Fatalf("unmarshal data: %v", err)
 	}
-	if data["reason"] != "expiry_not_extended" {
-		t.Fatalf("expected reason expiry_not_extended, got %s", data["reason"])
-	}
-
-	// Refresh with earlier expiry.
-	err = clientConn.SendControl(wsconn.ControlMessage{
-		Type: "token_refresh",
-		Data: mustMarshal(map[string]string{"access_token": "earlier-exp-token"}),
-	})
-	if err != nil {
-		t.Fatalf("send token_refresh: %v", err)
-	}
-
-	msg, ok = readControl(t, clientConn, 2*time.Second)
-	if !ok {
-		t.Fatal("timed out waiting for token_rejected (earlier expiry)")
-	}
-	if msg.Type != "token_rejected" {
-		t.Fatalf("expected token_rejected, got %s", msg.Type)
-	}
-	if err := json.Unmarshal(msg.Data, &data); err != nil {
-		t.Fatalf("unmarshal data: %v", err)
-	}
-	if data["reason"] != "expiry_not_extended" {
-		t.Fatalf("expected reason expiry_not_extended, got %s", data["reason"])
+	if data["reason"] != "expiry_reduced" {
+		t.Fatalf("expected reason expiry_reduced, got %s", data["reason"])
 	}
 }
 
