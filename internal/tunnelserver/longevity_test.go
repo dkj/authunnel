@@ -537,3 +537,88 @@ func TestTokenRefreshResetsDeadlineTimer(t *testing.T) {
 	default:
 	}
 }
+
+// TestTokenRefreshDefersWarningWhenInsideWarningWindow verifies that after
+// a successful refresh where the new token's lifetime is shorter than the
+// warning window, the server schedules the next warning at half the remaining
+// lifetime (not immediately, which would create a tight loop) and the client
+// still gets a future chance to refresh.
+func TestTokenRefreshDefersWarningWhenInsideWarningWindow(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	// Token lifetime (2s) < ExpiryWarning (5s). The warning fires immediately
+	// at startup.
+	originalExpiry := time.Now().Add(2 * time.Second)
+	// Refreshed token also has a short lifetime — still shorter than the warning.
+	refreshedExpiry := time.Now().Add(4 * time.Second)
+
+	claims := makeClaims("user-1", originalExpiry)
+	validator := &mockValidator{
+		tokens: map[string]*oidc.AccessTokenClaims{
+			"fresh-token": makeClaims("user-1", refreshedExpiry),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    5 * time.Second,
+	}, time.Now(), slog.Default())
+
+	// The initial warning fires immediately (lifetime < warning window).
+	msg, ok := readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for initial expiry_warning")
+	}
+	if msg.Type != "expiry_warning" {
+		t.Fatalf("expected expiry_warning, got %s", msg.Type)
+	}
+
+	// Refresh the token.
+	err := clientConn.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: mustMarshal(map[string]string{"access_token": "fresh-token"}),
+	})
+	if err != nil {
+		t.Fatalf("send token_refresh: %v", err)
+	}
+
+	// Expect token_accepted.
+	msg, ok = readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for token_accepted")
+	}
+	if msg.Type != "token_accepted" {
+		t.Fatalf("expected token_accepted, got %s", msg.Type)
+	}
+
+	// The refreshed token's remaining lifetime (~2s) is less than
+	// ExpiryWarning (5s). The next warning should fire at remaining/2 (~1s),
+	// NOT immediately. Verify: no warning within 200ms (rules out immediate
+	// fire), but a warning does arrive before the deadline.
+	select {
+	case stray := <-clientConn.ControlChan():
+		if stray.Type == "expiry_warning" {
+			t.Fatal("received immediate expiry_warning after refresh — warning loop not deferred")
+		}
+	case <-time.After(200 * time.Millisecond):
+		// Good — no immediate warning.
+	}
+
+	// A deferred warning should still arrive, giving the client another
+	// refresh opportunity.
+	msg, ok = readControl(t, clientConn, 3*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for deferred expiry_warning — client lost future refresh opportunity")
+	}
+	if msg.Type != "expiry_warning" {
+		// A disconnect is also acceptable if the deadline beat the warning.
+		if msg.Type != "disconnect" {
+			t.Fatalf("expected deferred expiry_warning or disconnect, got %s", msg.Type)
+		}
+	}
+}

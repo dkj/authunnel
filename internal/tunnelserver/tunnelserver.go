@@ -364,8 +364,18 @@ func manageTunnelLongevity(
 			tokenExpiry = newExpiry
 			drainTimer(tokenWarnTimer)
 			drainTimer(tokenDeadlineTimer)
-			tokenWarnTimer = newTimerUntil(tokenExpiry, cfg.ExpiryWarning)
-			tokenDeadlineTimer = time.NewTimer(time.Until(tokenExpiry))
+			remaining := time.Until(tokenExpiry)
+			if remaining > cfg.ExpiryWarning {
+				// Normal case: warn ExpiryWarning before the deadline.
+				tokenWarnTimer = newTimerUntil(tokenExpiry, cfg.ExpiryWarning)
+			} else {
+				// Token lifetime is shorter than the warning window.
+				// Schedule the next warning at half the remaining lifetime
+				// to avoid an immediate-fire loop while still giving the
+				// client a future refresh opportunity.
+				tokenWarnTimer = time.NewTimer(remaining / 2)
+			}
+			tokenDeadlineTimer = time.NewTimer(remaining)
 			logger.Info("token_refresh_accepted", slog.Time("new_expiry", tokenExpiry))
 			_ = conn.SendControl(wsconn.ControlMessage{
 				Type: "token_accepted",
