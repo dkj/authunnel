@@ -518,10 +518,19 @@ func (staticSuccessValidator) ValidateAccessToken(context.Context, string) (*oid
 }
 
 func newJWTTestIssuer(t *testing.T, audience string) (string, *http.Client, string) {
-	return newJWTTestIssuerWithExpiry(t, audience, time.Hour)
+	issuer, client, token, _ := newJWTTestIssuerFull(t, audience, time.Hour)
+	return issuer, client, token
 }
 
 func newJWTTestIssuerWithExpiry(t *testing.T, audience string, expiry time.Duration) (string, *http.Client, string) {
+	issuer, client, token, _ := newJWTTestIssuerFull(t, audience, expiry)
+	return issuer, client, token
+}
+
+// tokenMinter creates signed JWTs with a given expiry from the test issuer.
+type tokenMinter func(expiry time.Duration) string
+
+func newJWTTestIssuerFull(t *testing.T, audience string, initialExpiry time.Duration) (string, *http.Client, string, tokenMinter) {
 	t.Helper()
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -560,26 +569,29 @@ func newJWTTestIssuerWithExpiry(t *testing.T, audience string, expiry time.Durat
 		t.Fatalf("create signer: %v", err)
 	}
 
-	now := time.Now().UTC()
-	claims := &oidc.AccessTokenClaims{
-		TokenClaims: oidc.TokenClaims{
-			Issuer:     issuerURL,
-			Subject:    "test-user",
-			Audience:   oidc.Audience{audience},
-			Expiration: oidc.FromTime(now.Add(expiry)),
-			IssuedAt:   oidc.FromTime(now),
-			NotBefore:  oidc.FromTime(now),
-			ClientID:   "authunnel-cli",
-			JWTID:      "jwt-id",
-		},
-		Scopes: oidc.SpaceDelimitedArray{"openid"},
-	}
-	token, err := jwt.Signed(signer).Claims(claims).Serialize()
-	if err != nil {
-		t.Fatalf("sign token: %v", err)
+	mintToken := func(expiry time.Duration) string {
+		now := time.Now().UTC()
+		claims := &oidc.AccessTokenClaims{
+			TokenClaims: oidc.TokenClaims{
+				Issuer:     issuerURL,
+				Subject:    "test-user",
+				Audience:   oidc.Audience{audience},
+				Expiration: oidc.FromTime(now.Add(expiry)),
+				IssuedAt:   oidc.FromTime(now),
+				NotBefore:  oidc.FromTime(now),
+				ClientID:   "authunnel-cli",
+				JWTID:      "jwt-id",
+			},
+			Scopes: oidc.SpaceDelimitedArray{"openid"},
+		}
+		token, err := jwt.Signed(signer).Claims(claims).Serialize()
+		if err != nil {
+			t.Fatalf("sign token: %v", err)
+		}
+		return token
 	}
 
-	return issuerURL, server.Client(), token
+	return issuerURL, server.Client(), mintToken(initialExpiry), mintToken
 }
 
 func writeJSON(t *testing.T, w http.ResponseWriter, payload any) {
@@ -1512,5 +1524,156 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 		}
 	case <-deadline:
 		t.Fatal("tunnel was NOT closed after token expired — token-expiry enforcement is broken")
+	}
+}
+
+// TestTokenRefreshExtendsTunnelBeyondOriginalExpiry is a full integration test
+// that verifies a tunnel can be extended past the original access token's expiry
+// by refreshing with a new JWT. It uses a real JWT issuer, WebSocket tunnel,
+// and SOCKS5 echo server.
+func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
+	const audience = "authunnel-server"
+	// Initial token expires in 2s.
+	issuer, issuerClient, initialToken, mint := newJWTTestIssuerFull(t, audience, 2*time.Second)
+
+	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+
+	// TCP echo server.
+	echoLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+		tunnelserver.HandlerOptions{
+			Longevity: tunnelserver.LongevityConfig{
+				ImplementsExpiry: true,
+				ExpiryWarning:    1 * time.Second,
+			},
+		})
+
+	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+
+	// Dial the WebSocket tunnel with the short-lived initial token.
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	ctx := context.Background()
+	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + initialToken}},
+	})
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	mux := wsconn.New(ctx, wsConn)
+	defer mux.Close()
+
+	// Complete SOCKS5 handshake.
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoLn.Addr().String())
+	var echoPort int
+	fmt.Sscanf(echoPortStr, "%d", &echoPort)
+
+	if _, err := mux.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("socks greeting write: %v", err)
+	}
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(mux, greeting); err != nil {
+		t.Fatalf("socks greeting read: %v", err)
+	}
+
+	connectReq := []byte{0x05, 0x01, 0x00, 0x01}
+	connectReq = append(connectReq, net.ParseIP(echoHost).To4()...)
+	connectReq = append(connectReq, byte(echoPort>>8), byte(echoPort))
+	if _, err := mux.Write(connectReq); err != nil {
+		t.Fatalf("socks connect write: %v", err)
+	}
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(mux, connectReply); err != nil {
+		t.Fatalf("socks connect read: %v", err)
+	}
+	if connectReply[1] != 0x00 {
+		t.Fatalf("socks connect failed with reply code %d", connectReply[1])
+	}
+
+	// Start a background reader so control messages are dispatched.
+	binaryData := make(chan []byte, 16)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := mux.Read(buf)
+			if err != nil {
+				close(binaryData)
+				return
+			}
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			binaryData <- data
+		}
+	}()
+
+	// Wait for the expiry_warning (fires ~1s before the 2s expiry).
+	timer := time.After(5 * time.Second)
+	select {
+	case msg := <-mux.ControlChan():
+		if msg.Type != "expiry_warning" {
+			t.Fatalf("expected expiry_warning, got %s", msg.Type)
+		}
+	case <-timer:
+		t.Fatal("timed out waiting for expiry_warning")
+	}
+
+	// Mint a fresh token (expires 1 hour from now) and send it as a refresh.
+	freshToken := mint(1 * time.Hour)
+	tokenData, _ := json.Marshal(map[string]string{"access_token": freshToken})
+	if err := mux.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: tokenData,
+	}); err != nil {
+		t.Fatalf("send token_refresh: %v", err)
+	}
+
+	// Wait for token_accepted.
+	select {
+	case msg := <-mux.ControlChan():
+		if msg.Type != "token_accepted" {
+			t.Fatalf("expected token_accepted, got %s", msg.Type)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for token_accepted")
+	}
+
+	// Sleep past the original token's expiry. Without the refresh, the tunnel
+	// would have been closed by now.
+	time.Sleep(2 * time.Second)
+
+	// Verify the tunnel is still alive by echoing data through it.
+	if _, err := mux.Write([]byte{0xAB}); err != nil {
+		t.Fatalf("echo write after refresh: %v", err)
+	}
+
+	select {
+	case data := <-binaryData:
+		if len(data) != 1 || data[0] != 0xAB {
+			t.Fatalf("echo after refresh got %x, want 0xAB", data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("echo read timed out after refresh — tunnel did not survive past original expiry")
 	}
 }
