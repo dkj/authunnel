@@ -518,6 +518,10 @@ func (staticSuccessValidator) ValidateAccessToken(context.Context, string) (*oid
 }
 
 func newJWTTestIssuer(t *testing.T, audience string) (string, *http.Client, string) {
+	return newJWTTestIssuerWithExpiry(t, audience, time.Hour)
+}
+
+func newJWTTestIssuerWithExpiry(t *testing.T, audience string, expiry time.Duration) (string, *http.Client, string) {
 	t.Helper()
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -562,7 +566,7 @@ func newJWTTestIssuer(t *testing.T, audience string) (string, *http.Client, stri
 			Issuer:     issuerURL,
 			Subject:    "test-user",
 			Audience:   oidc.Audience{audience},
-			Expiration: oidc.FromTime(now.Add(time.Hour)),
+			Expiration: oidc.FromTime(now.Add(expiry)),
 			IssuedAt:   oidc.FromTime(now),
 			NotBefore:  oidc.FromTime(now),
 			ClientID:   "authunnel-cli",
@@ -1267,5 +1271,246 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 		// Any error is acceptable — the connection was closed by the server.
 	case <-deadline:
 		t.Fatal("tunnel was NOT closed after max-duration expired — longevity enforcement is broken")
+	}
+}
+
+// TestMaxDurationSendsWarningBeforeDisconnect verifies that the server sends
+// an expiry_warning with reason "max_duration" before the tunnel is closed.
+func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
+	const audience = "authunnel-server"
+	issuer, issuerClient, token := newJWTTestIssuer(t, audience)
+
+	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+
+	echoLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+		tunnelserver.HandlerOptions{
+			Longevity: tunnelserver.LongevityConfig{
+				MaxDuration:      2 * time.Second,
+				ImplementsExpiry: false,
+				ExpiryWarning:    1 * time.Second,
+			},
+		})
+
+	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	ctx := context.Background()
+	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
+	})
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	mux := wsconn.New(ctx, wsConn)
+	defer mux.Close()
+
+	// Complete SOCKS5 handshake to establish the tunnel.
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoLn.Addr().String())
+	var echoPort int
+	fmt.Sscanf(echoPortStr, "%d", &echoPort)
+
+	if _, err := mux.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("socks greeting write: %v", err)
+	}
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(mux, greeting); err != nil {
+		t.Fatalf("socks greeting read: %v", err)
+	}
+
+	connectReq := []byte{0x05, 0x01, 0x00, 0x01}
+	connectReq = append(connectReq, net.ParseIP(echoHost).To4()...)
+	connectReq = append(connectReq, byte(echoPort>>8), byte(echoPort))
+	if _, err := mux.Write(connectReq); err != nil {
+		t.Fatalf("socks connect write: %v", err)
+	}
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(mux, connectReply); err != nil {
+		t.Fatalf("socks connect read: %v", err)
+	}
+
+	// Start draining binary data so control messages are dispatched.
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			if _, err := mux.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Expect expiry_warning with reason "max_duration" before disconnect.
+	timer := time.After(10 * time.Second)
+	gotWarning := false
+	gotDisconnect := false
+
+	for !gotDisconnect {
+		select {
+		case msg, ok := <-mux.ControlChan():
+			if !ok {
+				if !gotWarning {
+					t.Fatal("control channel closed without receiving expiry_warning")
+				}
+				// Channel closed after disconnect — acceptable.
+				gotDisconnect = true
+				continue
+			}
+			switch msg.Type {
+			case "expiry_warning":
+				var payload map[string]string
+				if err := json.Unmarshal(msg.Data, &payload); err != nil {
+					t.Fatalf("unmarshal warning: %v", err)
+				}
+				if payload["reason"] != "max_duration" {
+					t.Fatalf("expected warning reason max_duration, got %s", payload["reason"])
+				}
+				gotWarning = true
+			case "disconnect":
+				gotDisconnect = true
+			}
+		case <-timer:
+			t.Fatal("timed out waiting for warning + disconnect")
+		}
+	}
+
+	if !gotWarning {
+		t.Fatal("received disconnect without prior expiry_warning")
+	}
+}
+
+// TestTokenExpiryActuallyClosesConnection is the token-expiry counterpart of
+// TestMaxDurationActuallyClosesConnection. It verifies that when
+// ImplementsExpiry is true and the JWT expires, the tunnel is terminated.
+func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
+	const audience = "authunnel-server"
+	// Token expires in 2s — long enough for the WebSocket dial and SOCKS
+	// handshake to complete, short enough to verify enforcement.
+	issuer, issuerClient, token := newJWTTestIssuerWithExpiry(t, audience, 2*time.Second)
+
+	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+
+	echoLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+		tunnelserver.HandlerOptions{
+			Longevity: tunnelserver.LongevityConfig{
+				ImplementsExpiry: true,
+				ExpiryWarning:    500 * time.Millisecond,
+			},
+		})
+
+	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	ctx := context.Background()
+	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
+	})
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	mux := wsconn.New(ctx, wsConn)
+	defer mux.Close()
+
+	// Complete SOCKS5 handshake.
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoLn.Addr().String())
+	var echoPort int
+	fmt.Sscanf(echoPortStr, "%d", &echoPort)
+
+	if _, err := mux.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("socks greeting write: %v", err)
+	}
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(mux, greeting); err != nil {
+		t.Fatalf("socks greeting read: %v", err)
+	}
+
+	connectReq := []byte{0x05, 0x01, 0x00, 0x01}
+	connectReq = append(connectReq, net.ParseIP(echoHost).To4()...)
+	connectReq = append(connectReq, byte(echoPort>>8), byte(echoPort))
+	if _, err := mux.Write(connectReq); err != nil {
+		t.Fatalf("socks connect write: %v", err)
+	}
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(mux, connectReply); err != nil {
+		t.Fatalf("socks connect read: %v", err)
+	}
+	if connectReply[1] != 0x00 {
+		t.Fatalf("socks connect failed with reply code %d", connectReply[1])
+	}
+
+	// Verify tunnel works before expiry.
+	if _, err := mux.Write([]byte{0x42}); err != nil {
+		t.Fatalf("echo write: %v", err)
+	}
+	echoBuf := make([]byte, 1)
+	if _, err := io.ReadFull(mux, echoBuf); err != nil {
+		t.Fatalf("echo read: %v", err)
+	}
+	if echoBuf[0] != 0x42 {
+		t.Fatalf("echo got %x, want 0x42", echoBuf[0])
+	}
+
+	// Wait for the token to expire. The tunnel MUST close.
+	deadline := time.After(10 * time.Second)
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := mux.Read(buf)
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected read to fail after token expiry, but it succeeded")
+		}
+	case <-deadline:
+		t.Fatal("tunnel was NOT closed after token expired — token-expiry enforcement is broken")
 	}
 }

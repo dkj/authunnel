@@ -227,6 +227,62 @@ func TestBidirectionalBinaryData(t *testing.T) {
 	}
 }
 
+// TestConcurrentWriteAndSendControl exercises the writeMu path by firing
+// binary Write and SendControl calls concurrently from multiple goroutines.
+// Without the mutex the WebSocket library panics or produces corrupt frames.
+func TestConcurrentWriteAndSendControl(t *testing.T) {
+	server, client := dialTestServer(t)
+	dataCh := drainBinary(client)
+	// Also drain control messages on the client side.
+	go func() {
+		for range client.ControlChan() {
+		}
+	}()
+
+	const goroutines = 10
+	const iterations = 20
+	done := make(chan struct{}, goroutines*2)
+
+	// Half the goroutines send binary data.
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < iterations; j++ {
+				if _, err := server.Write([]byte("bin")); err != nil {
+					return
+				}
+			}
+		}(i)
+	}
+
+	// The other half send control messages.
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < iterations; j++ {
+				msg := wsconn.ControlMessage{Type: "ping"}
+				if err := server.SendControl(msg); err != nil {
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Wait for all goroutines to finish.
+	for i := 0; i < goroutines*2; i++ {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for concurrent writers")
+		}
+	}
+
+	// Drain remaining data to make sure nothing panicked.
+	server.Close()
+	for range dataCh {
+	}
+}
+
 func mustMarshalJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(v)
