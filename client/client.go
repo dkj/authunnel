@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/coder/websocket"
 
 	"authunnel/internal/security"
+	"authunnel/internal/wsconn"
 )
 
 var version = "dev"
@@ -314,7 +316,14 @@ func handleSOCKSClient(ctx context.Context, cfg clientConfig, source authTokenSo
 		return fmt.Errorf("websocket dial failed: %w", err)
 	}
 
-	remoteConn := websocket.NetConn(ctx, wsConn, websocket.MessageBinary)
+	// Scope the context to this tunnel so the control-message goroutine
+	// exits when proxy() returns, avoiding goroutine leaks in unix-socket
+	// mode where many connections are handled sequentially.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
+	remoteConn := wsconn.New(connCtx, wsConn)
+	go handleControlMessages(connCtx, remoteConn, source)
 	proxy(localConn, remoteConn)
 	return nil
 }
@@ -324,7 +333,9 @@ func handleSOCKSClient(ctx context.Context, cfg clientConfig, source authTokenSo
 //	ProxyCommand /path/to/client --proxycommand %h %p
 //
 // It opens a websocket tunnel, performs SOCKS5 CONNECT for the target host/port,
-// then bridges stdin/stdout with the resulting network stream.
+// then bridges stdin/stdout with the resulting network stream. A background
+// goroutine handles server-initiated control messages (expiry warnings, token
+// refresh) so the tunnel can be extended without disrupting the SSH session.
 func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authTokenSource) error {
 	token, err := source.AccessToken(ctx)
 	if err != nil {
@@ -337,8 +348,13 @@ func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authToken
 	}
 	defer wsConn.CloseNow()
 
-	remoteConn := websocket.NetConn(ctx, wsConn, websocket.MessageBinary)
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
+	remoteConn := wsconn.New(connCtx, wsConn)
 	defer remoteConn.Close()
+
+	go handleControlMessages(connCtx, remoteConn, source)
 
 	if err := performSOCKS5Connect(remoteConn, cfg.TargetHost, cfg.TargetPort); err != nil {
 		return fmt.Errorf("socks5 connect failed: %w", err)
@@ -357,6 +373,62 @@ func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket
 		options.HTTPClient = cfg.HTTPClient
 	}
 	return websocket.Dial(ctx, cfg.WebSocketURL, options)
+}
+
+// handleControlMessages reads from the MultiplexConn's control channel and
+// responds to server-initiated longevity messages. When the server warns that
+// the token is about to expire, the client attempts to obtain a fresh token
+// and sends it back over the control channel.
+func handleControlMessages(ctx context.Context, conn *wsconn.MultiplexConn, source authTokenSource) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-conn.ControlChan():
+			if !ok {
+				return
+			}
+			switch msg.Type {
+			case "expiry_warning":
+				var payload struct {
+					Reason string `json:"reason"`
+				}
+				_ = json.Unmarshal(msg.Data, &payload)
+				if payload.Reason != "token" {
+					log.Printf("server warning: connection expiring due to %s", payload.Reason)
+					continue
+				}
+				newToken, err := source.AccessToken(ctx)
+				if err != nil {
+					log.Printf("token refresh failed: %v", err)
+					continue
+				}
+				tokenData, _ := json.Marshal(map[string]string{"access_token": newToken})
+				if err := conn.SendControl(wsconn.ControlMessage{
+					Type: "token_refresh",
+					Data: tokenData,
+				}); err != nil {
+					log.Printf("failed to send refreshed token: %v", err)
+				}
+			case "token_accepted":
+				log.Println("server accepted refreshed token")
+			case "token_rejected":
+				var payload struct {
+					Reason string `json:"reason"`
+				}
+				_ = json.Unmarshal(msg.Data, &payload)
+				log.Printf("server rejected token refresh: %s", payload.Reason)
+			case "disconnect":
+				var payload struct {
+					Reason string `json:"reason"`
+				}
+				_ = json.Unmarshal(msg.Data, &payload)
+				log.Printf("server disconnecting: %s", payload.Reason)
+				conn.Close()
+				return
+			}
+		}
+	}
 }
 
 // performSOCKS5Connect performs a minimal no-auth SOCKS5 handshake and CONNECT request.

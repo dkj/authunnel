@@ -2,12 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+
+	"authunnel/internal/wsconn"
 )
 
 // TestProxyForwardsBidirectionalTraffic validates that proxy copies bytes
@@ -275,4 +284,182 @@ func runMockSOCKS5ServerSuccess(conn net.Conn, t *testing.T) error {
 	// SOCKS5 success reply with IPv4 bind addr 0.0.0.0:0.
 	_, err := conn.Write([]byte{socksVersion5, socksReplySucceeded, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
 	return err
+}
+
+// wsPair creates a connected pair of MultiplexConns over a real WebSocket.
+func wsPair(t *testing.T) (server *wsconn.MultiplexConn, client *wsconn.MultiplexConn) {
+	t.Helper()
+	serverReady := make(chan *wsconn.MultiplexConn, 1)
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("server websocket accept: %v", err)
+			return
+		}
+		mc := wsconn.New(serverCtx, c)
+		serverReady <- mc
+		<-serverCtx.Done()
+	}))
+	t.Cleanup(func() {
+		serverCancel()
+		ts.Close()
+	})
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	c, _, err := websocket.Dial(context.Background(), wsURL, nil)
+	if err != nil {
+		t.Fatalf("client websocket dial: %v", err)
+	}
+	clientConn := wsconn.New(context.Background(), c)
+	t.Cleanup(func() { clientConn.Close() })
+
+	select {
+	case sc := <-serverReady:
+		return sc, clientConn
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server connection")
+		return nil, nil
+	}
+}
+
+// drainBinaryFrames starts a background reader that drives text-frame dispatch.
+func drainBinaryFrames(t *testing.T, conn *wsconn.MultiplexConn) {
+	t.Helper()
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+// fakeTokenSource is a test double for authTokenSource.
+type fakeTokenSource struct {
+	token string
+	err   error
+}
+
+func (f *fakeTokenSource) AccessToken(_ context.Context) (string, error) {
+	return f.token, f.err
+}
+
+// TestHandleControlMessagesRefreshesOnTokenWarning verifies the client-side
+// handleControlMessages function: when the server sends an expiry_warning with
+// reason "token", the client obtains a fresh token from its source and sends
+// a token_refresh control message back.
+func TestHandleControlMessagesRefreshesOnTokenWarning(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinaryFrames(t, clientConn)
+	drainBinaryFrames(t, serverConn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	source := &fakeTokenSource{token: "refreshed-token-abc"}
+	go handleControlMessages(ctx, clientConn, source)
+
+	// Server sends an expiry_warning with reason "token".
+	warningData, _ := json.Marshal(map[string]string{
+		"reason":     "token",
+		"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339),
+	})
+	err := serverConn.SendControl(wsconn.ControlMessage{
+		Type: "expiry_warning",
+		Data: warningData,
+	})
+	if err != nil {
+		t.Fatalf("send expiry_warning: %v", err)
+	}
+
+	// The client should respond with a token_refresh containing the fresh token.
+	select {
+	case msg := <-serverConn.ControlChan():
+		if msg.Type != "token_refresh" {
+			t.Fatalf("expected token_refresh, got %s", msg.Type)
+		}
+		var payload struct {
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.Unmarshal(msg.Data, &payload); err != nil {
+			t.Fatalf("unmarshal token_refresh: %v", err)
+		}
+		if payload.AccessToken != "refreshed-token-abc" {
+			t.Fatalf("expected token refreshed-token-abc, got %s", payload.AccessToken)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for token_refresh from client")
+	}
+}
+
+// TestHandleControlMessagesClosesOnDisconnect verifies that the client closes
+// the connection and returns when the server sends a disconnect message.
+func TestHandleControlMessagesClosesOnDisconnect(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinaryFrames(t, clientConn)
+	drainBinaryFrames(t, serverConn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		handleControlMessages(ctx, clientConn, &fakeTokenSource{})
+		close(done)
+	}()
+
+	disconnectData, _ := json.Marshal(map[string]string{"reason": "max_duration_reached"})
+	err := serverConn.SendControl(wsconn.ControlMessage{
+		Type: "disconnect",
+		Data: disconnectData,
+	})
+	if err != nil {
+		t.Fatalf("send disconnect: %v", err)
+	}
+
+	select {
+	case <-done:
+		// Good — handleControlMessages returned.
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleControlMessages did not return after disconnect")
+	}
+}
+
+// TestHandleControlMessagesIgnoresNonTokenWarning verifies that an
+// expiry_warning with reason "max_duration" does NOT trigger a token refresh.
+func TestHandleControlMessagesIgnoresNonTokenWarning(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinaryFrames(t, clientConn)
+	drainBinaryFrames(t, serverConn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	source := &fakeTokenSource{token: "should-not-be-sent"}
+	go handleControlMessages(ctx, clientConn, source)
+
+	// Server sends an expiry_warning for max_duration (not token).
+	warningData, _ := json.Marshal(map[string]string{
+		"reason":     "max_duration",
+		"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339),
+	})
+	err := serverConn.SendControl(wsconn.ControlMessage{
+		Type: "expiry_warning",
+		Data: warningData,
+	})
+	if err != nil {
+		t.Fatalf("send expiry_warning: %v", err)
+	}
+
+	// Give the handler time to process, then check no refresh was sent.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case msg := <-serverConn.ControlChan():
+		t.Fatalf("unexpected control message from client: %+v", msg)
+	default:
+		// Good — no token_refresh was sent.
+	}
 }

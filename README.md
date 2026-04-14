@@ -30,17 +30,19 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
   - **ProxyCommand mode**: stdio bridge for direct SSH integration
   - **Unix socket mode**: local SOCKS5 endpoint for generic client tooling
   - **Managed OIDC mode**: public-client PKCE login with token cache + refresh
+  - Control-message listener for server-initiated longevity warnings; automatic token refresh when the server signals imminent token expiry
 
 ## How It Works
 
 ### Server flow
 
-1. Reads OIDC issuer, audience, listen address, and TLS mode configuration from flags or environment.
+1. Reads OIDC issuer, audience, listen address, TLS mode, and connection longevity configuration from flags or environment.
 2. Performs OIDC discovery once at startup, solely to locate the issuer's JWKS endpoint.
 3. Verifies bearer-token signature, issuer, expiration, and audience.
 4. Accepts WebSocket connections at `/protected/socks`.
 5. Hands each upgraded connection to the SOCKS5 server implementation.
-6. Emits structured JSON logs for request lifecycle, auth failures, tunnel open/close events, and debug-level SOCKS CONNECT destinations.
+6. If connection longevity is configured, manages tunnel lifetime: warns clients before expiry and disconnects when limits are reached. When token-expiry enforcement is active, the server accepts refreshed tokens from the client to extend the tunnel.
+7. Emits structured JSON logs for request lifecycle, auth failures, tunnel open/close events, token refresh outcomes, and debug-level SOCKS CONNECT destinations.
 
 ### Client flow
 
@@ -52,14 +54,15 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
    - otherwise refreshes it when a refresh token is available,
    - otherwise launches a browser to the IdP and listens on `127.0.0.1` for the callback.
 3. The client opens an authenticated WebSocket connection to the Authunnel server.
-4. In ProxyCommand mode it performs a SOCKS5 CONNECT for `%h:%p` and bridges `stdin/stdout`.
-5. In unix-socket mode it exposes a local SOCKS5 endpoint and opens a dedicated tunnel per local connection.
+4. A background control-message listener handles server-initiated longevity messages. When the server warns that the access token is about to expire, the client automatically obtains a fresh token (via its existing refresh logic) and sends it to the server to extend the tunnel.
+5. In ProxyCommand mode it performs a SOCKS5 CONNECT for `%h:%p` and bridges `stdin/stdout`.
+6. In unix-socket mode it exposes a local SOCKS5 endpoint and opens a dedicated tunnel per local connection.
 
 ## Security Posture
 
 Authunnel is deliberately simple in both functionality and implementation — a small, focused codebase that is intended to be easy to read and audit in full. Complexity is kept low by design; if a feature would make the security model harder to reason about, that is a reason not to add it.
 
-Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. The `--allow` option provides a second layer of control over *where* an authenticated user can connect.
+Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. By default, tunnel lifetime is tied to the access token's expiry, so a revoked or expired token causes the tunnel to close rather than persisting indefinitely. This can be disabled with `--no-connection-token-expiry` if needed. An optional hard maximum duration (`--max-connection-duration`) provides an additional ceiling. Both limits are orthogonal and can be active simultaneously. The `--allow` option provides a further layer of control over *where* an authenticated user can connect.
 
 **Open mode (no `--allow` rules — the default):** Any destination reachable by the server process is accessible to authenticated clients. This is convenient and gives operators full visibility: every SOCKS CONNECT destination is logged at debug level.
 
@@ -140,6 +143,9 @@ Useful server flags and environment variables:
 - `--acme-cache-dir` or `ACME_CACHE_DIR` with default `/var/cache/authunnel/acme`
 - `--plaintext-behind-reverse-proxy` or `PLAINTEXT_BEHIND_REVERSE_PROXY=true` — serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; `X-Forwarded-Proto` and `X-Forwarded-Host` are used for WebSocket origin checks
 - `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable; if unset all connections are allowed
+- `--max-connection-duration` or `MAX_CONNECTION_DURATION` — hard maximum tunnel lifetime (e.g. `4h`, `30m`); default `0` (unlimited)
+- `--no-connection-token-expiry` or `NO_CONNECTION_TOKEN_EXPIRY=true` — do not tie tunnel lifetime to access token expiry; by default expiry IS enforced and clients can refresh tokens to extend
+- `--expiry-warning` or `EXPIRY_WARNING` — warning period before either longevity limit; default `3m`
 
 Rule formats: `host-glob:port`, `host-glob:lo-hi`, `CIDR:port`, `CIDR:lo-hi`, `[IPv6]:port`, `[IPv6]:lo-hi`
 
@@ -262,6 +268,7 @@ Current fast coverage includes:
 - SOCKS5 CONNECT request construction and handshake behavior
 - bidirectional proxy forwarding behavior
 - server authorization-header rejection and JWT audience validation
+- WebSocket multiplexing: binary data round-trip, control message routing, interleaved text/binary frame handling, bidirectional control messages
 
 ## Developer Notes
 
@@ -280,12 +287,16 @@ flows are easy to locate:
   - issuer discovery and JWKS-backed JWT validation
   - HTTP route setup for protected endpoints
   - websocket-to-SOCKS bridge wiring
+  - connection longevity management: token-expiry and max-duration enforcement, token refresh validation with subject pinning
+- [`internal/wsconn/wsconn.go`](internal/wsconn/wsconn.go)
+  - `MultiplexConn` adapter: wraps a `*websocket.Conn` as `net.Conn` for binary SOCKS5 data, routing text frames to a control channel for longevity messages (expiry warnings, disconnect, token refresh)
 
 When changing the auth flow, keep these invariants intact:
 
 - ProxyCommand mode must only write transport bytes to `stdout`; any user-facing auth output belongs on `stderr`.
 - Managed OIDC mode must prefer cache, then refresh, then browser login, so repeated `ssh` runs stay fast and predictable.
 - Server-side authorization must continue to fail closed on missing bearer token, invalid JWT signature, wrong issuer, expired token, or wrong `aud`.
+- Token refresh over the control channel must verify that the new token's subject matches the original tunnel's subject (subject pinning). Never send refresh tokens to the server; only access tokens travel over the control channel.
 
 ## Local Keycloak Test Environment
 

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -17,11 +19,13 @@ import (
 	"time"
 
 	socks5 "github.com/armon/go-socks5"
+	"github.com/coder/websocket"
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 
 	"authunnel/internal/tunnelserver"
+	"authunnel/internal/wsconn"
 )
 
 func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
@@ -48,13 +52,14 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 	}
 
 	want := serverConfig{
-		Issuer:        "https://flag-issuer.example",
-		TokenAudience: "authunnel-server",
-		ListenAddr:    "127.0.0.1:9443",
-		TLSCertPath:   "/flags/server.crt",
-		TLSKeyPath:    "/flags/server.key",
-		ACMECacheDir:  "/var/cache/authunnel/acme",
-		LogLevel:      slog.LevelInfo,
+		Issuer:                     "https://flag-issuer.example",
+		TokenAudience:              "authunnel-server",
+		ListenAddr:                 "127.0.0.1:9443",
+		TLSCertPath:                "/flags/server.crt",
+		TLSKeyPath:                 "/flags/server.key",
+		ACMECacheDir:               "/var/cache/authunnel/acme",
+		LogLevel:                   slog.LevelInfo,
+		ExpiryWarning: 3 * time.Minute,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("unexpected config: got %#v want %#v", cfg, want)
@@ -1101,5 +1106,166 @@ func TestParseServerConfigRejectsInvalidAllowRulesEnv(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for invalid ALLOW_RULES env, got nil")
+	}
+}
+
+func TestParseServerConfigRejectsNegativeDurations(t *testing.T) {
+	tests := []struct {
+		name   string
+		envKey string
+		flag   string
+	}{
+		{"negative MAX_CONNECTION_DURATION env", "MAX_CONNECTION_DURATION", ""},
+		{"negative EXPIRY_WARNING env", "EXPIRY_WARNING", ""},
+		{"negative --max-connection-duration flag", "", "--max-connection-duration"},
+		{"negative --expiry-warning flag", "", "--expiry-warning"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var args []string
+			env := func(key string) string {
+				if key == tt.envKey {
+					return "-5m"
+				}
+				return minimalServerEnv(key)
+			}
+			if tt.flag != "" {
+				args = []string{tt.flag, "-5m"}
+			}
+			_, err := parseServerConfig(args, env)
+			if err == nil {
+				t.Fatal("expected error for negative duration, got nil")
+			}
+			if !strings.Contains(err.Error(), "negative") {
+				t.Fatalf("expected error mentioning 'negative', got: %v", err)
+			}
+		})
+	}
+}
+
+// TestMaxDurationActuallyClosesConnection verifies that the server-side
+// longevity enforcement actually terminates the tunnel when the max-duration
+// deadline is reached. This is an integration test that sets up a real JWT
+// issuer, WebSocket tunnel, and SOCKS5 echo destination.
+func TestMaxDurationActuallyClosesConnection(t *testing.T) {
+	const audience = "authunnel-server"
+	issuer, issuerClient, token := newJWTTestIssuer(t, audience)
+
+	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+
+	// Start a TCP echo server as the SOCKS destination.
+	echoLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	socksServer, err := socks5.New(&socks5.Config{})
+	if err != nil {
+		t.Fatalf("create socks server: %v", err)
+	}
+
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+		tunnelserver.HandlerOptions{
+			Longevity: tunnelserver.LongevityConfig{
+				MaxDuration:      200 * time.Millisecond,
+				ImplementsExpiry: false,
+				ExpiryWarning:    50 * time.Millisecond,
+			},
+		})
+	_ = socksServer // We use the observed wrapper above.
+
+	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+
+	// Dial the WebSocket tunnel.
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	ctx := context.Background()
+	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
+	})
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	mux := wsconn.New(ctx, wsConn)
+	defer mux.Close()
+
+	// Perform SOCKS5 CONNECT to the echo server.
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoLn.Addr().String())
+	var echoPort int
+	fmt.Sscanf(echoPortStr, "%d", &echoPort)
+
+	// SOCKS5 greeting: version 5, 1 method, no-auth
+	if _, err := mux.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("socks greeting write: %v", err)
+	}
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(mux, greeting); err != nil {
+		t.Fatalf("socks greeting read: %v", err)
+	}
+
+	// SOCKS5 CONNECT to the echo server.
+	connectReq := []byte{0x05, 0x01, 0x00, 0x01} // ver, connect, rsv, IPv4
+	connectReq = append(connectReq, net.ParseIP(echoHost).To4()...)
+	connectReq = append(connectReq, byte(echoPort>>8), byte(echoPort))
+	if _, err := mux.Write(connectReq); err != nil {
+		t.Fatalf("socks connect write: %v", err)
+	}
+	connectReply := make([]byte, 10) // 4 header + 4 IPv4 + 2 port
+	if _, err := io.ReadFull(mux, connectReply); err != nil {
+		t.Fatalf("socks connect read: %v", err)
+	}
+	if connectReply[1] != 0x00 {
+		t.Fatalf("socks connect failed with reply code %d", connectReply[1])
+	}
+
+	// Verify the tunnel works: echo a byte.
+	if _, err := mux.Write([]byte{0x42}); err != nil {
+		t.Fatalf("echo write: %v", err)
+	}
+	echoBuf := make([]byte, 1)
+	if _, err := io.ReadFull(mux, echoBuf); err != nil {
+		t.Fatalf("echo read: %v", err)
+	}
+	if echoBuf[0] != 0x42 {
+		t.Fatalf("echo got %x, want 0x42", echoBuf[0])
+	}
+
+	// Now wait for the max-duration to expire. The tunnel MUST be closed by
+	// the server after ~200ms. If longevity enforcement is broken, Read will
+	// block indefinitely and the test times out.
+	deadline := time.After(5 * time.Second)
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := mux.Read(buf)
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected read to fail after max-duration, but it succeeded")
+		}
+		// Any error is acceptable — the connection was closed by the server.
+	case <-deadline:
+		t.Fatal("tunnel was NOT closed after max-duration expired — longevity enforcement is broken")
 	}
 }

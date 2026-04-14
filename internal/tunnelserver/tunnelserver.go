@@ -1,17 +1,15 @@
-// Package tunnelserver contains the reusable HTTP and token-validation logic
-// for the Authunnel server. Keeping this separate from main makes the security-
-// sensitive request flow easier to test without needing to boot the TLS server.
+// Package tunnelserver contains the reusable HTTP, token-validation, and
+// connection-longevity logic for the Authunnel server. Keeping this separate
+// from main makes the security-sensitive request flow easier to test without
+// needing to boot the TLS server.
 package tunnelserver
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/zitadel/oidc/v3/pkg/client"
-	"github.com/zitadel/oidc/v3/pkg/client/rp"
-	"github.com/zitadel/oidc/v3/pkg/oidc"
-	"github.com/zitadel/oidc/v3/pkg/op"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,6 +18,12 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/zitadel/oidc/v3/pkg/client"
+	"github.com/zitadel/oidc/v3/pkg/client/rp"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
+	"github.com/zitadel/oidc/v3/pkg/op"
+
+	"authunnel/internal/wsconn"
 )
 
 type TokenValidator interface {
@@ -73,6 +77,25 @@ func (v *JWTTokenValidator) ValidateAccessToken(ctx context.Context, token strin
 	return claims, nil
 }
 
+// LongevityConfig controls connection lifetime enforcement. MaxDuration and
+// ImplementsExpiry are orthogonal; both may be active simultaneously, in which
+// case the connection ends at whichever limit is reached first.
+type LongevityConfig struct {
+	// MaxDuration is a hard ceiling on tunnel lifetime. Zero means unlimited.
+	MaxDuration time.Duration
+	// ImplementsExpiry ties the tunnel lifetime to the access token's exp
+	// claim. When enabled, the server sends an expiry warning before the
+	// token expires and disconnects if no refreshed token arrives in time.
+	ImplementsExpiry bool
+	// ExpiryWarning is the lead time before either deadline at which the
+	// server sends an expiry_warning control message to the client.
+	ExpiryWarning time.Duration
+}
+
+func (lc LongevityConfig) active() bool {
+	return lc.MaxDuration > 0 || lc.ImplementsExpiry
+}
+
 // HandlerOptions controls optional behavior of the HTTP handler.
 type HandlerOptions struct {
 	// TrustForwardedProto instructs the same-origin WebSocket check to use
@@ -88,12 +111,19 @@ type HandlerOptions struct {
 	// "proxy_set_header Host $host;" directive. The headers are never consulted
 	// in TLS modes because r.TLS != nil short-circuits before they are reached.
 	TrustForwardedProto bool
+
+	// Longevity controls connection lifetime enforcement.
+	Longevity LongevityConfig
 }
 
 // NewHandler installs the small HTTP surface used by the server:
 //   - "/" for a simple liveness response
 //   - "/protected" for token-validation smoke testing
 //   - "/protected/socks" for the authenticated websocket-to-SOCKS bridge
+//
+// When Longevity is configured in the handler options, each tunnel is managed
+// by a background goroutine that enforces connection lifetime limits and
+// handles token refresh requests from the client over the control channel.
 func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOptions) *http.ServeMux {
 	var opt HandlerOptions
 	if len(opts) > 0 {
@@ -149,17 +179,32 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 			slog.String("tunnel_id", newLogID()),
 			slog.String("remote_ip", requestRemoteIP(r)),
 		)
-		// Carry token identity into the long-lived tunnel logger once, so tunnel
-		// lifecycle and per-destination SOCKS logs do not need to re-parse or
-		// re-validate bearer claims after the websocket upgrade succeeds.
 		tunnelLogger = loggerWithAccessTokenClaims(tunnelLogger, claims)
 		tunnelStart := time.Now()
 		tunnelLogger.Info("tunnel_open")
 		defer logTunnelClose(tunnelLogger, tunnelStart)
-		// Wrap the upgraded websocket connection so the SOCKS layer can recover the
-		// per-tunnel logger and emit destination logs with the same request/tunnel
-		// correlation fields.
-		if err := socks.ServeConn(newObservedTunnelConn(websocket.NetConn(r.Context(), c, websocket.MessageBinary), tunnelLogger)); err != nil {
+
+		// tunnelCtx controls the tunnel lifetime. When longevity is active,
+		// manageTunnelLongevity cancels this context to force the MultiplexConn
+		// reads to fail, which terminates the SOCKS session. When longevity is
+		// inactive the context is only cancelled by the deferred tunnelCancel
+		// (normal cleanup) or the parent r.Context() closing.
+		tunnelCtx, tunnelCancel := context.WithCancel(r.Context())
+		defer tunnelCancel()
+
+		// MultiplexConn wraps the WebSocket so binary frames carry SOCKS5 data
+		// while text frames are routed to a control channel for longevity messages
+		// (expiry warnings, token refresh, disconnect). The SOCKS layer sees a
+		// plain net.Conn and is unaware of the control channel. It uses tunnelCtx
+		// so that longevity enforcement can terminate reads.
+		muxConn := wsconn.New(tunnelCtx, c)
+		defer muxConn.Close()
+
+		if opt.Longevity.active() {
+			go manageTunnelLongevity(tunnelCtx, tunnelCancel, muxConn, validator, claims, opt.Longevity, tunnelStart, tunnelLogger)
+		}
+
+		if err := socks.ServeConn(newObservedTunnelConn(muxConn, tunnelLogger)); err != nil {
 			tunnelLogger.Warn("socks_session_failed",
 				slog.String("error", err.Error()),
 			)
@@ -172,6 +217,211 @@ func logTunnelClose(logger *slog.Logger, started time.Time) {
 	logger.Info("tunnel_close",
 		slog.Int64("duration_ms", time.Since(started).Milliseconds()),
 	)
+}
+
+// manageTunnelLongevity enforces connection lifetime limits. It manages up to
+// two independent deadlines (max-duration and token-expiry), sends warnings
+// before each, and handles token refresh requests from the client.
+func manageTunnelLongevity(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn *wsconn.MultiplexConn,
+	validator TokenValidator,
+	claims *oidc.AccessTokenClaims,
+	cfg LongevityConfig,
+	tunnelStart time.Time,
+	logger *slog.Logger,
+) {
+	originalSubject := claims.Subject
+
+	// Token-expiry deadline (resettable via refresh).
+	var tokenExpiry time.Time
+	var tokenWarnTimer, tokenDeadlineTimer *time.Timer
+	if cfg.ImplementsExpiry {
+		tokenExpiry = claims.GetExpiration()
+		tokenWarnTimer = newTimerUntil(tokenExpiry, cfg.ExpiryWarning)
+		tokenDeadlineTimer = time.NewTimer(time.Until(tokenExpiry))
+		defer tokenWarnTimer.Stop()
+		defer tokenDeadlineTimer.Stop()
+	} else {
+		// Inert timers that never fire.
+		tokenWarnTimer = stoppedTimer()
+		tokenDeadlineTimer = stoppedTimer()
+	}
+
+	// Max-duration deadline (immovable).
+	var maxWarnTimer, maxDeadlineTimer *time.Timer
+	if cfg.MaxDuration > 0 {
+		maxDeadline := tunnelStart.Add(cfg.MaxDuration)
+		maxWarnTimer = newTimerUntil(maxDeadline, cfg.ExpiryWarning)
+		maxDeadlineTimer = time.NewTimer(time.Until(maxDeadline))
+		defer maxWarnTimer.Stop()
+		defer maxDeadlineTimer.Stop()
+	} else {
+		maxWarnTimer = stoppedTimer()
+		maxDeadlineTimer = stoppedTimer()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-tokenWarnTimer.C:
+			logger.Info("token_expiry_warning_sent", slog.Time("expires_at", tokenExpiry))
+			_ = conn.SendControl(wsconn.ControlMessage{
+				Type: "expiry_warning",
+				Data: mustMarshal(map[string]string{
+					"reason":     "token",
+					"expires_at": tokenExpiry.Format(time.RFC3339),
+				}),
+			})
+
+		case <-tokenDeadlineTimer.C:
+			logger.Info("tunnel_closing_token_expired")
+			cancel()
+			sendBestEffortDisconnect(conn, "token_expired")
+			return
+
+		case <-maxWarnTimer.C:
+			maxDeadline := tunnelStart.Add(cfg.MaxDuration)
+			logger.Info("max_duration_warning_sent", slog.Time("expires_at", maxDeadline))
+			_ = conn.SendControl(wsconn.ControlMessage{
+				Type: "expiry_warning",
+				Data: mustMarshal(map[string]string{
+					"reason":     "max_duration",
+					"expires_at": maxDeadline.Format(time.RFC3339),
+				}),
+			})
+
+		case <-maxDeadlineTimer.C:
+			logger.Info("tunnel_closing_max_duration")
+			cancel()
+			sendBestEffortDisconnect(conn, "max_duration_reached")
+			return
+
+		case msg, ok := <-conn.ControlChan():
+			if !ok {
+				return
+			}
+			if msg.Type != "token_refresh" {
+				continue
+			}
+			var payload struct {
+				AccessToken string `json:"access_token"`
+			}
+			if err := json.Unmarshal(msg.Data, &payload); err != nil || payload.AccessToken == "" {
+				_ = conn.SendControl(wsconn.ControlMessage{
+					Type: "token_rejected",
+					Data: mustMarshal(map[string]string{"reason": "invalid_payload"}),
+				})
+				continue
+			}
+			if !cfg.ImplementsExpiry {
+				_ = conn.SendControl(wsconn.ControlMessage{
+					Type: "token_rejected",
+					Data: mustMarshal(map[string]string{"reason": "token_expiry_not_enforced"}),
+				})
+				continue
+			}
+			newClaims, err := validator.ValidateAccessToken(ctx, payload.AccessToken)
+			if err != nil {
+				logger.Warn("token_refresh_rejected", slog.String("error", err.Error()))
+				_ = conn.SendControl(wsconn.ControlMessage{
+					Type: "token_rejected",
+					Data: mustMarshal(map[string]string{"reason": "validation_failed"}),
+				})
+				continue
+			}
+			if newClaims.Subject != originalSubject {
+				logger.Warn("token_refresh_rejected_subject_mismatch",
+					slog.String("original", originalSubject),
+					slog.String("received", newClaims.Subject),
+				)
+				_ = conn.SendControl(wsconn.ControlMessage{
+					Type: "token_rejected",
+					Data: mustMarshal(map[string]string{"reason": "subject_mismatch"}),
+				})
+				continue
+			}
+
+			newExpiry := newClaims.GetExpiration()
+			if !newExpiry.After(tokenExpiry) {
+				logger.Warn("token_refresh_rejected_expiry_not_extended",
+					slog.Time("current", tokenExpiry),
+					slog.Time("received", newExpiry),
+				)
+				_ = conn.SendControl(wsconn.ControlMessage{
+					Type: "token_rejected",
+					Data: mustMarshal(map[string]string{"reason": "expiry_not_extended"}),
+				})
+				continue
+			}
+
+			tokenExpiry = newExpiry
+			drainTimer(tokenWarnTimer)
+			drainTimer(tokenDeadlineTimer)
+			tokenWarnTimer = newTimerUntil(tokenExpiry, cfg.ExpiryWarning)
+			tokenDeadlineTimer = time.NewTimer(time.Until(tokenExpiry))
+			logger.Info("token_refresh_accepted", slog.Time("new_expiry", tokenExpiry))
+			_ = conn.SendControl(wsconn.ControlMessage{
+				Type: "token_accepted",
+				Data: mustMarshal(map[string]string{"expires_at": tokenExpiry.Format(time.RFC3339)}),
+			})
+		}
+	}
+}
+
+// sendBestEffortDisconnect attempts to send a disconnect control message with
+// a short timeout. It is called after the tunnel context has been cancelled, so
+// the write may fail — this is intentional. Cancellation is the authoritative
+// teardown mechanism; the disconnect frame is a courtesy to the client.
+func sendBestEffortDisconnect(conn *wsconn.MultiplexConn, reason string) {
+	_ = conn.SendControlTimeout(2*time.Second, wsconn.ControlMessage{
+		Type: "disconnect",
+		Data: mustMarshal(map[string]string{"reason": reason}),
+	})
+}
+
+// newTimerUntil returns a timer that fires warningBefore a deadline. If the
+// warning time has already passed, the timer fires immediately.
+func newTimerUntil(deadline time.Time, warningBefore time.Duration) *time.Timer {
+	d := time.Until(deadline) - warningBefore
+	if d < 0 {
+		d = 0
+	}
+	return time.NewTimer(d)
+}
+
+// drainTimer stops a timer and drains its channel if it had already fired.
+// This prevents a stale fire from being picked up by the next select iteration
+// after the timer is replaced (e.g. after a token refresh).
+func drainTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
+func stoppedTimer() *time.Timer {
+	t := time.NewTimer(0)
+	t.Stop()
+	// Drain the channel in case it fired before Stop.
+	select {
+	case <-t.C:
+	default:
+	}
+	return t
+}
+
+func mustMarshal(v any) json.RawMessage {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return data
 }
 
 // checkWebSocketRequest rejects requests that should never reach the
