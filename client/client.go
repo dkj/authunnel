@@ -398,7 +398,7 @@ func handleControlMessages(ctx context.Context, conn *wsconn.MultiplexConn, sour
 					log.Printf("server warning: connection expiring due to %s", payload.Reason)
 					continue
 				}
-				newToken, err := source.AccessToken(ctx)
+				newToken, err := source.RefreshAccessToken(ctx)
 				if err != nil {
 					log.Printf("token refresh failed: %v", err)
 					continue

@@ -339,11 +339,19 @@ func drainBinaryFrames(t *testing.T, conn *wsconn.MultiplexConn) {
 
 // fakeTokenSource is a test double for authTokenSource.
 type fakeTokenSource struct {
-	token string
-	err   error
+	token        string
+	refreshToken string
+	err          error
 }
 
 func (f *fakeTokenSource) AccessToken(_ context.Context) (string, error) {
+	return f.token, f.err
+}
+
+func (f *fakeTokenSource) RefreshAccessToken(_ context.Context) (string, error) {
+	if f.refreshToken != "" {
+		return f.refreshToken, f.err
+	}
 	return f.token, f.err
 }
 
@@ -359,7 +367,7 @@ func TestHandleControlMessagesRefreshesOnTokenWarning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	source := &fakeTokenSource{token: "refreshed-token-abc"}
+	source := &fakeTokenSource{refreshToken: "refreshed-token-abc"}
 	go handleControlMessages(ctx, clientConn, source)
 
 	// Server sends an expiry_warning with reason "token".
