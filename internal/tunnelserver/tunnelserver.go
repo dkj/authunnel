@@ -241,15 +241,18 @@ func manageTunnelLongevity(
 		tokenExpiry = claims.GetExpiration()
 		tokenWarnTimer = newTimerUntil(tokenExpiry, cfg.ExpiryWarning)
 		tokenDeadlineTimer = time.NewTimer(time.Until(tokenExpiry))
-		defer tokenWarnTimer.Stop()
-		defer tokenDeadlineTimer.Stop()
 	} else {
 		// Inert timers that never fire.
 		tokenWarnTimer = stoppedTimer()
 		tokenDeadlineTimer = stoppedTimer()
 	}
+	// Stop the current timers on exit. These closures capture the pointer
+	// variables, so they stop whichever timer is active at return time —
+	// including replacements created by token refresh.
+	defer func() { tokenWarnTimer.Stop() }()
+	defer func() { tokenDeadlineTimer.Stop() }()
 
-	// Max-duration deadline (immovable).
+	// Max-duration deadline (immovable, never replaced).
 	var maxWarnTimer, maxDeadlineTimer *time.Timer
 	if cfg.MaxDuration > 0 {
 		maxDeadline := tunnelStart.Add(cfg.MaxDuration)
