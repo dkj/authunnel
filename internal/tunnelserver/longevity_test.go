@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,7 +37,11 @@ func wsPair(t *testing.T) (server *wsconn.MultiplexConn, client *wsconn.Multiple
 	serverReady := make(chan *wsconn.MultiplexConn, 1)
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on IPv4 loopback: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Errorf("server websocket accept: %v", err)
@@ -46,6 +51,8 @@ func wsPair(t *testing.T) (server *wsconn.MultiplexConn, client *wsconn.Multiple
 		serverReady <- mc
 		<-serverCtx.Done()
 	}))
+	ts.Listener = ln
+	ts.Start()
 	t.Cleanup(func() {
 		serverCancel()
 		ts.Close()

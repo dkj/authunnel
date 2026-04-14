@@ -3,6 +3,7 @@ package wsconn_test
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,7 +21,11 @@ func dialTestServer(t *testing.T) (server *wsconn.MultiplexConn, client *wsconn.
 	t.Helper()
 	serverReady := make(chan *wsconn.MultiplexConn, 1)
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on IPv4 loopback: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Errorf("server websocket accept: %v", err)
@@ -30,6 +35,8 @@ func dialTestServer(t *testing.T) (server *wsconn.MultiplexConn, client *wsconn.
 		serverReady <- mc
 		<-r.Context().Done()
 	}))
+	ts.Listener = ln
+	ts.Start()
 	t.Cleanup(ts.Close)
 
 	ctx := context.Background()
