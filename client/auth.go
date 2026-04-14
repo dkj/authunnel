@@ -30,27 +30,18 @@ const tokenReuseWindow = time.Minute
 // authTokenSource hides how the client obtains an access token so tunnel setup
 // can stay identical for manual tokens and managed OIDC login.
 type authTokenSource interface {
-	// AccessToken returns a usable access token, reusing a cached token when
-	// it is still safely valid.
-	AccessToken(ctx context.Context) (string, error)
-
-	// RefreshAccessToken bypasses the cache-reuse check and obtains a
-	// genuinely new token via the refresh-token grant. It is called when the
-	// server sends an expiry_warning and the client needs a token with a
-	// later expiry than the current one. Implementations that cannot refresh
-	// (e.g. static tokens) return the existing token unchanged.
-	RefreshAccessToken(ctx context.Context) (string, error)
+	// AccessToken returns a usable access token. When useCache is true, a
+	// cached token that passes the reuse window is returned immediately.
+	// When false, the cache-reuse check is skipped, forcing a refresh-token
+	// grant — used when the server warns that the current token is expiring.
+	AccessToken(ctx context.Context, useCache bool) (string, error)
 }
 
 type staticTokenSource struct {
 	token string
 }
 
-func (s staticTokenSource) AccessToken(context.Context) (string, error) {
-	return s.token, nil
-}
-
-func (s staticTokenSource) RefreshAccessToken(context.Context) (string, error) {
+func (s staticTokenSource) AccessToken(_ context.Context, _ bool) (string, error) {
 	return s.token, nil
 }
 
@@ -138,25 +129,12 @@ func normalizeScopes(scopes string) string {
 	return strings.Join(strings.Fields(scopes), " ")
 }
 
-// AccessToken is the single entry point for managed authentication. The order
-// is deliberate: cache first, then refresh, then browser-based login. That
-// keeps repeat ssh invocations fast while still recovering automatically when
-// the cached access token has expired.
-func (s *managedOIDCTokenSource) AccessToken(ctx context.Context) (string, error) {
-	return s.acquireToken(ctx, true)
-}
-
-// RefreshAccessToken bypasses the cache-reuse window and performs an OIDC
-// refresh-token grant to obtain a token with a later expiry. If no refresh
-// token is cached, or the refresh fails, it falls back to interactive login.
-func (s *managedOIDCTokenSource) RefreshAccessToken(ctx context.Context) (string, error) {
-	return s.acquireToken(ctx, false)
-}
-
-// acquireToken is the shared token-acquisition logic. When useCache is true,
-// a cached token that passes the reuse window is returned immediately.
-// Otherwise the cache check is skipped, forcing a refresh-token grant.
-func (s *managedOIDCTokenSource) acquireToken(ctx context.Context, useCache bool) (string, error) {
+// AccessToken is the single entry point for managed authentication. When
+// useCache is true the order is: cache first, then refresh, then browser-based
+// login — keeping repeat ssh invocations fast. When useCache is false (e.g.
+// responding to a server expiry_warning), the cache-reuse check is skipped so
+// the refresh-token grant produces a token with a later expiry.
+func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

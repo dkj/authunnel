@@ -304,7 +304,7 @@ func tightenUnixSocketPermissions(unixSocketPath string) error {
 }
 
 func handleSOCKSClient(ctx context.Context, cfg clientConfig, source authTokenSource, localConn net.Conn) error {
-	token, err := source.AccessToken(ctx)
+	token, err := source.AccessToken(ctx, true)
 	if err != nil {
 		_ = localConn.Close()
 		return fmt.Errorf("resolve access token: %w", err)
@@ -337,7 +337,7 @@ func handleSOCKSClient(ctx context.Context, cfg clientConfig, source authTokenSo
 // goroutine handles server-initiated control messages (expiry warnings, token
 // refresh) so the tunnel can be extended without disrupting the SSH session.
 func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authTokenSource) error {
-	token, err := source.AccessToken(ctx)
+	token, err := source.AccessToken(ctx, true)
 	if err != nil {
 		return fmt.Errorf("resolve access token: %w", err)
 	}
@@ -398,7 +398,7 @@ func handleControlMessages(ctx context.Context, conn *wsconn.MultiplexConn, sour
 					log.Printf("server warning: connection expiring due to %s", payload.Reason)
 					continue
 				}
-				newToken, err := source.RefreshAccessToken(ctx)
+				newToken, err := source.AccessToken(ctx, false)
 				if err != nil {
 					log.Printf("token refresh failed: %v", err)
 					continue
