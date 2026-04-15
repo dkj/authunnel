@@ -79,6 +79,8 @@ Authunnel enforces authentication (JWT validation) at the WebSocket layer before
 - A server audience configured in the IdP and emitted into access-token `aud`
 - A TLS certificate trusted by the client runtime (for TLS-files mode; not required for ACME or plaintext-behind-reverse-proxy modes)
 
+The **server** runs on Linux and macOS. The **client** runs on Linux, macOS, and Windows (10 1803 or later).
+
 ### Start server
 
 Choose one TLS mode. All modes also accept `--oidc-issuer`, `--token-audience`, `--listen-addr`, `--log-level`, and `--allow`.
@@ -178,6 +180,15 @@ Host internal-host
     --proxycommand %h %p
 ```
 
+On Windows with OpenSSH, use the full path with backslashes and quote it if it contains spaces:
+
+```sshconfig
+Host internal-host
+  HostName internal-host
+  User myuser
+  ProxyCommand "C:\path\to\authunnel-client.exe" --ws-url https://... --oidc-issuer https://<issuer> --oidc-client-id authunnel-cli --proxycommand %h %p
+```
+
 Useful client flags:
 
 - `--oidc-issuer`
@@ -185,7 +196,7 @@ Useful client flags:
 - `--oidc-audience` to request a specific API/resource audience during managed login
 - `--oidc-redirect-port` to use a fixed loopback callback port instead of a random one
 - `--oidc-scopes` with default `openid offline_access`
-- `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json`
+- `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json` (macOS/Linux) or `%AppData%\authunnel\tokens.json` (Windows)
 - `--oidc-no-browser` to print the URL without attempting automatic browser launch
 - `--access-token` to supply a bearer token directly (not recommended; mutually exclusive with all OIDC flags)
 - `--ws-url`
@@ -235,6 +246,8 @@ Host internal-host-via-socat
 If the unix-socket parent directory does not already exist, the client creates
 it with `0700` permissions. It also tightens the socket itself to `0600` so
 other local users cannot connect by default on shared hosts.
+
+Unix socket mode works on Windows 10 1803 and later.
 
 ## OIDC Client Registration
 

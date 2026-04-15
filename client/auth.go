@@ -12,13 +12,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	oidcclient "github.com/zitadel/oidc/v3/pkg/client"
@@ -364,38 +361,6 @@ func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.
 	return token, nil
 }
 
-// acquireFileLock coordinates concurrent client processes that share the same
-// token cache using an OS-backed advisory lock. The lock file is never deleted;
-// the kernel releases the lock when the owning process exits, which avoids both
-// age-based lock stealing and stale lock files after crashes.
-func acquireFileLock(ctx context.Context, lockPath string) (func(), error) {
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		return nil, fmt.Errorf("create lock directory: %w", err)
-	}
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open cache lock %q: %w", lockPath, err)
-	}
-	for {
-		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-			return func() {
-				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-				_ = file.Close()
-			}, nil
-		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-			_ = file.Close()
-			return nil, fmt.Errorf("lock cache lock %q: %w", lockPath, err)
-		}
-
-		select {
-		case <-ctx.Done():
-			_ = file.Close()
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
 // tokenUsable keeps a small reuse window so the client does not start a tunnel
 // with a token that is about to expire mid-handshake.
 func tokenUsable(token *oauth2.Token, now time.Time) bool {
@@ -450,25 +415,3 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-func defaultBrowserOpener(ctx context.Context, url string) error {
-	var name string
-	var args []string
-	switch runtime.GOOS {
-	case "darwin":
-		name = "open"
-		args = []string{url}
-	default:
-		// Linux and most Unix desktops use xdg-open. Unsupported platforms still
-		// get the URL printed to stderr, so browser launch remains best-effort.
-		name = "xdg-open"
-		args = []string{url}
-	}
-
-	commandCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	command := exec.CommandContext(commandCtx, name, args...)
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("launch %s: %w", name, err)
-	}
-	return nil
-}
