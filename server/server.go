@@ -37,6 +37,11 @@ type serverConfig struct {
 	PlaintextBehindProxy bool
 	LogLevel      slog.Level
 	AllowRules    tunnelserver.Allowlist
+	// Connection longevity
+	MaxConnectionDuration      time.Duration // hard max tunnel lifetime; 0 = unlimited
+	NoConnectionTokenExpiry bool          // when true, tunnel lifetime is NOT tied to access token expiry
+	ExpiryWarning              time.Duration // warning period before either limit
+	ExpiryGrace                time.Duration // grace period beyond token exp for cached-token providers
 }
 
 func serverUsage(w io.Writer) {
@@ -65,6 +70,19 @@ TLS mode (choose exactly one):
                              Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security.
                              X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks.
                              (env: PLAINTEXT_BEHIND_REVERSE_PROXY=true)
+
+Connection longevity:
+
+  --max-connection-duration <duration>
+                             Hard maximum tunnel lifetime, e.g. 4h or 30m (env: MAX_CONNECTION_DURATION, default: 0 = unlimited)
+  --no-connection-token-expiry
+                             Do not tie tunnel lifetime to access token expiry; tunnels persist regardless of
+                             token expiry (env: NO_CONNECTION_TOKEN_EXPIRY=true; by default, expiry IS enforced)
+  --expiry-warning <duration>
+                             Warning period before either longevity limit (env: EXPIRY_WARNING, default: 3m)
+  --expiry-grace <duration>
+                             Grace period beyond token exp for providers that cache access tokens; the
+                             connection deadline becomes exp + grace (env: EXPIRY_GRACE, default: 0)
 
 Other:
 
@@ -105,7 +123,15 @@ func main() {
 	}
 
 	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules),
-		tunnelserver.HandlerOptions{TrustForwardedProto: cfg.PlaintextBehindProxy})
+		tunnelserver.HandlerOptions{
+			TrustForwardedProto: cfg.PlaintextBehindProxy,
+			Longevity: tunnelserver.LongevityConfig{
+				MaxDuration:      cfg.MaxConnectionDuration,
+				ImplementsExpiry: !cfg.NoConnectionTokenExpiry,
+				ExpiryWarning:    cfg.ExpiryWarning,
+				ExpiryGrace:      cfg.ExpiryGrace,
+			},
+		})
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           tunnelserver.NewRequestLoggingMiddleware(logger, serverMux),
@@ -156,12 +182,13 @@ func main() {
 
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {
 	cfg := serverConfig{
-		Issuer:        getenv("OIDC_ISSUER"),
-		TokenAudience: getenv("TOKEN_AUDIENCE"),
-		TLSCertPath:   getenv("TLS_CERT_FILE"),
-		TLSKeyPath:    getenv("TLS_KEY_FILE"),
-		ACMECacheDir:  "/var/cache/authunnel/acme",
-		LogLevel:      slog.LevelInfo,
+		Issuer:                     getenv("OIDC_ISSUER"),
+		TokenAudience:              getenv("TOKEN_AUDIENCE"),
+		TLSCertPath:                getenv("TLS_CERT_FILE"),
+		TLSKeyPath:                 getenv("TLS_KEY_FILE"),
+		ACMECacheDir:               "/var/cache/authunnel/acme",
+		LogLevel:                   slog.LevelInfo,
+		ExpiryWarning: 3 * time.Minute,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
@@ -171,6 +198,39 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 	if getenv("PLAINTEXT_BEHIND_REVERSE_PROXY") == "true" {
 		cfg.PlaintextBehindProxy = true
+	}
+	if v := getenv("MAX_CONNECTION_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("MAX_CONNECTION_DURATION: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("MAX_CONNECTION_DURATION: must not be negative")
+		}
+		cfg.MaxConnectionDuration = d
+	}
+	if getenv("NO_CONNECTION_TOKEN_EXPIRY") == "true" {
+		cfg.NoConnectionTokenExpiry = true
+	}
+	if v := getenv("EXPIRY_WARNING"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("EXPIRY_WARNING: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("EXPIRY_WARNING: must not be negative")
+		}
+		cfg.ExpiryWarning = d
+	}
+	if v := getenv("EXPIRY_GRACE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("EXPIRY_GRACE: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("EXPIRY_GRACE: must not be negative")
+		}
+		cfg.ExpiryGrace = d
 	}
 
 	envLogLevel := getenv("LOG_LEVEL")
@@ -220,6 +280,41 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		}
 		cfg.LogLevel = level
 		logLevelFlagSet = true
+		return nil
+	})
+	fs.Func("max-connection-duration", "Hard maximum tunnel lifetime, e.g. 4h or 30m; 0 = unlimited", func(value string) error {
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		if d < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.MaxConnectionDuration = d
+		return nil
+	})
+	fs.BoolVar(&cfg.NoConnectionTokenExpiry, "no-connection-token-expiry", cfg.NoConnectionTokenExpiry,
+		"Do not tie tunnel lifetime to access token expiry; tunnels persist regardless of token expiry")
+	fs.Func("expiry-warning", "Warning period before either longevity limit (default: 3m)", func(value string) error {
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		if d < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.ExpiryWarning = d
+		return nil
+	})
+	fs.Func("expiry-grace", "Grace period beyond token exp for providers that cache access tokens (default: 0)", func(value string) error {
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		if d < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.ExpiryGrace = d
 		return nil
 	})
 	if err := fs.Parse(args); err != nil {

@@ -332,6 +332,11 @@ That is not implemented today. Current behavior is still tied closely to a
 single live websocket transport. The important constraint for current work is
 to avoid making that future harder.
 
+The connection longevity system (text-frame control channel, `MultiplexConn`
+adapter) provides a foundation for future session-level state management.
+Token refresh over the control channel already demonstrates the pattern of
+in-band session renegotiation without disrupting the data path.
+
 Design guardrails:
 
 - Treat tunnel session identity as separate from the current websocket
@@ -362,56 +367,63 @@ If resumable tunnels are implemented later, the likely model is:
 
 ## Multiplexing and control-plane design note
 
-It may be useful later to break the current practical `1 websocket : 1 tunnel`
-shape, but that should be done carefully.
+The `1 websocket : 1 tunnel` shape is preserved, but an in-band control channel
+now exists alongside the SOCKS5 data path. The `internal/wsconn.MultiplexConn`
+adapter uses WebSocket text frames for JSON control messages and binary frames
+for SOCKS5 data, giving each tunnel a lightweight control plane without adding
+framing overhead to the data path.
 
-A helpful distinction:
+A helpful distinction remains:
 
 - `session != websocket`
 - `control channel != data multiplexing`
 
-The first likely architectural step is an explicit session/control layer, not
-immediate multiplexing of many TCP tunnels over one websocket.
+### What is implemented
 
-Why that ordering is preferable:
+The control channel currently supports connection longevity management:
 
-- A control plane can support resume/reconnect, lease renewal, shutdown/drain
-  notices, diagnostics, and explicit session expiry without immediately making
-  the byte-forwarding path much more complex.
+- **`expiry_warning`** (server→client): sent before either the token expiry or
+  max-duration limit is reached, with a `reason` field (`"token"` or
+  `"max_duration"`) so the client knows whether a refresh can help.
+- **`token_refresh`** (client→server): the client sends a new access token to
+  extend the tunnel when the server signals token expiry.
+- **`token_accepted` / `token_rejected`** (server→client): confirmation of
+  whether the refresh succeeded. Subject pinning prevents identity swaps.
+- **`disconnect`** (server→client): sent immediately before server-initiated
+  close, with a reason string.
+
+The server validates refreshed tokens using the same `TokenValidator` and
+enforces subject continuity (the new token's `sub` must match the original).
+
+### What remains for future work
+
+Full data multiplexing (many TCP tunnels over one websocket) is not implemented
+and the earlier reasoning against premature multiplexing still holds:
+
 - Full data multiplexing adds framing, stream IDs, fairness, per-stream flow
   control, shared-buffer accounting, and more complicated failure handling.
-- A single multiplexed websocket also creates a larger blast radius: one
-  transport failure could drop many active tunnels at once.
+- A single multiplexed websocket creates a larger blast radius: one transport
+  failure could drop many active tunnels at once.
 
-Useful future control-plane functions could include:
+Useful future control-plane extensions could include:
 
 - session creation and resume tokens
 - attached/detached state transitions
 - heartbeat / liveness signals
-- lease renewal or explicit session expiry
-- reauthentication state for future resumes or live sessions
 - server shutdown or drain notifications
 - structured logging / user-visible diagnostics
 
-For live tunnels, prefer session-lease renewal over tying the tunnel directly to
-the original access token expiry. For example, the server could send a
-`renew_soon` control message a few minutes before expiry; the client would try
-refresh-token renewal first, then browser reauth if needed, and send only a new
-access token over the control plane. The server can then extend the session
-lease, or move the session into grace/expiry if renewal never arrives.
-
-Essential guardrails:
+Essential guardrails (unchanged):
 
 - Send new access tokens over the control plane only. Never send refresh tokens
   to the Authunnel server.
-- Do not hard-drop a live tunnel exactly at token expiry; use explicit
-  grace/expiry policy.
 - When renewing, validate continuity of identity and audience before extending
-  the session lease.
+  the session lease. (Implemented: subject pinning in `manageTunnelLongevity`.)
 - Never log bearer tokens or resume tokens.
 
 Current guardrail:
 
 - Do not spread websocket-specific assumptions deeper into the code than
-  necessary. Future work should be able to introduce a session/control layer
-  while preserving a simple and auditable per-tunnel data path.
+  necessary. The `MultiplexConn` adapter keeps the control channel isolated
+  from the SOCKS5 data path, preserving a simple and auditable per-tunnel
+  byte-forwarding layer.
