@@ -317,23 +317,23 @@ func loggerWithAccessTokenClaims(logger *slog.Logger, claims *oidc.AccessTokenCl
 		return logger
 	}
 
-	attrs := make([]slog.Attr, 0, 4)
+	args := make([]any, 0, 8)
 	if user := accessTokenUser(claims); user != "" {
-		attrs = append(attrs, slog.String("user", user))
+		args = append(args, slog.String("user", user))
 	}
 	if email := accessTokenEmail(claims); email != "" {
-		attrs = append(attrs, slog.String("email", email))
+		args = append(args, slog.String("email", email))
 	}
 	if claims.Subject != "" {
-		attrs = append(attrs, slog.String("subject", claims.Subject))
+		args = append(args, slog.String("subject", claims.Subject))
 	}
 	if claims.ClientID != "" {
-		attrs = append(attrs, slog.String("client_id", claims.ClientID))
+		args = append(args, slog.String("client_id", claims.ClientID))
 	}
-	if len(attrs) == 0 {
+	if len(args) == 0 {
 		return logger
 	}
-	return logger.With(slogAttrsToArgs(attrs)...)
+	return logger.With(args...)
 }
 
 // accessTokenUser prefers a human-meaningful identifier when the provider
@@ -387,12 +387,4 @@ func socksCommandName(command uint8) string {
 	default:
 		return "unknown"
 	}
-}
-
-func slogAttrsToArgs(attrs []slog.Attr) []any {
-	args := make([]any, 0, len(attrs))
-	for _, attr := range attrs {
-		args = append(args, attr)
-	}
-	return args
 }

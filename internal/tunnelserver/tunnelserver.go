@@ -442,26 +442,15 @@ func newTimerUntil(deadline time.Time, warningBefore time.Duration) *time.Timer 
 	return time.NewTimer(d)
 }
 
-// drainTimer stops a timer and drains its channel if it had already fired.
-// This prevents a stale fire from being picked up by the next select iteration
-// after the timer is replaced (e.g. after a token refresh).
+// drainTimer stops a timer so it can safely be replaced. Since Go 1.23,
+// Stop guarantees no stale values will be sent after it returns.
 func drainTimer(t *time.Timer) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
+	t.Stop()
 }
 
 func stoppedTimer() *time.Timer {
 	t := time.NewTimer(0)
 	t.Stop()
-	// Drain the channel in case it fired before Stop.
-	select {
-	case <-t.C:
-	default:
-	}
 	return t
 }
 
