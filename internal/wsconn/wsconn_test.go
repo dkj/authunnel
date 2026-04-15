@@ -3,6 +3,8 @@ package wsconn_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -287,6 +289,101 @@ func TestConcurrentWriteAndSendControl(t *testing.T) {
 	// Drain remaining data to make sure nothing panicked.
 	server.Close()
 	for range dataCh {
+	}
+}
+
+// TestNormalCloseReturnsEOF verifies that when the peer sends a normal close
+// frame (StatusNormalClosure), Read returns io.EOF rather than a raw
+// websocket.CloseError. This is critical because go-socks5 (and anything using
+// io.Copy) treats any non-nil, non-EOF error as a session failure, which would
+// log clean SSH disconnects as socks_session_failed warnings.
+func TestNormalCloseReturnsEOF(t *testing.T) {
+	server, client := dialTestServer(t)
+
+	// Close the server side cleanly.
+	server.Close()
+
+	// The client-side Read should return io.EOF, not a CloseError.
+	buf := make([]byte, 1)
+	_, err := client.Read(buf)
+	if err == nil {
+		t.Fatal("expected error from Read after peer close, got nil")
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got %T: %v", err, err)
+	}
+}
+
+// TestOversizedControlFrameDiscarded verifies that a text frame larger than
+// maxControlFrameSize (64 KiB) is silently discarded without killing the
+// connection. Subsequent normal-sized control and binary messages must still
+// be delivered.
+func TestOversizedControlFrameDiscarded(t *testing.T) {
+	// We need a raw *websocket.Conn on the sending side so we can write an
+	// oversized text frame without going through MultiplexConn.SendControl
+	// (which would JSON-marshal a reasonable-sized struct).
+	serverReady := make(chan *websocket.Conn, 1)
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		serverReady <- c
+		<-r.Context().Done()
+	}))
+	ts.Listener = ln
+	ts.Start()
+	t.Cleanup(ts.Close)
+
+	ctx := context.Background()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	clientWS, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	client := wsconn.New(ctx, clientWS)
+	t.Cleanup(func() { client.Close() })
+
+	rawServer := <-serverReady
+	// Disable the server-side read limit too so our large write doesn't fail.
+	rawServer.SetReadLimit(-1)
+	t.Cleanup(func() { rawServer.Close(websocket.StatusNormalClosure, "") })
+
+	// Start reading on the client side so frames are dispatched.
+	drainBinary(client)
+
+	// Send a text frame that exceeds 64 KiB.
+	oversized := make([]byte, 70*1024)
+	for i := range oversized {
+		oversized[i] = 'X'
+	}
+	if err := rawServer.Write(ctx, websocket.MessageText, oversized); err != nil {
+		t.Fatalf("write oversized text frame: %v", err)
+	}
+
+	// Follow it with a normal control message.
+	normal, _ := json.Marshal(wsconn.ControlMessage{
+		Type: "ping",
+		Data: json.RawMessage(`{}`),
+	})
+	if err := rawServer.Write(ctx, websocket.MessageText, normal); err != nil {
+		t.Fatalf("write normal text frame: %v", err)
+	}
+
+	// The oversized frame should be discarded; the normal one should arrive.
+	select {
+	case msg := <-client.ControlChan():
+		if msg.Type != "ping" {
+			t.Fatalf("expected ping, got %s", msg.Type)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for control message after oversized frame — connection may have been killed")
 	}
 }
 

@@ -7,6 +7,7 @@ package wsconn
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,14 @@ import (
 
 	"github.com/coder/websocket"
 )
+
+// maxControlFrameSize is the largest text frame the multiplexer will accept.
+// Control messages are small JSON envelopes (token refresh payloads are the
+// largest at ~2 KiB for a JWT). 64 KiB is generous headroom while still
+// preventing a peer from forcing unbounded allocations via oversized text
+// frames — important because the library-level read limit is disabled to
+// allow arbitrary binary (SOCKS5) frame sizes.
+const maxControlFrameSize int64 = 64 * 1024
 
 // ControlMessage is a JSON envelope sent over WebSocket text frames.
 type ControlMessage struct {
@@ -40,6 +49,12 @@ type MultiplexConn struct {
 // connection satisfies net.Conn for binary data. Control messages arriving as
 // text frames are available via ControlChan.
 func New(ctx context.Context, ws *websocket.Conn) *MultiplexConn {
+	// Disable the library's default per-message read limit (~32 KiB).
+	// SOCKS proxy paths using io.Copy can emit arbitrarily large binary
+	// frames; the default limit would tear down healthy tunnels with a
+	// "message too large" error under normal throughput.
+	ws.SetReadLimit(-1)
+
 	ctx, cancel := context.WithCancel(ctx)
 	return &MultiplexConn{
 		ws:       ws,
@@ -99,7 +114,7 @@ func (c *MultiplexConn) Read(p []byte) (int, error) {
 		typ, reader, err := c.ws.Reader(c.ctx)
 		if err != nil {
 			c.closeOnce.Do(func() { close(c.controlC) })
-			return 0, err
+			return 0, normalCloseToEOF(err)
 		}
 
 		if typ == websocket.MessageBinary {
@@ -108,10 +123,22 @@ func (c *MultiplexConn) Read(p []byte) (int, error) {
 		}
 
 		// Text frame: consume fully and dispatch as control message.
-		data, err := io.ReadAll(reader)
+		// Cap reads at maxControlFrameSize to prevent a peer from forcing
+		// unbounded memory allocation via an oversized text frame. The
+		// global read limit is disabled (for binary throughput), so this
+		// is the only size guard on the control path.
+		limited := io.LimitReader(reader, maxControlFrameSize+1)
+		data, err := io.ReadAll(limited)
 		if err != nil {
 			c.closeOnce.Do(func() { close(c.controlC) })
 			return 0, fmt.Errorf("read control frame: %w", err)
+		}
+		if int64(len(data)) > maxControlFrameSize {
+			// Oversized control frame — drain the remainder so the
+			// websocket reader is left in a clean state for the next
+			// message, then discard.
+			_, _ = io.Copy(io.Discard, reader)
+			continue
 		}
 		var msg ControlMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
@@ -157,6 +184,22 @@ func (c *MultiplexConn) SetReadDeadline(t time.Time) error { return nil }
 
 // SetWriteDeadline implements net.Conn.
 func (c *MultiplexConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// normalCloseToEOF translates clean WebSocket close frames into io.EOF.
+// StatusNormalClosure and StatusGoingAway are the two codes that indicate an
+// orderly shutdown. The previous websocket.NetConn adapter made this
+// translation internally; without it, go-socks5 (and anything else using
+// io.Copy) treats a clean client disconnect as a session error instead of a
+// graceful EOF.
+func normalCloseToEOF(err error) error {
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		if ce.Code == websocket.StatusNormalClosure || ce.Code == websocket.StatusGoingAway {
+			return io.EOF
+		}
+	}
+	return err
+}
 
 type wsAddr string
 
