@@ -41,6 +41,7 @@ type serverConfig struct {
 	MaxConnectionDuration      time.Duration // hard max tunnel lifetime; 0 = unlimited
 	NoConnectionTokenExpiry bool          // when true, tunnel lifetime is NOT tied to access token expiry
 	ExpiryWarning              time.Duration // warning period before either limit
+	ExpiryGrace                time.Duration // grace period beyond token exp for cached-token providers
 }
 
 func serverUsage(w io.Writer) {
@@ -79,6 +80,9 @@ Connection longevity:
                              token expiry (env: NO_CONNECTION_TOKEN_EXPIRY=true; by default, expiry IS enforced)
   --expiry-warning <duration>
                              Warning period before either longevity limit (env: EXPIRY_WARNING, default: 3m)
+  --expiry-grace <duration>
+                             Grace period beyond token exp for providers that cache access tokens; the
+                             connection deadline becomes exp + grace (env: EXPIRY_GRACE, default: 0)
 
 Other:
 
@@ -125,6 +129,7 @@ func main() {
 				MaxDuration:      cfg.MaxConnectionDuration,
 				ImplementsExpiry: !cfg.NoConnectionTokenExpiry,
 				ExpiryWarning:    cfg.ExpiryWarning,
+				ExpiryGrace:      cfg.ExpiryGrace,
 			},
 		})
 	httpServer := &http.Server{
@@ -217,6 +222,16 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		}
 		cfg.ExpiryWarning = d
 	}
+	if v := getenv("EXPIRY_GRACE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("EXPIRY_GRACE: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("EXPIRY_GRACE: must not be negative")
+		}
+		cfg.ExpiryGrace = d
+	}
 
 	envLogLevel := getenv("LOG_LEVEL")
 	envAllowRules := getenv("ALLOW_RULES")
@@ -289,6 +304,17 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 			return fmt.Errorf("must not be negative")
 		}
 		cfg.ExpiryWarning = d
+		return nil
+	})
+	fs.Func("expiry-grace", "Grace period beyond token exp for providers that cache access tokens (default: 0)", func(value string) error {
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		if d < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.ExpiryGrace = d
 		return nil
 	})
 	if err := fs.Parse(args); err != nil {

@@ -356,6 +356,72 @@ func TestTokenRefreshRejectedWhenExpiryNotEnforced(t *testing.T) {
 	}
 }
 
+// TestTokenRefreshSameExpiryBeforeWarningKeepsTimer verifies that a proactive
+// same-expiry refresh that arrives before the warning window does NOT pull the
+// warning timer forward. With exp far away and warning=2s, a same-exp refresh
+// at T+0 should leave the warning timer at its original schedule, not halve it.
+func TestTokenRefreshSameExpiryBeforeWarningKeepsTimer(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	// Token expires in 10s, warning at 2s before deadline → warning at T+8s.
+	sameExpiry := time.Now().Add(10 * time.Second)
+	claims := makeClaims("user-1", sameExpiry)
+	validator := &mockValidator{
+		tokens: map[string]*oidc.AccessTokenClaims{
+			"cached-token": makeClaims("user-1", sameExpiry),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    2 * time.Second,
+	}, time.Now(), slog.Default())
+
+	// Send a proactive same-expiry refresh immediately (well before warning window).
+	err := clientConn.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: mustMarshal(map[string]string{"access_token": "cached-token"}),
+	})
+	if err != nil {
+		t.Fatalf("send token_refresh: %v", err)
+	}
+
+	msg, ok := readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for token_accepted")
+	}
+	if msg.Type != "token_accepted" {
+		t.Fatalf("expected token_accepted, got %s", msg.Type)
+	}
+
+	// The warning timer should still be at its original schedule (~T+8s).
+	// If the bug exists, it would be rescheduled to remaining/2 (~T+5s)
+	// and fire within 6s. Assert no warning arrives within 6s.
+	select {
+	case stray := <-clientConn.ControlChan():
+		if stray.Type == "expiry_warning" {
+			t.Fatal("warning timer was pulled forward by proactive same-expiry refresh")
+		}
+		t.Fatalf("unexpected control message: %s", stray.Type)
+	case <-time.After(6 * time.Second):
+		// Good — no premature warning. Original timer is intact.
+	}
+
+	// The warning should still arrive around T+8s (within 4 more seconds).
+	msg, ok = readControl(t, clientConn, 4*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for the original expiry_warning — timer was lost")
+	}
+	if msg.Type != "expiry_warning" {
+		t.Fatalf("expected expiry_warning, got %s", msg.Type)
+	}
+}
+
 // TestTokenRefreshAcceptsSameExpiry verifies that a refreshed token with the
 // same expiry is accepted (common with providers like Auth0 that cache access
 // tokens) but timers are not reset.
@@ -644,5 +710,188 @@ func TestTokenRefreshDefersWarningWhenInsideWarningWindow(t *testing.T) {
 		if msg.Type != "disconnect" {
 			t.Fatalf("expected deferred expiry_warning or disconnect, got %s", msg.Type)
 		}
+	}
+}
+
+// TestExpiryGraceWarningGTGraceRetriesUntilNewToken exercises the common case
+// where --expiry-warning exceeds --expiry-grace. The first warning fires before
+// the raw token expires; the client refreshes but the provider returns the same
+// cached token (same exp). The server accepts it unchanged and schedules a
+// retry warning at remaining/2. When the retry fires, the client refreshes
+// again — this time with a genuinely new token — and the tunnel extends.
+func TestExpiryGraceWarningGTGraceRetriesUntilNewToken(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	// Token expires in 3s, grace 1s → deadline at T+4s, warning 5s.
+	// Warning fires at max(0, 4s-5s) = T+0 (immediately).
+	tokenExpiry := time.Now().Add(3 * time.Second)
+	extendedExpiry := time.Now().Add(10 * time.Second)
+	claims := makeClaims("user-1", tokenExpiry)
+
+	// The validator knows two tokens: one with the same exp (cached provider
+	// response) and one with extended exp (new token after provider cache expires).
+	validator := &mockValidator{
+		tokens: map[string]*oidc.AccessTokenClaims{
+			"cached-token": makeClaims("user-1", tokenExpiry),
+			"new-token":    makeClaims("user-1", extendedExpiry),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    5 * time.Second,
+		ExpiryGrace:      1 * time.Second,
+	}, time.Now(), slog.Default())
+
+	// 1. First warning fires immediately (warning > deadline).
+	msg, ok := readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for initial expiry_warning")
+	}
+	if msg.Type != "expiry_warning" {
+		t.Fatalf("expected expiry_warning, got %s", msg.Type)
+	}
+
+	// 2. Client refreshes with cached (same-exp) token.
+	err := clientConn.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: mustMarshal(map[string]string{"access_token": "cached-token"}),
+	})
+	if err != nil {
+		t.Fatalf("send cached token_refresh: %v", err)
+	}
+
+	msg, ok = readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for token_accepted (cached)")
+	}
+	if msg.Type != "token_accepted" {
+		t.Fatalf("expected token_accepted, got %s", msg.Type)
+	}
+
+	// 3. A retry warning should fire at remaining/2 (not never).
+	msg, ok = readControl(t, clientConn, 4*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for retry expiry_warning — server did not schedule retry after same-exp accept")
+	}
+	if msg.Type == "disconnect" {
+		t.Fatal("tunnel disconnected without giving client a retry warning")
+	}
+	if msg.Type != "expiry_warning" {
+		t.Fatalf("expected retry expiry_warning, got %s", msg.Type)
+	}
+
+	// 4. Client refreshes with a genuinely new token.
+	err = clientConn.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: mustMarshal(map[string]string{"access_token": "new-token"}),
+	})
+	if err != nil {
+		t.Fatalf("send new token_refresh: %v", err)
+	}
+
+	msg, ok = readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for token_accepted (new)")
+	}
+	if msg.Type != "token_accepted" {
+		t.Fatalf("expected token_accepted, got %s", msg.Type)
+	}
+
+	// 5. Tunnel should survive past original deadline (T+4s).
+	time.Sleep(2 * time.Second)
+	select {
+	case <-ctx.Done():
+		t.Fatal("tunnel closed despite successful refresh with new token")
+	default:
+		// Good — still alive.
+	}
+}
+
+// TestExpiryGraceExtendsTunnelBeyondTokenExp verifies that the grace period
+// pushes the connection deadline past the token's raw exp claim. With a 1s
+// token and 2s grace, the tunnel should survive for ~3s total.
+func TestExpiryGraceExtendsTunnelBeyondTokenExp(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	// Token expires in 1s, but grace extends the connection deadline to 3s.
+	tokenExpiry := time.Now().Add(1 * time.Second)
+	claims := makeClaims("user-1", tokenExpiry)
+	validator := &mockValidator{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    500 * time.Millisecond,
+		ExpiryGrace:      2 * time.Second,
+	}, time.Now(), slog.Default())
+
+	// At T+1s the token has expired, but the tunnel should still be alive
+	// (grace extends to T+3s).
+	time.Sleep(1500 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		t.Fatal("tunnel closed at token exp despite grace period")
+	default:
+		// Good — still alive.
+	}
+
+	// By T+3.5s the grace period should be exhausted and the tunnel closed.
+	time.Sleep(2 * time.Second)
+	select {
+	case <-ctx.Done():
+		// Good — tunnel closed after grace period.
+	default:
+		t.Fatal("tunnel still alive after grace period should have expired")
+	}
+}
+
+// TestExpiryGraceWarningRelativeToDeadline verifies that the expiry_warning
+// fires relative to the connection deadline (exp + grace), not the raw token
+// exp. With a 3s token, 3s grace, and 1s warning, the deadline is at T+6s
+// and the warning fires at T+5s — well past the raw token exp.
+func TestExpiryGraceWarningRelativeToDeadline(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	tokenExpiry := time.Now().Add(3 * time.Second)
+	claims := makeClaims("user-1", tokenExpiry)
+	validator := &mockValidator{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    1 * time.Second,
+		ExpiryGrace:      3 * time.Second,
+	}, time.Now(), slog.Default())
+
+	// Token exp is at T+3s, grace pushes deadline to T+6s, warning at T+5s.
+	// No warning should arrive before T+4s (well past raw token exp).
+	select {
+	case msg := <-clientConn.ControlChan():
+		t.Fatalf("unexpected early control message: %s", msg.Type)
+	case <-time.After(4 * time.Second):
+		// Good — no warning yet, even though raw token has expired.
+	}
+
+	// Warning should arrive between T+4s and T+6s.
+	msg, ok := readControl(t, clientConn, 3*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for expiry_warning")
+	}
+	if msg.Type != "expiry_warning" {
+		t.Fatalf("expected expiry_warning, got %s", msg.Type)
 	}
 }

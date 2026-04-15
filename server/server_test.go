@@ -1133,8 +1133,10 @@ func TestParseServerConfigRejectsNegativeDurations(t *testing.T) {
 	}{
 		{"negative MAX_CONNECTION_DURATION env", "MAX_CONNECTION_DURATION", ""},
 		{"negative EXPIRY_WARNING env", "EXPIRY_WARNING", ""},
+		{"negative EXPIRY_GRACE env", "EXPIRY_GRACE", ""},
 		{"negative --max-connection-duration flag", "", "--max-connection-duration"},
 		{"negative --expiry-warning flag", "", "--expiry-warning"},
+		{"negative --expiry-grace flag", "", "--expiry-grace"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1675,5 +1677,196 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("echo read timed out after refresh — tunnel did not survive past original expiry")
+	}
+}
+
+// TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh is a full integration
+// test that verifies the --expiry-grace flag wires through config parsing into
+// an actual server instance. A short-lived token (2s) with a 2s grace period
+// gives a connection deadline of T+4s. The warning fires, the client refreshes
+// with the same cached token (same exp), and the server schedules a retry
+// warning. On the retry the client sends a genuinely new token, extending the
+// tunnel past the original deadline. The echo server confirms data still flows.
+func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
+	const audience = "authunnel-server"
+	// Initial token expires in 2s.
+	issuer, issuerClient, initialToken, mint := newJWTTestIssuerFull(t, audience, 2*time.Second)
+
+	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+
+	// TCP echo server.
+	echoLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	// Key: ExpiryGrace is set, and ExpiryWarning > ExpiryGrace (the
+	// scenario that triggered the reviewer concern).
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+		tunnelserver.HandlerOptions{
+			Longevity: tunnelserver.LongevityConfig{
+				ImplementsExpiry: true,
+				ExpiryWarning:    3 * time.Second,
+				ExpiryGrace:      2 * time.Second,
+			},
+		})
+
+	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	ctx := context.Background()
+	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + initialToken}},
+	})
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	mux := wsconn.New(ctx, wsConn)
+	defer mux.Close()
+
+	// Complete SOCKS5 handshake.
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoLn.Addr().String())
+	var echoPort int
+	fmt.Sscanf(echoPortStr, "%d", &echoPort)
+
+	if _, err := mux.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("socks greeting write: %v", err)
+	}
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(mux, greeting); err != nil {
+		t.Fatalf("socks greeting read: %v", err)
+	}
+
+	connectReq := []byte{0x05, 0x01, 0x00, 0x01}
+	connectReq = append(connectReq, net.ParseIP(echoHost).To4()...)
+	connectReq = append(connectReq, byte(echoPort>>8), byte(echoPort))
+	if _, err := mux.Write(connectReq); err != nil {
+		t.Fatalf("socks connect write: %v", err)
+	}
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(mux, connectReply); err != nil {
+		t.Fatalf("socks connect read: %v", err)
+	}
+	if connectReply[1] != 0x00 {
+		t.Fatalf("socks connect failed with reply code %d", connectReply[1])
+	}
+
+	// Background reader so control messages are dispatched.
+	binaryData := make(chan []byte, 16)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := mux.Read(buf)
+			if err != nil {
+				close(binaryData)
+				return
+			}
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			binaryData <- data
+		}
+	}()
+
+	// Token exp=2s, grace=2s → deadline at T+4s, warning=3s → fires at T+1s.
+	// 1. Wait for first expiry_warning.
+	select {
+	case msg := <-mux.ControlChan():
+		if msg.Type != "expiry_warning" {
+			t.Fatalf("expected expiry_warning, got %s", msg.Type)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for expiry_warning")
+	}
+
+	// 2. Refresh with the SAME token (simulating a cached-token provider).
+	//    Mint a token with the same 2s lifetime as the original — by the time
+	//    this runs ~1s has elapsed, so the new token's exp is ~1s in the future,
+	//    which is close to (or equal to) the original exp. The server should
+	//    accept it (same or slightly different exp) and schedule a retry warning.
+	cachedToken := mint(2 * time.Second)
+	tokenData, _ := json.Marshal(map[string]string{"access_token": cachedToken})
+	if err := mux.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: tokenData,
+	}); err != nil {
+		t.Fatalf("send cached token_refresh: %v", err)
+	}
+
+	// Wait for token_accepted.
+	select {
+	case msg := <-mux.ControlChan():
+		if msg.Type != "token_accepted" {
+			t.Fatalf("expected token_accepted for cached token, got %s", msg.Type)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for token_accepted (cached)")
+	}
+
+	// 3. Wait for the retry warning (remaining/2 of the remaining deadline).
+	select {
+	case msg := <-mux.ControlChan():
+		if msg.Type == "disconnect" {
+			t.Fatal("tunnel disconnected without giving a retry warning")
+		}
+		if msg.Type != "expiry_warning" {
+			t.Fatalf("expected retry expiry_warning, got %s", msg.Type)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for retry expiry_warning")
+	}
+
+	// 4. Refresh with a genuinely new, long-lived token.
+	freshToken := mint(1 * time.Hour)
+	tokenData, _ = json.Marshal(map[string]string{"access_token": freshToken})
+	if err := mux.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: tokenData,
+	}); err != nil {
+		t.Fatalf("send fresh token_refresh: %v", err)
+	}
+
+	select {
+	case msg := <-mux.ControlChan():
+		if msg.Type != "token_accepted" {
+			t.Fatalf("expected token_accepted for fresh token, got %s", msg.Type)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for token_accepted (fresh)")
+	}
+
+	// 5. Sleep past the original deadline (T+4s). Without the grace+retry
+	//    logic the tunnel would be dead by now.
+	time.Sleep(2 * time.Second)
+
+	// 6. Verify the tunnel is still alive by echoing data.
+	if _, err := mux.Write([]byte{0xCD}); err != nil {
+		t.Fatalf("echo write after refresh: %v", err)
+	}
+	select {
+	case data := <-binaryData:
+		if len(data) != 1 || data[0] != 0xCD {
+			t.Fatalf("echo after refresh got %x, want 0xCD", data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("echo read timed out — tunnel did not survive past original deadline with grace+refresh")
 	}
 }

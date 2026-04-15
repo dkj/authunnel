@@ -90,6 +90,12 @@ type LongevityConfig struct {
 	// ExpiryWarning is the lead time before either deadline at which the
 	// server sends an expiry_warning control message to the client.
 	ExpiryWarning time.Duration
+	// ExpiryGrace extends the connection deadline beyond the access token's
+	// exp claim. This accommodates providers (e.g. Auth0) that cache access
+	// tokens and return the same one on refresh until the original expires.
+	// The grace window gives the client time to obtain a genuinely new token
+	// after the old one expires at the provider. Default: 0 (no grace).
+	ExpiryGrace time.Duration
 }
 
 func (lc LongevityConfig) active() bool {
@@ -234,13 +240,17 @@ func manageTunnelLongevity(
 ) {
 	originalSubject := claims.Subject
 
-	// Token-expiry deadline (resettable via refresh).
-	var tokenExpiry time.Time
+	// Token-expiry deadline (resettable via refresh). The connection deadline
+	// is token exp + grace, giving clients time to obtain a new token from
+	// providers that cache access tokens (e.g. Auth0).
+	var tokenExpiry time.Time    // raw exp claim from the current token
+	var connDeadline time.Time   // tokenExpiry + grace — the actual enforcement point
 	var tokenWarnTimer, tokenDeadlineTimer *time.Timer
 	if cfg.ImplementsExpiry {
 		tokenExpiry = claims.GetExpiration()
-		tokenWarnTimer = newTimerUntil(tokenExpiry, cfg.ExpiryWarning)
-		tokenDeadlineTimer = time.NewTimer(time.Until(tokenExpiry))
+		connDeadline = tokenExpiry.Add(cfg.ExpiryGrace)
+		tokenWarnTimer = newTimerUntil(connDeadline, cfg.ExpiryWarning)
+		tokenDeadlineTimer = time.NewTimer(time.Until(connDeadline))
 	} else {
 		// Inert timers that never fire.
 		tokenWarnTimer = stoppedTimer()
@@ -271,12 +281,12 @@ func manageTunnelLongevity(
 			return
 
 		case <-tokenWarnTimer.C:
-			logger.Info("token_expiry_warning_sent", slog.Time("expires_at", tokenExpiry))
+			logger.Info("token_expiry_warning_sent", slog.Time("expires_at", connDeadline))
 			_ = conn.SendControl(wsconn.ControlMessage{
 				Type: "expiry_warning",
 				Data: mustMarshal(map[string]string{
 					"reason":     "token",
-					"expires_at": tokenExpiry.Format(time.RFC3339),
+					"expires_at": connDeadline.Format(time.RFC3339),
 				}),
 			})
 
@@ -364,36 +374,48 @@ func manageTunnelLongevity(
 			if newExpiry.Equal(tokenExpiry) {
 				// Same expiry — common with providers like Auth0 that
 				// cache access tokens and return the same one until it
-				// expires. The token is valid, so accept it, but don't
-				// reset timers (they're already correct for this expiry).
-				logger.Info("token_refresh_accepted_unchanged", slog.Time("expiry", tokenExpiry))
+				// expires. The token is valid, so accept it. The deadline
+				// timer is already correct. If we are already inside the
+				// warning window (the warning has fired), schedule a
+				// retry at remaining/2 so the client retries once the
+				// provider starts issuing genuinely new tokens. If the
+				// refresh arrived proactively (before the warning window),
+				// leave the existing warning timer untouched — rescheduling
+				// would pull the warning earlier than the configured lead
+				// time and cause unnecessary token churn.
+				remaining := time.Until(connDeadline)
+				if remaining > 0 && remaining <= cfg.ExpiryWarning {
+					drainTimer(tokenWarnTimer)
+					tokenWarnTimer = time.NewTimer(remaining / 2)
+				}
+				logger.Info("token_refresh_accepted_unchanged", slog.Time("expiry", connDeadline))
 				_ = conn.SendControl(wsconn.ControlMessage{
 					Type: "token_accepted",
-					Data: mustMarshal(map[string]string{"expires_at": tokenExpiry.Format(time.RFC3339)}),
+					Data: mustMarshal(map[string]string{"expires_at": connDeadline.Format(time.RFC3339)}),
 				})
 				continue
 			}
 
-			// Expiry extended — reset timers.
+			// Expiry extended — update deadline and reset timers.
 			tokenExpiry = newExpiry
+			connDeadline = tokenExpiry.Add(cfg.ExpiryGrace)
 			drainTimer(tokenWarnTimer)
 			drainTimer(tokenDeadlineTimer)
-			remaining := time.Until(tokenExpiry)
+			remaining := time.Until(connDeadline)
 			if remaining > cfg.ExpiryWarning {
-				// Normal case: warn ExpiryWarning before the deadline.
-				tokenWarnTimer = newTimerUntil(tokenExpiry, cfg.ExpiryWarning)
+				tokenWarnTimer = newTimerUntil(connDeadline, cfg.ExpiryWarning)
 			} else {
-				// Token lifetime is shorter than the warning window.
-				// Schedule the next warning at half the remaining lifetime
+				// Connection deadline is shorter than the warning window.
+				// Schedule the next warning at half the remaining time
 				// to avoid an immediate-fire loop while still giving the
 				// client a future refresh opportunity.
 				tokenWarnTimer = time.NewTimer(remaining / 2)
 			}
 			tokenDeadlineTimer = time.NewTimer(remaining)
-			logger.Info("token_refresh_accepted", slog.Time("new_expiry", tokenExpiry))
+			logger.Info("token_refresh_accepted", slog.Time("new_expiry", connDeadline))
 			_ = conn.SendControl(wsconn.ControlMessage{
 				Type: "token_accepted",
-				Data: mustMarshal(map[string]string{"expires_at": tokenExpiry.Format(time.RFC3339)}),
+				Data: mustMarshal(map[string]string{"expires_at": connDeadline.Format(time.RFC3339)}),
 			})
 		}
 	}
