@@ -91,7 +91,9 @@ Host *.internal.sanger.ac.uk
 | DNS entry for `st.sanger.ac.uk` | Network team | ~5 min |
 | Security groups (inbound from Ivanti, outbound to Okta, logging endpoints, and permitted hosts) | Infrastructure / Network team | Standard config |
 | Deploy binary + systemd unit | Infrastructure & Authunnel maintainer | ~1 hour |
-| Log shipping (Filebeat or Splunk UF) | Logging / observability team | Standard config (see below) |
+| Log shipping from server VM (Filebeat or Splunk UF) | Logging / observability team | Standard config (see below) |
+| Ivanti access/TLS log shipping to the same logging system | Network / Ivanti team + Logging team | Standard config; ideally configure Ivanti to emit a `Traceparent` header so server logs and Ivanti logs can be joined by `trace_id` |
+| Log receiver configuration (Elasticsearch index + Kibana, or Splunk index + sourcetype) for both Authunnel server and Ivanti logs, plus any required dashboards or alerts | Logging / observability team | Standard config — structured JSON means fields are available without parsing |
 | Security review of codebase and deployment architecture | Security team | See below |
 | Client binary distribution + SSH config docs | Authunnel maintainer | Documentation task |
 
@@ -135,6 +137,8 @@ Authunnel emits structured JSON logs to stderr via Go's `slog.JSONHandler`. Ever
 **Integration with ELK / Splunk:**
 
 Since the output is already structured JSON, integration with ELK (via Filebeat) or Splunk (via Universal Forwarder) requires only a standard JSON input — no grok patterns or custom parsing.
+
+**End-to-end correlation with Ivanti:** Authunnel's `trace_id` is sourced from an incoming W3C `Traceparent` header when present. If Ivanti is configured to emit a `Traceparent` header on forwarded requests, and Ivanti's own access/TLS logs are shipped to the same index as the Authunnel server logs, a single `trace_id` will join the edge (TLS termination, client IP seen by Ivanti) with the backend (authentication, tunnel lifecycle, SOCKS destinations) for any given request.
 
 Setting `--log-level debug` enables per-connection destination logging, providing full audit visibility of which internal hosts each user connects to.
 
