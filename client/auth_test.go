@@ -153,7 +153,7 @@ func TestManagedOIDCTokenSourceUsesCachedValidTokenWithoutBrowser(t *testing.T) 
 		now:         time.Now,
 	}
 
-	token, err := source.AccessToken(context.Background())
+	token, err := source.AccessToken(context.Background(), true)
 	if err != nil {
 		t.Fatalf("expected cached token lookup to succeed, got error: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestManagedOIDCTokenSourceRefreshesExpiredTokenBeforeBrowser(t *testing.T) 
 		now:         time.Now,
 	}
 
-	token, err := source.AccessToken(context.Background())
+	token, err := source.AccessToken(context.Background(), true)
 	if err != nil {
 		t.Fatalf("expected refresh flow to succeed, got error: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestManagedOIDCTokenSourceFallsBackToInteractiveLoginWhenRefreshFails(t *te
 		now: time.Now,
 	}
 
-	token, err := source.AccessToken(context.Background())
+	token, err := source.AccessToken(context.Background(), true)
 	if err != nil {
 		t.Fatalf("expected interactive fallback to succeed, got error: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestManagedOIDCTokenSourceRejectsCallbackStateMismatch(t *testing.T) {
 		now: time.Now,
 	}
 
-	if _, err := source.AccessToken(context.Background()); err == nil || !strings.Contains(err.Error(), "state mismatch") {
+	if _, err := source.AccessToken(context.Background(), true); err == nil || !strings.Contains(err.Error(), "state mismatch") {
 		t.Fatalf("expected state mismatch error, got %v", err)
 	}
 }
@@ -314,7 +314,7 @@ func TestManagedOIDCTokenSourceIncludesAudienceAndConfiguredRedirectPortInAuthUR
 		now: time.Now,
 	}
 
-	token, err := source.AccessToken(context.Background())
+	token, err := source.AccessToken(context.Background(), true)
 	if err != nil {
 		t.Fatalf("expected interactive flow to succeed, got error: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestManagedOIDCTokenSourceFailsClosedWhenRedirectPortInUse(t *testing.T) {
 		now: time.Now,
 	}
 
-	_, err = source.AccessToken(context.Background())
+	_, err = source.AccessToken(context.Background(), true)
 	if err == nil || !strings.Contains(err.Error(), "listen for OIDC callback") {
 		t.Fatalf("expected callback-listener failure, got %v", err)
 	}
@@ -385,7 +385,7 @@ func TestManagedOIDCTokenSourceIgnoresMismatchedCacheAndRunsInteractiveFlow(t *t
 		now: time.Now,
 	}
 
-	token, err := source.AccessToken(context.Background())
+	token, err := source.AccessToken(context.Background(), true)
 	if err != nil {
 		t.Fatalf("expected interactive flow to succeed, got error: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestManagedOIDCTokenSourceIgnoresCacheWhenAudienceChanges(t *testing.T) {
 		now: time.Now,
 	}
 
-	token, err := source.AccessToken(context.Background())
+	token, err := source.AccessToken(context.Background(), true)
 	if err != nil {
 		t.Fatalf("expected interactive flow to succeed, got error: %v", err)
 	}

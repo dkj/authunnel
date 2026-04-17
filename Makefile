@@ -23,6 +23,10 @@ release-build:
 	    CGO_ENABLED=0 GOOS=$$OS GOARCH=$$ARCH go build $(LDFLAGS) -o $(DIST)/authunnel-client-$$OS-$$ARCH ./client; \
 	  done; \
 	done
+	@for ARCH in amd64 arm64; do \
+	  echo "Building windows/$$ARCH..."; \
+	  CGO_ENABLED=0 GOOS=windows GOARCH=$$ARCH go build $(LDFLAGS) -o $(DIST)/authunnel-client-windows-$$ARCH.exe ./client; \
+	done
 
 .PHONY: clean
 clean:

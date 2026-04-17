@@ -12,13 +12,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	oidcclient "github.com/zitadel/oidc/v3/pkg/client"
@@ -30,14 +27,18 @@ const tokenReuseWindow = time.Minute
 // authTokenSource hides how the client obtains an access token so tunnel setup
 // can stay identical for manual tokens and managed OIDC login.
 type authTokenSource interface {
-	AccessToken(ctx context.Context) (string, error)
+	// AccessToken returns a usable access token. When useCache is true, a
+	// cached token that passes the reuse window is returned immediately.
+	// When false, the cache-reuse check is skipped, forcing a refresh-token
+	// grant — used when the server warns that the current token is expiring.
+	AccessToken(ctx context.Context, useCache bool) (string, error)
 }
 
 type staticTokenSource struct {
 	token string
 }
 
-func (s staticTokenSource) AccessToken(context.Context) (string, error) {
+func (s staticTokenSource) AccessToken(_ context.Context, _ bool) (string, error) {
 	return s.token, nil
 }
 
@@ -125,11 +126,12 @@ func normalizeScopes(scopes string) string {
 	return strings.Join(strings.Fields(scopes), " ")
 }
 
-// AccessToken is the single entry point for managed authentication. The order
-// is deliberate: cache first, then refresh, then browser-based login. That
-// keeps repeat ssh invocations fast while still recovering automatically when
-// the cached access token has expired.
-func (s *managedOIDCTokenSource) AccessToken(ctx context.Context) (string, error) {
+// AccessToken is the single entry point for managed authentication. When
+// useCache is true the order is: cache first, then refresh, then browser-based
+// login — keeping repeat ssh invocations fast. When useCache is false (e.g.
+// responding to a server expiry_warning), the cache-reuse check is skipped so
+// the refresh-token grant produces a token with a later expiry.
+func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -147,7 +149,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context) (string, error
 	if err != nil {
 		return "", err
 	}
-	if tokenUsable(cache.asOAuth2Token(), s.now()) {
+	if useCache && tokenUsable(cache.asOAuth2Token(), s.now()) {
 		return cache.AccessToken, nil
 	}
 	if cache.RefreshToken != "" {
@@ -359,38 +361,6 @@ func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.
 	return token, nil
 }
 
-// acquireFileLock coordinates concurrent client processes that share the same
-// token cache using an OS-backed advisory lock. The lock file is never deleted;
-// the kernel releases the lock when the owning process exits, which avoids both
-// age-based lock stealing and stale lock files after crashes.
-func acquireFileLock(ctx context.Context, lockPath string) (func(), error) {
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		return nil, fmt.Errorf("create lock directory: %w", err)
-	}
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open cache lock %q: %w", lockPath, err)
-	}
-	for {
-		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-			return func() {
-				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-				_ = file.Close()
-			}, nil
-		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-			_ = file.Close()
-			return nil, fmt.Errorf("lock cache lock %q: %w", lockPath, err)
-		}
-
-		select {
-		case <-ctx.Done():
-			_ = file.Close()
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
 // tokenUsable keeps a small reuse window so the client does not start a tunnel
 // with a token that is about to expire mid-handshake.
 func tokenUsable(token *oauth2.Token, now time.Time) bool {
@@ -445,25 +415,3 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-func defaultBrowserOpener(ctx context.Context, url string) error {
-	var name string
-	var args []string
-	switch runtime.GOOS {
-	case "darwin":
-		name = "open"
-		args = []string{url}
-	default:
-		// Linux and most Unix desktops use xdg-open. Unsupported platforms still
-		// get the URL printed to stderr, so browser launch remains best-effort.
-		name = "xdg-open"
-		args = []string{url}
-	}
-
-	commandCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	command := exec.CommandContext(commandCtx, name, args...)
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("launch %s: %w", name, err)
-	}
-	return nil
-}
