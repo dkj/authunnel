@@ -12,13 +12,13 @@ Authunnel is a lightweight, purpose-built tool that fills these gaps. It tunnels
 
 ## What Authunnel Is
 
-Authunnel is an authenticated tunnel for reaching internal SSH services. Users run `ssh` as normal; the Authunnel client, configured as an SSH `ProxyCommand`, transparently handles Okta login via the browser and establishes an encrypted WebSocket tunnel to the server. The server acts as an OAuth2 resource server — it validates the Okta-issued JWT access token (signature, issuer, expiry, audience) and proxies the SSH connection to the requested internal host. The entire system is a single Go binary with no database, no external state, and no licence fees.
+Authunnel is an authenticated tunnel for reaching internal SSH services. Users run `ssh` as normal; the Authunnel client, configured as an SSH `ProxyCommand`, transparently handles Okta login via the browser and establishes an encrypted WebSocket tunnel to the server. The server acts as an OAuth2 resource server — it validates the Okta-issued JWT access token (signature, issuer, expiry, audience) and proxies the SSH connection to the requested internal host. Tunnel lifetime is bound to the access token's expiry by default: when the token expires the tunnel closes, unless the client refreshes the token (typically silently) while the tunnel is still alive. The entire system is a single Go binary with no database, no external state, and no licence fees.
 
 ## Why Authunnel
 
 1. **Zero licence cost** Authunnel is a single Go binary with no commercial dependencies. There is no per-seat fee, no annual renewal, no vendor lock-in. The total infrastructure cost is one or two small VMs.
 
-2. **Uses existing Okta SSO.** Users authenticate via the same Okta login they already use. When someone is offboarded in Okta, they immediately lose Authunnel access. It requires only an issuer URL and a token audience — no client secrets, no synced user database.
+2. **Uses existing Okta SSO, with prompt offboarding.** Users authenticate via the same Okta login they already use. Tunnel lifetime is bound to the access token's expiry, so when someone is offboarded in Okta they lose Authunnel access as soon as their current access token expires (typically minutes, not hours) — refresh attempts fail immediately against Okta. The server requires only an issuer URL and a token audience — no client secrets, no synced user database.
 
 3. **Can run behind Ivanti Traffic Manager (vTM).** Authunnel can run in plaintext mode behind a TLS-terminating reverse proxy, benefiting from the team's existing knowledge and experience of Ivanti as an external interface. Ivanti handles TLS certificates and termination as it already does for other services. No new TLS infrastructure is needed.
 
@@ -30,7 +30,7 @@ Authunnel is an authenticated tunnel for reaching internal SSH services. Users r
 
    This is useful for granting access to specific services only, or for limiting exposure to the broader network.
 
-6. **Works from macOS or Linux machines.** The client is a statically compiled binary available for macOS and Linux (amd64 and arm64). It requires no special network configuration and no Sanger-issued hardware. This makes it suitable for staff working from personal machines, university desktops, or cloud development environments where the VPN is not an option. If Windows clients are required this should be a small amount of work to deliver.
+6. **Works from any machine.** The client is a statically compiled binary available for Linux, macOS, and Windows (10 1803 or later). It requires no special network configuration and no Sanger-issued hardware. This makes it suitable for staff working from personal machines, for academic collaborators, or commercial partners where the company VPN is not an option.
 
 7. **Transparent audit trail.** Every tunnel is logged with the authenticated user's identity and destination. Denied connections are logged at warn level. Logs are structured JSON with request and trace correlation IDs, ready for ingestion into ELK or Splunk without custom parsing (see Logging & Observability below).
 
@@ -106,6 +106,10 @@ Authunnel emits structured JSON logs to stderr via Go's `slog.JSONHandler`. Ever
 | HTTP request | info | `method`, `path`, `status`, `bytes`, `duration_ms`, `remote_ip`, `request_id`, `trace_id` |
 | Tunnel open | info | `tunnel_id`, `remote_ip`, `user`, `email`, `subject`, `client_id` |
 | Tunnel close | info | `tunnel_id`, `duration_ms`, plus all identity fields |
+| Token expiry warning sent | info | `tunnel_id`, `expires_at`, plus identity fields |
+| Token refresh accepted | info | `tunnel_id`, `new_expiry`, plus identity fields |
+| Token refresh rejected | warn | `tunnel_id`, reason (signature / subject mismatch / expiry reduced), plus identity fields |
+| Tunnel closed on token expiry | info | `tunnel_id`, plus identity fields |
 | SOCKS destination | debug | `target_host`, `target_port`, plus tunnel and identity fields |
 | Connection denied | warn | `target_host`, `target_port`, plus tunnel and identity fields |
 | Auth failure | warn | `remote_ip`, `request_id`, error detail |
@@ -140,7 +144,7 @@ Setting `--log-level debug` enables per-connection destination logging, providin
 |------|-----------|
 | Ivanti vTM limitations (licensing or implementation) prevent, or have significant negatives if used for Authunnel TLS termination | Consider either Ivanti vTM changes and instead of vTM mediated access, firewall based access to suitably isolated Authunnel instances. |
 | WebSocket blocked by network policy | Authunnel uses standard HTTPS on port 443 with a WebSocket upgrade — the same mechanism used by most modern web applications. Ivanti already handles WebSocket traffic. |
-| Okta outage prevents new logins | Cached and refresh tokens allow continued access for hours. Only first-time logins or expired refresh tokens require live Okta connectivity. |
+| Okta outage prevents new logins or token refresh | Existing tunnels continue until the current access token expires (typically an hour or less, depending on Okta policy). New logins and token refreshes require live Okta connectivity. This is a deliberate trade-off — tying tunnel lifetime to token expiry is what makes offboarding prompt. |
 | Single server is a single point of failure | Server instances are stateless. Run two or more behind Ivanti load balancing for high availability. |
 | Maintainability over time | The codebase is ~2,000 lines of Go with an explicit design goal of auditability. It has significantly lower maintenance burden than a full platform like Teleport. |
 | Security of non-Sanger client machines | Authunnel does not trust the client machine. It provides only a tunnel — the SSH host still requires its own authentication (keys, certificates, etc.). Allow rules and VM security groups independently limit which destinations a tunnel can reach. |
