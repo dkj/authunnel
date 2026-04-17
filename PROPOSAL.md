@@ -54,7 +54,7 @@ ssh internal-host
 
 **Components:**
 
-- **Ivanti Traffic Manager** — TLS termination at `st.sanger.ac.uk:443`, forwarding to the backend VM on port 8080. Requires WebSocket upgrade pass-through and setting `X-Forwarded-Proto` and `X-Forwarded-Host` headers on forwarded requests.
+- **Ivanti Traffic Manager** — TLS termination at `st.sanger.ac.uk:443`, forwarding to the backend VM on port 8080. Configured to accept HTTPS only — any plain HTTP listener should either be absent or redirect to HTTPS; it must never accept plaintext client traffic. Requires WebSocket upgrade pass-through and setting `X-Forwarded-Proto` and `X-Forwarded-Host` headers on forwarded requests.
 - **Server VM** (VMware or OpenStack) — a single small Linux VM running the authunnel-server binary, managed by systemd. No database, no disk state beyond the binary and a configuration file. Security groups restrict both inbound access (to the Ivanti VIP) and outbound access (to permitted internal hosts only).
 - **Okta** — one public OIDC client registration (for the CLI tool) and one audience/resource entry (for token scoping to `authunnel-server`).
 - **DNS** — `st.sanger.ac.uk` pointing at the Ivanti VIP.
@@ -86,7 +86,7 @@ Host *.internal.sanger.ac.uk
 |------|-------|--------|
 | Okta public OIDC client + audience | Identity team | ~30 min config |
 | VM (small, any Linux) | Infrastructure | Standard provisioning |
-| Ivanti VIP + TLS cert for `st.sanger.ac.uk` | Network / Ivanti team | Standard config |
+| Ivanti VIP + TLS cert for `st.sanger.ac.uk`, configured to accept HTTPS only (no plain HTTP listener, or 80→443 redirect at most) | Network / Ivanti team | Standard config |
 | WebSocket upgrade pass-through on Ivanti | Network / Ivanti team | Standard config |
 | DNS entry for `st.sanger.ac.uk` | Network team | ~5 min |
 | Security groups (inbound from Ivanti, outbound to Okta, logging endpoints, and permitted hosts) | Infrastructure / Network team | Standard config |
