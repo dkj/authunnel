@@ -88,7 +88,7 @@ func TestParseClientConfigRejectsMixedManualAndOIDCAuth(t *testing.T) {
 
 func TestParseClientConfigAcceptsOIDCAudienceAndRedirectPort(t *testing.T) {
 	cfg, err := parseClientConfig([]string{
-		"--oidc-issuer", "http://issuer",
+		"--oidc-issuer", "https://issuer.example",
 		"--oidc-client-id", "client",
 		"--oidc-audience", "authunnel-server",
 		"--oidc-redirect-port", "38081",
@@ -138,6 +138,69 @@ func TestParseClientConfigRejectsAccessTokenWithOIDCCacheOrNoBrowser(t *testing.
 		if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
 			t.Errorf("parseClientConfig(%v) expected conflict error, got %v", args, err)
 		}
+	}
+}
+
+func TestParseClientConfigRejectsHTTPTunnelURL(t *testing.T) {
+	_, err := parseClientConfig([]string{
+		"--tunnel-url", "http://tunnel.example/protected/tunnel",
+		"--oidc-issuer", "https://issuer.example",
+		"--oidc-client-id", "client",
+	}, func(string) string { return "" })
+	if err == nil || !strings.Contains(err.Error(), "https://") {
+		t.Fatalf("expected https tunnel-url rejection, got: %v", err)
+	}
+}
+
+func TestParseClientConfigAcceptsHTTPTunnelURLWithInsecureFlag(t *testing.T) {
+	cfg, err := parseClientConfig([]string{
+		"--tunnel-url", "http://tunnel.example/protected/tunnel",
+		"--oidc-issuer", "https://issuer.example",
+		"--oidc-client-id", "client",
+		"--insecure-tunnel-url",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("insecure-tunnel-url flag should allow http tunnel URL: %v", err)
+	}
+	if !cfg.InsecureTunnelURL {
+		t.Fatal("InsecureTunnelURL should be true")
+	}
+}
+
+func TestParseClientConfigRejectsHTTPOIDCIssuer(t *testing.T) {
+	_, err := parseClientConfig([]string{
+		"--oidc-issuer", "http://issuer.example",
+		"--oidc-client-id", "client",
+	}, func(string) string { return "" })
+	if err == nil || !strings.Contains(err.Error(), "https://") {
+		t.Fatalf("expected https oidc-issuer rejection, got: %v", err)
+	}
+}
+
+func TestParseClientConfigAcceptsHTTPOIDCIssuerWithInsecureFlag(t *testing.T) {
+	cfg, err := parseClientConfig([]string{
+		"--oidc-issuer", "http://issuer.example",
+		"--oidc-client-id", "client",
+		"--insecure-oidc-issuer",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("insecure-oidc-issuer flag should allow http issuer: %v", err)
+	}
+	if !cfg.InsecureOIDCIssuer {
+		t.Fatal("InsecureOIDCIssuer should be true")
+	}
+}
+
+func TestParseClientConfigAcceptsHTTPSIssuerAndTunnelURL(t *testing.T) {
+	cfg, err := parseClientConfig([]string{
+		"--oidc-issuer", "https://issuer.example",
+		"--oidc-client-id", "client",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("valid https:// URLs should be accepted: %v", err)
+	}
+	if cfg.InsecureTunnelURL || cfg.InsecureOIDCIssuer {
+		t.Fatal("insecure flags should default to false")
 	}
 }
 

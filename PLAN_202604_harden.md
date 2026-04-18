@@ -263,7 +263,7 @@ This order front-loads the issues most likely to silently weaken the trust model
 
 ## Suggested Task Breakdown
 
-### Task A: Transport hardening
+### Task A: Transport hardening ✓ done
 
 - Add secure-scheme validation.
 - Add tests for rejected insecure issuer and tunnel URLs.
@@ -314,6 +314,15 @@ Every workstream should leave behind direct tests for the changed behavior. At m
 ```bash
 go test ./...
 ```
+
+## Contributor Requirements
+
+All work on this plan must follow [AGENTS.md](AGENTS.md). Key obligations relevant to hardening changes:
+
+- Update `README.md` when CLI flags, runtime flows, or architecture change.
+- Keep code comments up to date when behavior changes.
+- Add or update tests for every behavior change.
+- Run `go test ./...` before finalising.
 
 ## Review Guidance
 

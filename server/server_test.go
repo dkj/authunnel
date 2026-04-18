@@ -66,6 +66,58 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 	}
 }
 
+func TestParseServerConfigRejectsHTTPIssuer(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{
+			"--oidc-issuer", "http://issuer.example",
+			"--token-audience", "authunnel-server",
+			"--tls-cert", "/srv/server.crt",
+			"--tls-key", "/srv/server.key",
+		},
+		func(string) string { return "" },
+	)
+	if err == nil || !strings.Contains(err.Error(), "https://") {
+		t.Fatalf("expected https rejection for http issuer, got: %v", err)
+	}
+}
+
+func TestParseServerConfigAcceptsHTTPIssuerWithFlag(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{
+			"--oidc-issuer", "http://issuer.example",
+			"--token-audience", "authunnel-server",
+			"--tls-cert", "/srv/server.crt",
+			"--tls-key", "/srv/server.key",
+			"--insecure-oidc-issuer",
+		},
+		func(string) string { return "" },
+	)
+	// May fail for other reasons (TLS files don't exist at runtime) but must NOT reject the http scheme.
+	if err != nil && strings.Contains(err.Error(), "https://") {
+		t.Fatalf("insecure-oidc-issuer flag should suppress scheme error, got: %v", err)
+	}
+}
+
+func TestParseServerConfigAcceptsHTTPIssuerViaEnv(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{
+			"--oidc-issuer", "http://issuer.example",
+			"--token-audience", "authunnel-server",
+			"--tls-cert", "/srv/server.crt",
+			"--tls-key", "/srv/server.key",
+		},
+		func(key string) string {
+			if key == "INSECURE_OIDC_ISSUER" {
+				return "true"
+			}
+			return ""
+		},
+	)
+	if err != nil && strings.Contains(err.Error(), "https://") {
+		t.Fatalf("INSECURE_OIDC_ISSUER=true should suppress scheme error, got: %v", err)
+	}
+}
+
 func TestParseServerConfigAcceptsTLSPathsFromEnv(t *testing.T) {
 	cfg, err := parseServerConfig(nil, func(key string) string {
 		switch key {

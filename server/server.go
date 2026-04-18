@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -35,6 +36,8 @@ type serverConfig struct {
 	ACMECacheDir string
 	// Plaintext mode (behind a TLS-terminating reverse proxy)
 	PlaintextBehindProxy bool
+	// Development override: allow non-HTTPS OIDC issuer
+	InsecureOIDCIssuer bool
 	LogLevel      slog.Level
 	AllowRules    tunnelserver.Allowlist
 	// Connection longevity
@@ -87,6 +90,10 @@ Connection longevity:
 Other:
 
   version, --version         Print version and exit
+
+Development / unsafe overrides (do not use in production):
+
+  --insecure-oidc-issuer     Allow a non-HTTPS OIDC issuer URL (env: INSECURE_OIDC_ISSUER=true)
 `)
 }
 
@@ -199,6 +206,9 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	if getenv("PLAINTEXT_BEHIND_REVERSE_PROXY") == "true" {
 		cfg.PlaintextBehindProxy = true
 	}
+	if getenv("INSECURE_OIDC_ISSUER") == "true" {
+		cfg.InsecureOIDCIssuer = true
+	}
 	if v := getenv("MAX_CONNECTION_DURATION"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -259,6 +269,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	fs.StringVar(&cfg.ACMECacheDir, "acme-cache-dir", cfg.ACMECacheDir, "Directory to cache ACME certificates")
 	fs.BoolVar(&cfg.PlaintextBehindProxy, "plaintext-behind-reverse-proxy", cfg.PlaintextBehindProxy,
 		"Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks")
+	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", cfg.InsecureOIDCIssuer,
+		"Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
 	fs.Func("listen-addr", "Listen address", func(value string) error {
 		cfg.ListenAddr = value
 		listenAddrFlagSet = true
@@ -371,6 +383,13 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 
 	if cfg.Issuer == "" {
 		return cfg, errors.New("--oidc-issuer or OIDC_ISSUER is required")
+	}
+	issuerU, err := url.Parse(cfg.Issuer)
+	if err != nil || issuerU.Host == "" {
+		return cfg, fmt.Errorf("--oidc-issuer %q is not a valid URL", cfg.Issuer)
+	}
+	if issuerU.Scheme != "https" && !cfg.InsecureOIDCIssuer {
+		return cfg, errors.New("--oidc-issuer must use an https:// URL; use --insecure-oidc-issuer or INSECURE_OIDC_ISSUER=true to allow plaintext (development only)")
 	}
 	if cfg.TokenAudience == "" {
 		return cfg, errors.New("--token-audience or TOKEN_AUDIENCE is required")

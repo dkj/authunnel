@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -60,6 +61,9 @@ type clientConfig struct {
 	TargetHost       string
 	TargetPort       int
 
+	InsecureOIDCIssuer bool
+	InsecureTunnelURL  bool
+
 	HTTPClient     *http.Client
 	AuthHTTPClient *http.Client
 	Stdin          io.ReadCloser
@@ -102,6 +106,11 @@ Connection:
 Other:
 
   version, --version           Print version and exit
+
+Development / unsafe overrides (do not use in production):
+
+  --insecure-oidc-issuer       Allow a non-HTTPS OIDC issuer URL
+  --insecure-tunnel-url        Allow a non-HTTPS tunnel endpoint URL
 `)
 }
 
@@ -172,6 +181,8 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
 	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
 	fs.IntVar(&cfg.OIDCRedirectPort, "oidc-redirect-port", 0, "Loopback port for the OIDC callback listener; 0 chooses a random port")
+	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", false, "Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
+	fs.BoolVar(&cfg.InsecureTunnelURL, "insecure-tunnel-url", false, "Allow a non-HTTPS tunnel endpoint URL (development only; do not use in production)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			clientUsage(os.Stdout)
@@ -221,6 +232,23 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 				return cfg, err
 			}
 			cfg.OIDCCache = cachePath
+		}
+	}
+
+	tunnelU, err := url.Parse(cfg.TunnelURL)
+	if err != nil || tunnelU.Host == "" {
+		return cfg, fmt.Errorf("--tunnel-url %q is not a valid URL", cfg.TunnelURL)
+	}
+	if tunnelU.Scheme != "https" && !cfg.InsecureTunnelURL {
+		return cfg, errors.New("--tunnel-url must use an https:// URL; use --insecure-tunnel-url to allow plaintext (development only)")
+	}
+	if cfg.OIDCIssuer != "" {
+		issuerU, err := url.Parse(cfg.OIDCIssuer)
+		if err != nil || issuerU.Host == "" {
+			return cfg, fmt.Errorf("--oidc-issuer %q is not a valid URL", cfg.OIDCIssuer)
+		}
+		if issuerU.Scheme != "https" && !cfg.InsecureOIDCIssuer {
+			return cfg, errors.New("--oidc-issuer must use an https:// URL; use --insecure-oidc-issuer to allow plaintext (development only)")
 		}
 	}
 

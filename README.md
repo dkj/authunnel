@@ -145,6 +145,7 @@ Useful server flags and environment variables:
 - `--acme-cache-dir` or `ACME_CACHE_DIR` with default `/var/cache/authunnel/acme`
 - `--plaintext-behind-reverse-proxy` or `PLAINTEXT_BEHIND_REVERSE_PROXY=true` — serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; `X-Forwarded-Proto` and `X-Forwarded-Host` are used for WebSocket origin checks
 - `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable; if unset all connections are allowed
+- `--insecure-oidc-issuer` or `INSECURE_OIDC_ISSUER=true` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
 - `--max-connection-duration` or `MAX_CONNECTION_DURATION` — hard maximum tunnel lifetime (e.g. `4h`, `30m`); default `0` (unlimited)
 - `--no-connection-token-expiry` or `NO_CONNECTION_TOKEN_EXPIRY=true` — do not tie tunnel lifetime to access token expiry; by default expiry IS enforced and clients can refresh tokens to extend
 - `--expiry-warning` or `EXPIRY_WARNING` — warning period before either longevity limit; default `3m`
@@ -202,6 +203,8 @@ Useful client flags:
 - `--tunnel-url` — HTTPS endpoint used for the authenticated HTTP request that is then upgraded to WebSocket
 - `--unix-socket`
 - `--proxycommand`
+- `--insecure-oidc-issuer` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
+- `--insecure-tunnel-url` — allow a non-HTTPS tunnel endpoint URL **(development only; do not use in production)**
 
 On first use the client prints the authorization URL to `stderr` and tries to open the system browser. Subsequent runs reuse the cache or refresh token when possible.
 
@@ -334,6 +337,7 @@ This imports a realm with:
 
 ```bash
 export OIDC_ISSUER='http://127.0.0.1:18080/realms/authunnel'
+export INSECURE_OIDC_ISSUER=true   # local Keycloak uses HTTP
 export TOKEN_AUDIENCE='authunnel-server'
 export TLS_CERT_FILE='../cert.pem'
 export TLS_KEY_FILE='../key.pem'
@@ -348,6 +352,7 @@ CGO_ENABLED=0 go run .
 cd client
 CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
   --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
+  --insecure-oidc-issuer \
   --oidc-client-id authunnel-cli \
   --oidc-scopes openid \
   --unix-socket /tmp/authunnel/proxy.sock
@@ -361,6 +366,7 @@ Direct ProxyCommand-compatible invocation:
 SSL_CERT_FILE=../cert.pem ./client/client \
   --tunnel-url https://localhost:8443/protected/tunnel \
   --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
+  --insecure-oidc-issuer \
   --oidc-client-id authunnel-cli \
   --oidc-scopes openid \
   --proxycommand localhost 22
