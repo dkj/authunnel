@@ -25,7 +25,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
     - `tunnel_id` — generated when a WebSocket upgrade succeeds; scoped to the lifetime of the SOCKS tunnel and inherited by all subsequent tunnel events (open, SOCKS CONNECT, close)
   - Tunnel logs include the authenticated user identity, with per-destination SOCKS CONNECT logs at debug level; all three correlation IDs are carried through so HTTP admission, tunnel lifecycle, and per-destination events can be joined
   - OAuth2 resource-server JWT validation: OIDC discovery used only to bootstrap the JWKS endpoint, all token verification done locally
-  - WebSocket endpoint (`/protected/socks`) connected to an in-process SOCKS5 server
+  - WebSocket tunnel endpoint (`/protected/tunnel`) connected to an in-process SOCKS5 server
 - `client/client.go`
   - **ProxyCommand mode**: stdio bridge for direct SSH integration
   - **Unix socket mode**: local SOCKS5 endpoint for generic client tooling
@@ -39,7 +39,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 1. Reads OIDC issuer, audience, listen address, TLS mode, and connection longevity configuration from flags or environment.
 2. Performs OIDC discovery once at startup, solely to locate the issuer's JWKS endpoint.
 3. Verifies bearer-token signature, issuer, expiration, and audience.
-4. Accepts WebSocket connections at `/protected/socks`.
+4. Accepts WebSocket connections at `/protected/tunnel`.
 5. Hands each upgraded connection to the SOCKS5 server implementation.
 6. If connection longevity is configured, manages tunnel lifetime: warns clients before expiry and disconnects when limits are reached. When token-expiry enforcement is active, the server accepts refreshed tokens from the client to extend the tunnel.
 7. Emits structured JSON logs for request lifecycle, auth failures, tunnel open/close events, token refresh outcomes, and debug-level SOCKS CONNECT destinations.
@@ -174,7 +174,7 @@ Host internal-host
   HostName internal-host
   User myuser
   ProxyCommand /path/to/authunnel-client \
-    --ws-url https://localhost:8443/protected/socks \
+    --tunnel-url https://localhost:8443/protected/tunnel \
     --oidc-issuer https://<issuer> \
     --oidc-client-id authunnel-cli \
     --proxycommand %h %p
@@ -186,7 +186,7 @@ On Windows with OpenSSH, use the full path with backslashes and quote it if it c
 Host internal-host
   HostName internal-host
   User myuser
-  ProxyCommand "C:\path\to\authunnel-client.exe" --ws-url https://... --oidc-issuer https://<issuer> --oidc-client-id authunnel-cli --proxycommand %h %p
+  ProxyCommand "C:\path\to\authunnel-client.exe" --tunnel-url https://... --oidc-issuer https://<issuer> --oidc-client-id authunnel-cli --proxycommand %h %p
 ```
 
 Useful client flags:
@@ -199,7 +199,7 @@ Useful client flags:
 - `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json` (macOS/Linux) or `%AppData%\authunnel\tokens.json` (Windows)
 - `--oidc-no-browser` to print the URL without attempting automatic browser launch
 - `--access-token` to supply a bearer token directly (not recommended; mutually exclusive with all OIDC flags)
-- `--ws-url`
+- `--tunnel-url` — HTTPS endpoint used for the authenticated HTTP request that is then upgraded to WebSocket
 - `--unix-socket`
 - `--proxycommand`
 
@@ -220,7 +220,7 @@ ProxyCommand example with a pre-supplied token:
 ```bash
 /path/to/authunnel-client \
   --access-token "$ACCESS_TOKEN" \
-  --ws-url https://localhost:8443/protected/socks \
+  --tunnel-url https://localhost:8443/protected/tunnel \
   --proxycommand internal-host 22
 ```
 
@@ -359,7 +359,7 @@ Direct ProxyCommand-compatible invocation:
 
 ```bash
 SSL_CERT_FILE=../cert.pem ./client/client \
-  --ws-url https://localhost:8443/protected/socks \
+  --tunnel-url https://localhost:8443/protected/tunnel \
   --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
   --oidc-client-id authunnel-cli \
   --oidc-scopes openid \
@@ -384,4 +384,4 @@ The GitHub Actions workflow in [`.github/workflows/keycloak-e2e.yml`](.github/wo
 
 ## License
 
-See `LICENSE`.
+See [`LICENSE`](./LICENSE).

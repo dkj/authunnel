@@ -54,7 +54,7 @@ type clientConfig struct {
 	OIDCNoBrowser    bool
 	OIDCRedirectPort int
 
-	WebSocketURL     string
+	TunnelURL        string
 	UnixSocketPath   string
 	ProxyCommandMode bool
 	TargetHost       string
@@ -95,8 +95,9 @@ Choose one authentication method (mutually exclusive):
 
 Connection:
 
-  --ws-url <url>               WebSocket tunnel endpoint URL
-                               (default: https://localhost:8443/protected/socks)
+  --tunnel-url <url>           HTTPS tunnel endpoint URL; auth is checked before
+                               the connection is upgraded to WebSocket
+                               (default: https://localhost:8443/protected/tunnel)
 
 Other:
 
@@ -161,7 +162,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	var showVersion bool
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.AccessToken, "access-token", cfg.AccessToken, "Bearer token for manual authentication (not recommended; prefer OIDC or ACCESS_TOKEN env var)")
-	fs.StringVar(&cfg.WebSocketURL, "ws-url", "https://localhost:8443/protected/socks", "WebSocket URL for the authenticated socks tunnel endpoint")
+	fs.StringVar(&cfg.TunnelURL, "tunnel-url", "https://localhost:8443/protected/tunnel", "HTTPS tunnel endpoint URL; auth is checked before the connection is upgraded to WebSocket")
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
@@ -372,7 +373,7 @@ func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket
 	if cfg.HTTPClient != nil {
 		options.HTTPClient = cfg.HTTPClient
 	}
-	return websocket.Dial(ctx, cfg.WebSocketURL, options)
+	return websocket.Dial(ctx, cfg.TunnelURL, options)
 }
 
 // handleControlMessages reads from the MultiplexConn's control channel and

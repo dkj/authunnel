@@ -81,7 +81,7 @@ func (c *observedTunnelConn) TunnelLogger() *slog.Logger {
 //     that inherits request_id and trace_id, so all tunnel lifecycle events
 //     (open, SOCKS CONNECT, close) carry all three IDs.
 //
-// For a /protected/socks request the relationship is 1:1 — one HTTP request
+// For a /protected/tunnel request the relationship is 1:1 — one HTTP request
 // produces one tunnel. The IDs serve different scopes: request_id is for HTTP
 // admission, trace_id is for cross-system tracing, and tunnel_id is for the
 // long-lived tunnel session and its per-destination SOCKS events.

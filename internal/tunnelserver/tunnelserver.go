@@ -125,7 +125,7 @@ type HandlerOptions struct {
 // NewHandler installs the small HTTP surface used by the server:
 //   - "/" for a simple liveness response
 //   - "/protected" for token-validation smoke testing
-//   - "/protected/socks" for the authenticated websocket-to-SOCKS bridge
+//   - "/protected/tunnel" for the authenticated websocket-to-SOCKS bridge
 //
 // When Longevity is configured in the handler options, each tunnel is managed
 // by a background goroutine that enforces connection lifetime limits and
@@ -161,7 +161,7 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		_, _ = w.Write([]byte("Protected OK " + time.Now().String()))
 	})
 
-	mux.HandleFunc("/protected/socks", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/protected/tunnel", func(w http.ResponseWriter, r *http.Request) {
 		if !checkWebSocketRequest(w, r, opt.TrustForwardedProto) {
 			return
 		}

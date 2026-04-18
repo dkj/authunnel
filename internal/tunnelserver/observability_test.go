@@ -109,7 +109,7 @@ func TestRequestLoggingMiddlewarePreservesHijacker(t *testing.T) {
 		_ = conn.Close()
 	}))
 
-	req := httptest.NewRequest(http.MethodGet, "/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
 	req.RemoteAddr = "203.0.113.8:23456"
 	rr := fakeHijackResponseWriter{
 		ResponseRecorder: httptest.NewRecorder(),

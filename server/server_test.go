@@ -350,7 +350,7 @@ func TestProtectedSocksRejectsNonWebSocketRequestsBeforeAuth(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
 	req.Header.Set("Authorization", "Bearer valid-token")
 	rr := httptest.NewRecorder()
 
@@ -371,7 +371,7 @@ func TestProtectedSocksRejectsNonGETMethod(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodPost, "/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodPost, "/protected/tunnel", nil)
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Authorization", "Bearer valid-token")
@@ -391,7 +391,7 @@ func TestProtectedSocksRejectsCrossOriginWebSocketRequests(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -416,7 +416,7 @@ func TestProtectedSocksRejectsOriginWithDifferentScheme(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -438,7 +438,7 @@ func TestProtectedSocksRejectsOriginWithDifferentPort(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example:8443/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example:8443/protected/tunnel", nil)
 	req.Host = "authunnel.example:8443"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -460,7 +460,7 @@ func TestProtectedSocksAllowsSameHostOriginToReachAuth(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticFailValidator{err: errors.New("token rejected")}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -485,7 +485,7 @@ func TestProtectedSocksAllowsOriginWithImplicitDefaultHTTPSPort(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticFailValidator{err: errors.New("token rejected")}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example:443"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -942,7 +942,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedProto(t *testing.T) {
 
 	// Simulate a browser WebSocket request forwarded by a TLS-terminating
 	// reverse proxy: Origin is https:// but the backend sees plain HTTP.
-	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -972,7 +972,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedHost(t *testing.T) {
 
 	// Proxy rewrites Host to the backend address but sets X-Forwarded-Host
 	// and X-Forwarded-Proto to the external values.
-	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/tunnel", nil)
 	req.Host = "localhost:8080"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1002,7 +1002,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedProtoMultiProxy(t *testing
 
 	// Multi-proxy deployment: X-Forwarded-Proto is comma-separated; the
 	// leftmost entry is the original client-facing scheme.
-	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example.com/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example.com/protected/tunnel", nil)
 	req.Host = "authunnel.example.com"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1031,7 +1031,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedHostMultiProxy(t *testing.
 
 	// Multi-proxy deployment: X-Forwarded-Host is comma-separated; the
 	// leftmost entry is the original client-facing host.
-	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/tunnel", nil)
 	req.Host = "localhost:8080"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1055,7 +1055,7 @@ func TestPlaintextModeIgnoresForwardedHostWhenNotEnabled(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/tunnel", nil)
 	req.Host = "localhost:8080"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1083,7 +1083,7 @@ func TestPlaintextModeIgnoresForwardedProtoWhenNotEnabled(t *testing.T) {
 	// Default handler: TrustForwardedProto not set.
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1212,7 +1212,7 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
 	// Dial the WebSocket tunnel.
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
@@ -1329,7 +1329,7 @@ func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
@@ -1458,7 +1458,7 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
@@ -1574,7 +1574,7 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
 	// Dial the WebSocket tunnel with the short-lived initial token.
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + initialToken}},
@@ -1730,7 +1730,7 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + initialToken}},

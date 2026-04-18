@@ -61,6 +61,19 @@ func TestParseClientConfigAccessTokenFlag(t *testing.T) {
 	}
 }
 
+func TestParseClientConfigAcceptsTunnelURLFlag(t *testing.T) {
+	cfg, err := parseClientConfig([]string{
+		"--access-token", "tok123",
+		"--tunnel-url", "https://example.com/protected/tunnel",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("parseClientConfig failed: %v", err)
+	}
+	if cfg.TunnelURL != "https://example.com/protected/tunnel" {
+		t.Fatalf("unexpected TunnelURL: got %q", cfg.TunnelURL)
+	}
+}
+
 func TestParseClientConfigRejectsMixedManualAndOIDCAuth(t *testing.T) {
 	_, err := parseClientConfig([]string{"--oidc-issuer", "http://issuer", "--oidc-client-id", "client"}, func(key string) string {
 		if key == "ACCESS_TOKEN" {
