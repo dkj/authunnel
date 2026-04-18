@@ -216,7 +216,7 @@ Useful client flags:
 - `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json` (macOS/Linux) or `%AppData%\authunnel\tokens.json` (Windows)
 - `--oidc-no-browser` to print the URL without attempting automatic browser launch
 - `--access-token` to supply a bearer token directly (not recommended; mutually exclusive with all OIDC flags)
-- `--tunnel-url` — HTTPS endpoint used for the authenticated HTTP request that is then upgraded to WebSocket. **Required.** May also be supplied via the `AUTHUNNEL_TUNNEL_URL` environment variable (the flag takes precedence)
+- `--tunnel-url` — tunnel endpoint URL. Secure schemes `https://` and `wss://` are accepted by default; plaintext `http://` and `ws://` require `--insecure-tunnel-url`. **Required.** May also be supplied via the `AUTHUNNEL_TUNNEL_URL` environment variable (the flag takes precedence)
 - `--unix-socket`
 - `--proxycommand`
 - `--insecure-oidc-issuer` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**

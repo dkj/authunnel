@@ -195,8 +195,8 @@ func TestParseClientConfigRejectsHTTPTunnelURL(t *testing.T) {
 		"--oidc-issuer", "https://issuer.example",
 		"--oidc-client-id", "client",
 	}, func(string) string { return "" })
-	if err == nil || !strings.Contains(err.Error(), "https://") {
-		t.Fatalf("expected https tunnel-url rejection, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "secure scheme") {
+		t.Fatalf("expected secure-scheme tunnel-url rejection, got: %v", err)
 	}
 }
 
@@ -212,6 +212,46 @@ func TestParseClientConfigAcceptsHTTPTunnelURLWithInsecureFlag(t *testing.T) {
 	}
 	if !cfg.InsecureTunnelURL {
 		t.Fatal("InsecureTunnelURL should be true")
+	}
+}
+
+func TestParseClientConfigAcceptsWSSTunnelURL(t *testing.T) {
+	cfg, err := parseClientConfig([]string{
+		"--tunnel-url", "wss://tunnel.example/protected/tunnel",
+		"--oidc-issuer", "https://issuer.example",
+		"--oidc-client-id", "client",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("wss tunnel URL should be accepted: %v", err)
+	}
+	if cfg.TunnelURL != "wss://tunnel.example/protected/tunnel" {
+		t.Fatalf("unexpected TunnelURL: got %q", cfg.TunnelURL)
+	}
+}
+
+func TestParseClientConfigRejectsWSTunnelURLWithoutInsecureFlag(t *testing.T) {
+	_, err := parseClientConfig([]string{
+		"--tunnel-url", "ws://tunnel.example/protected/tunnel",
+		"--oidc-issuer", "https://issuer.example",
+		"--oidc-client-id", "client",
+	}, func(string) string { return "" })
+	if err == nil || !strings.Contains(err.Error(), "secure scheme") {
+		t.Fatalf("expected secure-scheme tunnel-url rejection, got: %v", err)
+	}
+}
+
+func TestParseClientConfigAcceptsWSTunnelURLWithInsecureFlag(t *testing.T) {
+	cfg, err := parseClientConfig([]string{
+		"--tunnel-url", "ws://tunnel.example/protected/tunnel",
+		"--oidc-issuer", "https://issuer.example",
+		"--oidc-client-id", "client",
+		"--insecure-tunnel-url",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("insecure-tunnel-url flag should allow ws tunnel URL: %v", err)
+	}
+	if cfg.TunnelURL != "ws://tunnel.example/protected/tunnel" {
+		t.Fatalf("unexpected TunnelURL: got %q", cfg.TunnelURL)
 	}
 }
 
