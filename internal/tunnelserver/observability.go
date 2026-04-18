@@ -266,8 +266,10 @@ func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (c
 			slog.Int("target_port", details.TargetPort),
 		)
 	}
-	// Security decision: apply operator-configured allowlist.
-	// Empty allowlist = open mode (allow all). Non-empty = deny unless a rule matches.
+	// Security decision: apply operator-configured allowlist. Non-empty rules
+	// mean deny unless a rule matches; an empty Allowlist permits everything
+	// and only reaches here when the operator explicitly chose --allow-open-egress
+	// at startup (parseServerConfig rejects an empty allowlist without that flag).
 	// Pass the raw FQDN and IP separately so CIDR rules and hostname-glob rules
 	// are evaluated independently — details.TargetHost collapses the two.
 	if !r.allowRules.Permits(req.DestAddr.FQDN, req.DestAddr.IP, req.DestAddr.Port) {

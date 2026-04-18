@@ -35,6 +35,7 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 			"--listen-addr", "127.0.0.1:9443",
 			"--tls-cert", "/flags/server.crt",
 			"--tls-key", "/flags/server.key",
+			"--allow-open-egress",
 		},
 		func(key string) string {
 			switch key {
@@ -59,6 +60,7 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 		TLSKeyPath:                 "/flags/server.key",
 		ACMECacheDir:               "/var/cache/authunnel/acme",
 		LogLevel:                   slog.LevelInfo,
+		AllowOpenEgress:            true,
 		ExpiryWarning: 3 * time.Minute,
 		DialTimeout:                10 * time.Second,
 	}
@@ -130,6 +132,8 @@ func TestParseServerConfigAcceptsTLSPathsFromEnv(t *testing.T) {
 			return "/env/server.crt"
 		case "TLS_KEY_FILE":
 			return "/env/server.key"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -165,6 +169,8 @@ func TestParseServerConfigAcceptsLogLevelFromFlagAndEnv(t *testing.T) {
 			return "authunnel-server"
 		case "LOG_LEVEL":
 			return "warn"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -190,6 +196,8 @@ func TestParseServerConfigAllowsValidFlagWhenEnvLogLevelIsInvalid(t *testing.T) 
 			return "authunnel-server"
 		case "LOG_LEVEL":
 			return "verbose"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -668,6 +676,17 @@ func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	return server
 }
 
+// minimalServerEnvWithRules is the companion to minimalServerEnv for tests
+// that supply their own --allow rules and therefore must NOT inherit the
+// ALLOW_OPEN_EGRESS shortcut, which would now conflict with the rules and be
+// rejected as an ambiguous posture.
+func minimalServerEnvWithRules(key string) string {
+	if key == "ALLOW_OPEN_EGRESS" {
+		return ""
+	}
+	return minimalServerEnv(key)
+}
+
 func minimalServerEnv(key string) string {
 	switch key {
 	case "OIDC_ISSUER":
@@ -678,6 +697,12 @@ func minimalServerEnv(key string) string {
 		return "/env/server.crt"
 	case "TLS_KEY_FILE":
 		return "/env/server.key"
+	case "ALLOW_OPEN_EGRESS":
+		// Tests that do not exercise the egress-posture gate rely on this
+		// helper to satisfy the default-deny allowlist check introduced in
+		// Task D. Tests that specifically cover that gate construct their
+		// own env function and leave ALLOW_OPEN_EGRESS unset.
+		return "true"
 	default:
 		return ""
 	}
@@ -687,7 +712,7 @@ func TestParseServerConfigAllowFlag(t *testing.T) {
 	cfg, err := parseServerConfig([]string{
 		"--allow", "*.internal:22",
 		"--allow", "10.0.0.0/8:443",
-	}, minimalServerEnv)
+	}, minimalServerEnvWithRules)
 	if err != nil {
 		t.Fatalf("parseServerConfig returned error: %v", err)
 	}
@@ -701,13 +726,155 @@ func TestParseServerConfigAllowRulesEnv(t *testing.T) {
 		if key == "ALLOW_RULES" {
 			return "*.internal:22,10.0.0.0/8:443"
 		}
-		return minimalServerEnv(key)
+		return minimalServerEnvWithRules(key)
 	})
 	if err != nil {
 		t.Fatalf("parseServerConfig returned error: %v", err)
 	}
 	if len(cfg.AllowRules) != 2 {
 		t.Fatalf("expected 2 allow rules from env, got %d", len(cfg.AllowRules))
+	}
+}
+
+// TestParseServerConfigRejectsEmptyAllowlistByDefault verifies the Task D
+// default-deny posture: absent both --allow rules and --allow-open-egress,
+// startup must fail so a misconfigured deployment cannot silently become a
+// general-purpose authenticated TCP pivot.
+func TestParseServerConfigRejectsEmptyAllowlistByDefault(t *testing.T) {
+	_, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err == nil {
+		t.Fatal("expected startup to fail with no allow rules and no --allow-open-egress")
+	}
+	if !strings.Contains(err.Error(), "--allow") || !strings.Contains(err.Error(), "--allow-open-egress") {
+		t.Fatalf("error should mention both --allow and --allow-open-egress so operators can pick a posture, got: %v", err)
+	}
+}
+
+// TestParseServerConfigAcceptsAllowOpenEgressFlag verifies the explicit escape
+// hatch: --allow-open-egress alone is enough to start the server with no
+// allowlist, preserving today's open-mode behaviour for operators who opt in.
+func TestParseServerConfigAcceptsAllowOpenEgressFlag(t *testing.T) {
+	cfg, err := parseServerConfig([]string{"--allow-open-egress"}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if !cfg.AllowOpenEgress {
+		t.Fatal("AllowOpenEgress should be true when --allow-open-egress is set")
+	}
+	if len(cfg.AllowRules) != 0 {
+		t.Fatalf("expected 0 allow rules in open-egress mode, got %d", len(cfg.AllowRules))
+	}
+}
+
+// TestParseServerConfigAcceptsAllowOpenEgressEnv mirrors the flag test for
+// the ALLOW_OPEN_EGRESS environment variable, so containerised deployments can
+// opt in through env without shell flags.
+func TestParseServerConfigAcceptsAllowOpenEgressEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if !cfg.AllowOpenEgress {
+		t.Fatal("AllowOpenEgress should be true when ALLOW_OPEN_EGRESS=true")
+	}
+}
+
+// TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress is the positive path
+// for restrictive mode: a non-empty allowlist is sufficient and does not
+// require the open-egress escape hatch.
+func TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress(t *testing.T) {
+	cfg, err := parseServerConfig([]string{"--allow", "*.internal:22"}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.AllowOpenEgress {
+		t.Fatal("AllowOpenEgress should remain false when only --allow rules are set")
+	}
+	if len(cfg.AllowRules) != 1 {
+		t.Fatalf("expected 1 allow rule, got %d", len(cfg.AllowRules))
+	}
+}
+
+// TestParseServerConfigRejectsAllowRulesWithOpenEgress forbids the ambiguous
+// combination of allowlist rules and the open-egress escape hatch. Accepting
+// both would obscure the active posture — operators should pick one.
+func TestParseServerConfigRejectsAllowRulesWithOpenEgress(t *testing.T) {
+	_, err := parseServerConfig([]string{
+		"--allow", "*.internal:22",
+		"--allow-open-egress",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err == nil {
+		t.Fatal("expected --allow and --allow-open-egress together to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected 'mutually exclusive' error, got: %v", err)
 	}
 }
 
@@ -718,7 +885,7 @@ func TestParseServerConfigAllowFlagAndEnvAreCombined(t *testing.T) {
 		if key == "ALLOW_RULES" {
 			return "*.internal:22"
 		}
-		return minimalServerEnv(key)
+		return minimalServerEnvWithRules(key)
 	})
 	if err != nil {
 		t.Fatalf("parseServerConfig returned error: %v", err)
@@ -835,6 +1002,34 @@ func TestParseServerConfigRejectsNegativeAdmissionValues(t *testing.T) {
 	}
 }
 
+// TestParseServerConfigRejectsNonFiniteTunnelOpenRate ensures NaN and ±Inf
+// are rejected on both the flag and env paths. strconv.ParseFloat accepts
+// those spellings, and prior to this check NaN would silently disable the
+// rate limiter (f > 0 is false) while +Inf would feed math.Ceil and an
+// undefined float-to-int conversion into burst derivation.
+func TestParseServerConfigRejectsNonFiniteTunnelOpenRate(t *testing.T) {
+	cases := []string{"NaN", "nan", "+Inf", "-Inf", "Inf"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{"--tunnel-open-rate", v}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --tunnel-open-rate=%q", v)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				if key == "TUNNEL_OPEN_RATE" {
+					return v
+				}
+				return minimalServerEnv(key)
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of TUNNEL_OPEN_RATE=%q", v)
+			}
+		})
+	}
+}
+
 func TestParseServerConfigRejectsInvalidAllowRule(t *testing.T) {
 	_, err := parseServerConfig([]string{
 		"--allow", "notarule",
@@ -854,6 +1049,8 @@ func TestParseServerConfigACMEDomainFromFlag(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -881,6 +1078,8 @@ func TestParseServerConfigACMEDomainFromEnv(t *testing.T) {
 			return "authunnel-server"
 		case "ACME_DOMAINS":
 			return "authunnel.example.com, www.example.com"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -904,6 +1103,8 @@ func TestParseServerConfigACMEFlagAndEnvCombined(t *testing.T) {
 			return "authunnel-server"
 		case "ACME_DOMAINS":
 			return "env.example.com"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -927,6 +1128,8 @@ func TestParseServerConfigACMECacheDirOverride(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -948,6 +1151,8 @@ func TestParseServerConfigPlaintextMode(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -971,6 +1176,8 @@ func TestParseServerConfigPlaintextModeFromEnv(t *testing.T) {
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
 		case "PLAINTEXT_BEHIND_REVERSE_PROXY":
+			return "true"
+		case "ALLOW_OPEN_EGRESS":
 			return "true"
 		default:
 			return ""
@@ -996,6 +1203,8 @@ func TestParseServerConfigACMEDomainsEnvFiltersEmptyEntries(t *testing.T) {
 			return "authunnel-server"
 		case "ACME_DOMAINS":
 			return "authunnel.example.com, , ,other.example.com,"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -1042,6 +1251,8 @@ func TestParseServerConfigListenAddrOverridesACMEDefault(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -1268,6 +1479,8 @@ func minimalACMElessEnv(key string) string {
 		return "https://issuer.example"
 	case "TOKEN_AUDIENCE":
 		return "authunnel-server"
+	case "ALLOW_OPEN_EGRESS":
+		return "true"
 	default:
 		return ""
 	}

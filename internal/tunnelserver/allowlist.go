@@ -24,9 +24,16 @@ type allowRule struct {
 
 // Allowlist holds zero or more connection-filter rules.
 //
-// An empty Allowlist means open mode: all destinations are permitted.
 // A non-empty Allowlist means restrictive mode: a destination is permitted
 // only when at least one rule matches both the host and the port.
+//
+// An empty Allowlist means unrestricted — Permits returns true for every
+// destination. The server entry point gates this: parseServerConfig refuses
+// to start with an empty Allowlist unless --allow-open-egress is set, so
+// running in open mode is always an explicit operator choice. Callers that
+// instantiate the Allowlist directly (tests, embedders) inherit the same
+// "empty = permit all" semantics and must apply their own gating if they
+// want default-deny.
 type Allowlist []allowRule
 
 // Permits reports whether a connection to the given destination is allowed.

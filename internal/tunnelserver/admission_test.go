@@ -171,6 +171,83 @@ func TestAdmit_UserEntryGCPreservesPartialBucket(t *testing.T) {
 	}
 }
 
+// TestAdmit_IdleEntryReapedAfterBucketRefills pins the invariant that
+// user entries left behind with a partially drained bucket (which
+// maybeRemoveIdleLocked intentionally preserves at release time) are later
+// evicted by the Admit-side sweep once the bucket has refilled. Without the
+// sweep, every unique short-lived subject would leave a limiter behind
+// forever and the users map would grow with historical cardinality.
+func TestAdmit_IdleEntryReapedAfterBucketRefills(t *testing.T) {
+	var now atomic.Pointer[time.Time]
+	start := time.Unix(1_700_000_000, 0)
+	now.Store(&start)
+	clock := func() time.Time { return *now.Load() }
+	advance := func(d time.Duration) {
+		t2 := now.Load().Add(d)
+		now.Store(&t2)
+	}
+
+	a := newAdmitterWithClock(AdmissionConfig{
+		PerUserRate:  rate.Every(time.Second),
+		PerUserBurst: 1,
+	}, clock)
+
+	_, release, _ := a.Admit("alice")
+	release()
+
+	// Bucket drained by the successful admit; entry must persist until the
+	// bucket refills so the rate limit can't be defeated by close/reopen.
+	a.mu.Lock()
+	_, present := a.users["alice"]
+	a.mu.Unlock()
+	if !present {
+		t.Fatal("alice entry should persist immediately after release while bucket is partially drained")
+	}
+
+	// Alice never returns. Fast-forward well past the refill interval — her
+	// bucket is now at burst, so the entry is cold-path reapable but there
+	// is no release callback left to do it.
+	advance(10 * time.Second)
+
+	// A single admission from a different subject triggers the opportunistic
+	// sweep at the top of Admit. With only a handful of entries in the map
+	// the sweep is guaranteed to visit alice.
+	_, releaseBob, _ := a.Admit("bob")
+	t.Cleanup(releaseBob)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.users["alice"]; ok {
+		t.Fatalf("fully refilled idle entry should have been reaped during sweep; users = %v", a.users)
+	}
+}
+
+// TestAdmit_SweepPreservesPartialBuckets guards against a regression where
+// the opportunistic sweep could rescue memory at the cost of letting a
+// returning user skip past accumulated rate-limit state by simply waiting
+// out a close/reopen cycle.
+func TestAdmit_SweepPreservesPartialBuckets(t *testing.T) {
+	a := NewAdmitter(AdmissionConfig{
+		PerUserRate:  rate.Every(time.Second),
+		PerUserBurst: 2,
+	})
+
+	_, releaseAlice, _ := a.Admit("alice")
+	releaseAlice()
+
+	// Trigger the sweep via a second, unrelated admission. Alice's bucket
+	// still owes a token (burst 2, one consumed), so the sweep must leave
+	// her entry alone even though active == 0.
+	_, releaseBob, _ := a.Admit("bob")
+	t.Cleanup(releaseBob)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.users["alice"]; !ok {
+		t.Fatalf("partially drained idle entry must survive sweep; users = %v", a.users)
+	}
+}
+
 func TestAdmit_ReleaseIdempotent(t *testing.T) {
 	a := NewAdmitter(AdmissionConfig{GlobalMax: 1})
 	_, release, _ := a.Admit("alice")

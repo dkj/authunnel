@@ -66,9 +66,11 @@ Authunnel is deliberately simple in both functionality and implementation — a 
 
 Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. By default, tunnel lifetime is tied to the access token's `exp` claim, so an expired token causes the tunnel to close rather than persisting indefinitely. Clients with a valid refresh token can extend tunnels by refreshing before expiry; the server validates the new token, pins it to the original subject, and rejects refreshes that would reduce the expiry. The connection's enforced deadline is the token's `exp` plus any configured `--expiry-grace` — during the grace window the underlying JWT has already passed its own `exp`, but the operator has explicitly opted into extending enforcement to that point (e.g. for IdPs that cache access tokens). A refresh carrying a token whose `nbf` is in the future is accepted only when `nbf` is at or before that enforced deadline; the comparison is strict (no additional clock-skew allowance beyond `--expiry-grace`), so a refresh handover never silently stretches the policy further. A refresh whose `nbf` would fall past the enforced deadline is rejected. This can be disabled with `--no-connection-token-expiry` if needed. An optional hard maximum duration (`--max-connection-duration`) provides an additional ceiling. Both limits are orthogonal and can be active simultaneously. Some identity providers (e.g. Auth0) cache access tokens and return the same one on refresh until it expires; `--expiry-grace` adds a grace period beyond the token's `exp`, giving the client time to obtain a genuinely new token after the old one expires at the provider. Note: revoking a token at the identity provider does not terminate an already-established tunnel — the server enforces token expiry but does not perform live revocation checks. The `--allow` option provides a further layer of control over *where* an authenticated user can connect.
 
-**Open mode (no `--allow` rules — the default):** Any destination reachable by the server process is accessible to authenticated clients. This is convenient and gives operators full visibility: every SOCKS CONNECT destination is logged at debug level.
+The server refuses to start without an egress posture. Operators pick one of two modes:
 
-**Allowlist mode (one or more `--allow` rules):** Only destinations matching a rule are permitted. Denied attempts are logged at warn level. This limits exposure if a credential is compromised, at the cost of requiring explicit enumeration of allowed targets.
+**Allowlist mode (one or more `--allow` rules — the recommended default):** Only destinations matching a rule are permitted. Denied attempts are logged at warn level. This limits exposure if a credential is compromised, at the cost of requiring explicit enumeration of allowed targets.
+
+**Open mode (`--allow-open-egress`, no `--allow` rules):** Any destination reachable by the server process is accessible to authenticated clients. Every SOCKS CONNECT destination is logged at debug level. The flag must be set explicitly — it is mutually exclusive with `--allow` and is logged at warn level on startup — so the broader blast radius is always a deliberate operator choice rather than a silent default.
 
 **Note:** Like any tunnel, Authunnel can only log and control the connections it directly brokers; what an authenticated client does once a connection is open is outside its scope — for example, a client could SOCKS CONNECT to a second tunnel or proxy, creating a chain that Authunnel cannot observe.
 
@@ -86,6 +88,8 @@ The **server** runs on Linux and macOS. The **client** runs on Linux, macOS, and
 
 Choose one TLS mode. All modes also accept `--oidc-issuer`, `--token-audience`, `--listen-addr`, `--log-level`, and `--allow`.
 
+**Egress posture is required at startup.** Either pass one or more `--allow` rules (recommended) or pass `--allow-open-egress` to explicitly opt into open mode. Running without either is rejected — see the "Security Posture" section above.
+
 **TLS certificate files** (default `:8443`):
 
 ```bash
@@ -94,7 +98,7 @@ export TOKEN_AUDIENCE='authunnel-server'
 export TLS_CERT_FILE='/etc/authunnel/tls/server.crt'
 export TLS_KEY_FILE='/etc/authunnel/tls/server.key'
 
-cd server && CGO_ENABLED=0 go run .
+cd server && CGO_ENABLED=0 go run . --allow '*.internal:22'
 ```
 
 **ACME / Let's Encrypt** (default `:443`; server must be reachable on port 443):
@@ -105,7 +109,7 @@ export TOKEN_AUDIENCE='authunnel-server'
 export ACME_DOMAINS='authunnel.example.com'
 export ACME_CACHE_DIR='/var/cache/authunnel/acme'
 
-cd server && CGO_ENABLED=0 go run .
+cd server && CGO_ENABLED=0 go run . --allow '*.internal:22'
 ```
 
 Certificates are obtained and renewed automatically using the TLS-ALPN-01 challenge. The cache directory must be writable by the server process and should persist across restarts to avoid hitting Let's Encrypt rate limits.
@@ -116,7 +120,7 @@ Certificates are obtained and renewed automatically using the TLS-ALPN-01 challe
 export OIDC_ISSUER='https://<issuer>'
 export TOKEN_AUDIENCE='authunnel-server'
 
-cd server && CGO_ENABLED=0 go run . --plaintext-behind-reverse-proxy
+cd server && CGO_ENABLED=0 go run . --plaintext-behind-reverse-proxy --allow '*.internal:22'
 ```
 
 The server trusts `X-Forwarded-Proto` and `X-Forwarded-Host` for WebSocket origin checks. Most proxies forward these automatically; nginx requires explicit configuration:
@@ -145,7 +149,8 @@ Useful server flags and environment variables:
 - `--acme-domain` or `ACME_DOMAINS` (comma-separated) — domain(s) for automatic ACME certificate; repeatable
 - `--acme-cache-dir` or `ACME_CACHE_DIR` with default `/var/cache/authunnel/acme`
 - `--plaintext-behind-reverse-proxy` or `PLAINTEXT_BEHIND_REVERSE_PROXY=true` — serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; `X-Forwarded-Proto` and `X-Forwarded-Host` are used for WebSocket origin checks
-- `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable; if unset all connections are allowed
+- `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable. At least one rule is required unless `--allow-open-egress` is set
+- `--allow-open-egress` or `ALLOW_OPEN_EGRESS=true` — explicit opt-in for running with no allowlist; mutually exclusive with `--allow`. Use only when arbitrary authenticated egress from the server host is acceptable for the deployment
 - `--insecure-oidc-issuer` or `INSECURE_OIDC_ISSUER=true` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
 - `--max-connection-duration` or `MAX_CONNECTION_DURATION` — hard maximum tunnel lifetime (e.g. `4h`, `30m`); default `0` (unlimited)
 - `--no-connection-token-expiry` or `NO_CONNECTION_TOKEN_EXPIRY=true` — do not tie tunnel lifetime to access token expiry; by default expiry IS enforced and clients can refresh tokens to extend
@@ -170,6 +175,9 @@ authunnel-server --allow '*.internal:22' --allow '10.0.0.0/8:443'
 ALLOW_RULES='*.internal:22,10.0.0.0/8:443' authunnel-server
 # IPv6 example
 authunnel-server --allow '[::1]:22' --allow '[2001:db8::1]:443'
+# Explicit open mode (no allowlist) — only if arbitrary egress from the
+# server host is genuinely acceptable for the deployment
+authunnel-server --allow-open-egress
 ```
 
 ### Managed OIDC client mode
@@ -223,7 +231,9 @@ A pre-obtained bearer token can be supplied via the `ACCESS_TOKEN` environment v
 ```bash
 export ACCESS_TOKEN='<access-token>'
 cd client
-CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . --unix-socket /tmp/authunnel/proxy.sock
+CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
+  --tunnel-url https://localhost:8443/protected/tunnel \
+  --unix-socket /tmp/authunnel/proxy.sock
 ```
 
 ProxyCommand example with a pre-supplied token:
@@ -240,6 +250,7 @@ ProxyCommand example with a pre-supplied token:
 ```bash
 cd client
 CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
+  --tunnel-url https://<host>:8443/protected/tunnel \
   --oidc-issuer https://<issuer> \
   --oidc-client-id authunnel-cli \
   --unix-socket /tmp/authunnel/proxy.sock
@@ -351,7 +362,9 @@ export TLS_CERT_FILE='../cert.pem'
 export TLS_KEY_FILE='../key.pem'
 
 cd server
-CGO_ENABLED=0 go run .
+# Local dev environment — opt into open egress since the destinations
+# exercised by the example commands are loopback services
+CGO_ENABLED=0 go run . --allow-open-egress
 ```
 
 ### 3) Start Authunnel client in managed mode
@@ -359,6 +372,7 @@ CGO_ENABLED=0 go run .
 ```bash
 cd client
 CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
+  --tunnel-url https://localhost:8443/protected/tunnel \
   --oidc-issuer http://127.0.0.1:18080/realms/authunnel \
   --insecure-oidc-issuer \
   --oidc-client-id authunnel-cli \

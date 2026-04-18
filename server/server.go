@@ -43,6 +43,11 @@ type serverConfig struct {
 	InsecureOIDCIssuer bool
 	LogLevel      slog.Level
 	AllowRules    tunnelserver.Allowlist
+	// AllowOpenEgress is the explicit opt-in for running without an allowlist.
+	// Startup fails when both this flag and --allow rules are absent so the
+	// default posture is restrictive; operators who genuinely want full egress
+	// have to say so.
+	AllowOpenEgress bool
 	// Connection longevity
 	MaxConnectionDuration      time.Duration // hard max tunnel lifetime; 0 = unlimited
 	NoConnectionTokenExpiry bool          // when true, tunnel lifetime is NOT tied to access token expiry
@@ -69,7 +74,10 @@ Flags and their environment variable equivalents:
   --allow <rule>             Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated).
                              Rule formats: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi.
                              IPv6 addresses must use bracketed notation, e.g. [::1]:22.
-                             With no rules, all connections are allowed.
+                             At least one --allow rule is required unless --allow-open-egress is set.
+  --allow-open-egress        Explicit opt-in for running with no allowlist; authenticated clients may CONNECT to any
+                             destination the server process can reach (env: ALLOW_OPEN_EGRESS=true). Mutually exclusive
+                             with --allow. Use only when the risk of arbitrary egress is acceptable for the deployment.
 
 TLS mode (choose exactly one):
 
@@ -141,6 +149,17 @@ func main() {
 	}
 
 	logger.Info("server_starting", slog.String("version", version))
+	if cfg.AllowOpenEgress {
+		logger.Warn("egress_mode_open",
+			slog.String("mode", "open"),
+			slog.String("hint", "--allow-open-egress is set; authenticated clients may CONNECT to any destination reachable by the server"),
+		)
+	} else {
+		logger.Info("egress_mode_allowlist",
+			slog.String("mode", "allowlist"),
+			slog.Int("rules", len(cfg.AllowRules)),
+		)
+	}
 
 	if len(cfg.ACMEDomains) > 0 {
 		if err := checkACMECacheDir(cfg.ACMECacheDir); err != nil {
@@ -243,6 +262,9 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	if getenv("INSECURE_OIDC_ISSUER") == "true" {
 		cfg.InsecureOIDCIssuer = true
 	}
+	if getenv("ALLOW_OPEN_EGRESS") == "true" {
+		cfg.AllowOpenEgress = true
+	}
 	if v := getenv("MAX_CONNECTION_DURATION"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -301,8 +323,14 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		if err != nil {
 			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: %w", err)
 		}
-		if f < 0 {
-			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: must not be negative")
+		// strconv.ParseFloat accepts NaN and ±Inf, and a negative value is
+		// also not a meaningful operator policy: NaN would silently disable
+		// the rate limiter (TunnelOpenRate > 0 is false), +Inf would feed
+		// math.Ceil during burst derivation, and a negative rate is
+		// nonsensical. Reject all three in one condition so the error is a
+		// single, stable string.
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: must be a non-negative finite number")
 		}
 		cfg.TunnelOpenRate = f
 	}
@@ -355,6 +383,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		"Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks")
 	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", cfg.InsecureOIDCIssuer,
 		"Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
+	fs.BoolVar(&cfg.AllowOpenEgress, "allow-open-egress", cfg.AllowOpenEgress,
+		"Explicit opt-in for running without an allowlist; mutually exclusive with --allow")
 	fs.Func("listen-addr", "Listen address", func(value string) error {
 		cfg.ListenAddr = value
 		listenAddrFlagSet = true
@@ -368,7 +398,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		return nil
 	})
 	fs.Var(&tunnelserver.AllowlistFlag{Rules: &cfg.AllowRules}, "allow",
-		"Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated). Rule: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi. IPv6 requires bracketed notation e.g. [::1]:22. With no rules all connections are allowed.")
+		"Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated). Rule: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi. IPv6 requires bracketed notation e.g. [::1]:22. At least one rule is required unless --allow-open-egress is set.")
 	fs.Func("log-level", "Structured log level: debug, info, warn, or error", func(value string) error {
 		level, err := parseServerLogLevel(value)
 		if err != nil {
@@ -440,8 +470,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		if err != nil {
 			return err
 		}
-		if f < 0 {
-			return fmt.Errorf("must not be negative")
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+			return fmt.Errorf("must be a non-negative finite number")
 		}
 		cfg.TunnelOpenRate = f
 		return nil
@@ -553,6 +583,17 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 	if modes == 0 {
 		return cfg, errors.New("one of --tls-cert/--tls-key, --acme-domain, or --plaintext-behind-reverse-proxy is required")
+	}
+
+	// Egress posture: default-deny. The server refuses to start without either
+	// a non-empty allowlist or an explicit opt-in for broad-access mode, so
+	// authenticated tunnels cannot silently become a general-purpose TCP pivot
+	// into loopback, metadata, or internal control-plane destinations.
+	switch {
+	case len(cfg.AllowRules) == 0 && !cfg.AllowOpenEgress:
+		return cfg, errors.New("at least one --allow rule is required, or pass --allow-open-egress (ALLOW_OPEN_EGRESS=true) to explicitly opt into open mode")
+	case len(cfg.AllowRules) > 0 && cfg.AllowOpenEgress:
+		return cfg, errors.New("--allow-open-egress is mutually exclusive with --allow/ALLOW_RULES; pick one egress posture")
 	}
 
 	// Admission sub-validation. Burst defaults to ceil(rate) when rate is

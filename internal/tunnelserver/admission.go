@@ -110,6 +110,15 @@ func (a *Admitter) Admit(subject string) (decision AdmitDecision, release func()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Opportunistically reap entries whose buckets have fully refilled since
+	// they went idle. maybeRemoveIdleLocked intentionally preserves partially
+	// drained buckets at release time to keep returning users rate-limited;
+	// without a later sweep those entries would linger forever once the
+	// subject stopped coming back, so the users map would grow with
+	// historical subject cardinality. A tiny per-call sweep amortises that
+	// cleanup without introducing a background goroutine.
+	a.reapIdleLocked(admitReapSweep)
+
 	if a.cfg.GlobalMax > 0 && a.global >= a.cfg.GlobalMax {
 		return AdmitDeniedGlobal, func() {}, 30 * time.Second
 	}
@@ -228,9 +237,11 @@ func admissionHTTPStatus(decision AdmitDecision) (int, string) {
 }
 
 // maybeRemoveIdleLocked removes the per-user entry when it is both inactive
-// and has no rate-limit state to preserve. Called under a.mu. This is the
-// only mechanism keeping the users map bounded; without it an active user
-// base would grow monotonically across the server's lifetime.
+// and has no rate-limit state worth preserving. Called under a.mu from the
+// hot paths (release and rejected-admit) where we already have the entry in
+// hand. It deliberately keeps partially drained buckets so a returning user
+// stays rate-limited across a close/reopen cycle; the later cold-path sweep
+// (reapIdleLocked) takes care of entries once their buckets refill.
 func (a *Admitter) maybeRemoveIdleLocked(subject string, entry *userEntry) {
 	if entry.active != 0 {
 		return
@@ -244,4 +255,40 @@ func (a *Admitter) maybeRemoveIdleLocked(subject string, entry *userEntry) {
 		}
 	}
 	delete(a.users, subject)
+}
+
+// admitReapSweep caps the number of user entries inspected per Admit call.
+// Map iteration in Go starts at a randomised position, so successive
+// admissions visit different slices of the map and every long-idle entry is
+// evicted within roughly O(n/admitReapSweep) calls while keeping each
+// Admit's worst-case work O(1).
+const admitReapSweep = 8
+
+// reapIdleLocked evicts up to `limit` user entries that are inactive and
+// whose rate-limit buckets (if any) have refilled to burst. Called under
+// a.mu. Partially drained buckets are skipped here for the same reason
+// maybeRemoveIdleLocked preserves them: dropping such an entry would hand a
+// returning user a fresh full bucket and effectively bypass their
+// accumulated rate-limit history.
+func (a *Admitter) reapIdleLocked(limit int) {
+	if limit <= 0 || len(a.users) == 0 {
+		return
+	}
+	visited := 0
+	now := a.clock()
+	for subject, entry := range a.users {
+		if visited >= limit {
+			return
+		}
+		visited++
+		if entry.active != 0 {
+			continue
+		}
+		if entry.limiter != nil {
+			if entry.limiter.TokensAt(now) < float64(entry.limiter.Burst()) {
+				continue
+			}
+		}
+		delete(a.users, subject)
+	}
 }

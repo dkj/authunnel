@@ -305,11 +305,20 @@ Tests: `TestAdmit_*` in [internal/tunnelserver/admission_test.go](internal/tunne
 
 Intentionally deferred: per-source-IP rate limiting, in-progress outbound dial cap (dial timeout + per-user cap already bound resource use), Prometheus metrics (structured warn logs are sufficient for v1), and automatic client-side retry/backoff on 429/503.
 
-### Task D: Allowlist default posture
+### Task D: Allowlist default posture ✓ done
 
 - Change server startup rules around empty allowlists.
 - Add explicit dangerous override if approved.
 - Update README and startup tests.
+
+Implemented in [server/server.go](server/server.go):
+
+- `serverConfig.AllowOpenEgress` backs a new `--allow-open-egress` flag and `ALLOW_OPEN_EGRESS=true` env; the flag is documented under "egress posture" in the usage text and alongside `--allow` in the README flag reference.
+- Startup validation enforces default-deny: an empty allowlist with no explicit opt-in returns `at least one --allow rule is required, or pass --allow-open-egress ...`. The combination of `--allow` rules and `--allow-open-egress` is rejected as `mutually exclusive`, so the active posture is always unambiguous in logs and config.
+- At startup the server emits either `event=egress_mode_allowlist` (info, with rule count) or `event=egress_mode_open` (warn, with hint) so operators can see the posture in the same log stream as admission rejections.
+- Built-in denylist for loopback/metadata in open mode was considered and deferred — the plan flags it as a "consider" item contingent on "without surprising operators", and a silent implicit denial of `127.0.0.1` would confuse anyone intentionally choosing `--allow-open-egress` for local-service tunnelling. Operators who want those denies can express them through explicit `--allow` policy.
+
+Tests in [server/server_test.go](server/server_test.go): `TestParseServerConfigRejectsEmptyAllowlistByDefault`, `TestParseServerConfigAcceptsAllowOpenEgressFlag`, `TestParseServerConfigAcceptsAllowOpenEgressEnv`, `TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress`, and `TestParseServerConfigRejectsAllowRulesWithOpenEgress` cover each branch of the new posture gate. A companion helper `minimalServerEnvWithRules` keeps the pre-existing `--allow`-based tests from inheriting the shortcut and tripping the new mutual-exclusion rule. README examples under "Start server", "Security Posture", and the Keycloak test-env section now demonstrate the explicit posture choice.
 
 ### Task E: Local client filesystem hardening
 
