@@ -38,7 +38,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 
 1. Reads OIDC issuer, audience, listen address, TLS mode, and connection longevity configuration from flags or environment.
 2. Performs OIDC discovery once at startup, solely to locate the issuer's JWKS endpoint.
-3. Verifies bearer-token signature, issuer, expiration, and audience.
+3. Verifies bearer-token signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission).
 4. Accepts WebSocket connections at `/protected/tunnel`.
 5. Hands each upgraded connection to the SOCKS5 server implementation.
 6. If connection longevity is configured, manages tunnel lifetime: warns clients before expiry and disconnects when limits are reached. When token-expiry enforcement is active, the server accepts refreshed tokens from the client to extend the tunnel.
@@ -62,7 +62,7 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 
 Authunnel is deliberately simple in both functionality and implementation — a small, focused codebase that is intended to be easy to read and audit in full. Complexity is kept low by design; if a feature would make the security model harder to reason about, that is a reason not to add it.
 
-Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. By default, tunnel lifetime is tied to the access token's `exp` claim, so an expired token causes the tunnel to close rather than persisting indefinitely. Clients with a valid refresh token can extend tunnels by refreshing before expiry; the server validates the new token, pins it to the original subject, and rejects refreshes that would reduce the expiry. This can be disabled with `--no-connection-token-expiry` if needed. An optional hard maximum duration (`--max-connection-duration`) provides an additional ceiling. Both limits are orthogonal and can be active simultaneously. Some identity providers (e.g. Auth0) cache access tokens and return the same one on refresh until it expires; `--expiry-grace` adds a grace period beyond the token's `exp`, giving the client time to obtain a genuinely new token after the old one expires at the provider. Note: revoking a token at the identity provider does not terminate an already-established tunnel — the server enforces token expiry but does not perform live revocation checks. The `--allow` option provides a further layer of control over *where* an authenticated user can connect.
+Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. By default, tunnel lifetime is tied to the access token's `exp` claim, so an expired token causes the tunnel to close rather than persisting indefinitely. Clients with a valid refresh token can extend tunnels by refreshing before expiry; the server validates the new token, pins it to the original subject, and rejects refreshes that would reduce the expiry. The connection's enforced deadline is the token's `exp` plus any configured `--expiry-grace` — during the grace window the underlying JWT has already passed its own `exp`, but the operator has explicitly opted into extending enforcement to that point (e.g. for IdPs that cache access tokens). A refresh carrying a token whose `nbf` is in the future is accepted only when `nbf` is at or before that enforced deadline; the comparison is strict (no additional clock-skew allowance beyond `--expiry-grace`), so a refresh handover never silently stretches the policy further. A refresh whose `nbf` would fall past the enforced deadline is rejected. This can be disabled with `--no-connection-token-expiry` if needed. An optional hard maximum duration (`--max-connection-duration`) provides an additional ceiling. Both limits are orthogonal and can be active simultaneously. Some identity providers (e.g. Auth0) cache access tokens and return the same one on refresh until it expires; `--expiry-grace` adds a grace period beyond the token's `exp`, giving the client time to obtain a genuinely new token after the old one expires at the provider. Note: revoking a token at the identity provider does not terminate an already-established tunnel — the server enforces token expiry but does not perform live revocation checks. The `--allow` option provides a further layer of control over *where* an authenticated user can connect.
 
 **Open mode (no `--allow` rules — the default):** Any destination reachable by the server process is accessible to authenticated clients. This is convenient and gives operators full visibility: every SOCKS CONNECT destination is logged at debug level.
 
@@ -75,8 +75,7 @@ Authunnel enforces authentication (JWT validation) at the WebSocket layer before
 ### Prerequisites
 
 - Go 1.25.0+
-- An OIDC provider that issues JWT access tokens
-- A server audience configured in the IdP and emitted into access-token `aud`
+- An OIDC provider that issues JWT access tokens carrying both a server audience (emitted as `aud`) and a non-empty `sub` — Authunnel pins each tunnel's refresh identity to `sub`, so tokens without one are rejected at admission. Most IdPs emit `sub` by default; on Keycloak 26+ the client's default scopes must cover it (the built-in `basic` scope, or an equivalent custom scope with an `oidc-sub-mapper` — see [`testenv/keycloak/authunnel-realm.json`](testenv/keycloak/authunnel-realm.json) for a working example)
 - A TLS certificate trusted by the client runtime (for TLS-files mode; not required for ACME or plaintext-behind-reverse-proxy modes)
 
 The **server** runs on Linux and macOS. The **client** runs on Linux, macOS, and Windows (10 1803 or later).
@@ -312,8 +311,8 @@ When changing the auth flow, keep these invariants intact:
 
 - ProxyCommand mode must only write transport bytes to `stdout`; any user-facing auth output belongs on `stderr`.
 - Managed OIDC mode must prefer cache, then refresh, then browser login, so repeated `ssh` runs stay fast and predictable.
-- Server-side authorization must continue to fail closed on missing bearer token, invalid JWT signature, wrong issuer, expired token, or wrong `aud`.
-- Token refresh over the control channel must verify that the new token's subject matches the original tunnel's subject (subject pinning). Never send refresh tokens to the server; only access tokens travel over the control channel.
+- Server-side authorization must continue to fail closed on missing bearer token, invalid JWT signature, wrong issuer, expired token, wrong `aud`, missing `sub`, future `iat`, or (at admission) unreached `nbf`.
+- Token refresh over the control channel must verify that the new token's subject matches the original tunnel's subject (subject pinning) and that its `nbf`, if in the future, is at or before the current enforced connection deadline (`exp + --expiry-grace`), so the handover stays within the deadline the operator has already opted into. Never send refresh tokens to the server; only access tokens travel over the control channel.
 
 ## Local Keycloak Test Environment
 

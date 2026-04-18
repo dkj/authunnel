@@ -302,6 +302,10 @@ At runtime the server validates:
 - issuer
 - expiry
 - audience
+- subject (`sub`) is non-empty — the tunnel's refresh identity is pinned to `sub`
+- `iat` is not meaningfully in the future (within a 30 s clock-skew allowance)
+- `nbf` is not after `exp`
+- at admission, `nbf` has been reached (the 30 s skew allowance applies here, since the comparison is against wall-clock `time.Now()`); on refresh, `nbf` must be at or before the current enforced deadline (`exp + --expiry-grace`) — this comparison is strict with no additional skew, so refresh cannot stretch enforcement past the configured grace window
 
 For manual debugging, either decode the JWT locally to inspect `aud`, or hit
 `/protected` with the bearer token and expect a `200 OK` only when the token is

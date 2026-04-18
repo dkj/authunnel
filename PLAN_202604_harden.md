@@ -269,12 +269,20 @@ This order front-loads the issues most likely to silently weaken the trust model
 - Add tests for rejected insecure issuer and tunnel URLs.
 - Update usage/help text.
 
-### Task B: Token validation hardening
+### Task B: Token validation hardening — **Done (2026-04-18)**
 
 - Enforce `nbf`.
 - Decide and implement `iat` handling.
 - Decide and implement `sub` requirements for refresh continuity.
 - Add focused unit tests.
+
+Implemented in [internal/tunnelserver/tunnelserver.go](internal/tunnelserver/tunnelserver.go):
+
+- `validateStandardClaims` enforces non-empty `sub`, rejects `iat` meaningfully in the future (with a 30 s clock-skew allowance), and rejects tokens with `nbf > exp`.
+- `checkTokenUsableBy` is a strict comparison used in two places: admission passes `time.Now() + tokenClockSkew` so IdP clock drift is tolerated at the wall-clock boundary; refresh passes the current enforced connection deadline (`exp + --expiry-grace`) unmodified, so a future-`nbf` token is only accepted if it activates at or before that operator-chosen policy point — the skew does not apply there.
+- `iat` stays optional (the plan's "minimum option"); tokens omitting it are still accepted.
+
+Tests: `TestValidateStandardClaims` and `TestCheckTokenUsableBy` cover the pure-claim checks and each failure mode; `TestTokenRefreshAcceptedFutureNbfWithinDeadline` and `TestTokenRefreshRejectedNbfAfterDeadline` exercise the refresh handover end-to-end. Existing refresh coverage (subject mismatch, expiry reduced, same-expiry) continues to pass unchanged.
 
 ### Task C: Admission and resource limiting
 

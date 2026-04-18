@@ -99,8 +99,8 @@ Choose one authentication method (mutually exclusive):
 
 Connection:
 
-  --tunnel-url <url>           HTTPS tunnel endpoint URL; auth is checked before
-                               the connection is upgraded to WebSocket
+  --tunnel-url <url>           HTTPS endpoint URL (not wss://); auth is checked
+                               before the connection is upgraded to WebSocket
                                (default: https://localhost:8443/protected/tunnel)
 
 Other:
@@ -171,7 +171,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	var showVersion bool
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.AccessToken, "access-token", cfg.AccessToken, "Bearer token for manual authentication (not recommended; prefer OIDC or ACCESS_TOKEN env var)")
-	fs.StringVar(&cfg.TunnelURL, "tunnel-url", "https://localhost:8443/protected/tunnel", "HTTPS tunnel endpoint URL; auth is checked before the connection is upgraded to WebSocket")
+	fs.StringVar(&cfg.TunnelURL, "tunnel-url", "https://localhost:8443/protected/tunnel", "HTTPS endpoint URL (not wss://); auth is checked before the connection is upgraded to WebSocket")
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
@@ -239,7 +239,13 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	if err != nil || tunnelU.Host == "" {
 		return cfg, fmt.Errorf("--tunnel-url %q is not a valid URL", cfg.TunnelURL)
 	}
+	// --tunnel-url is the HTTP(S) endpoint that serves the tunnel; the
+	// WebSocket upgrade happens inside an authenticated HTTPS request, so
+	// https:// is the canonical scheme here (not wss://).
 	if tunnelU.Scheme != "https" && !cfg.InsecureTunnelURL {
+		if tunnelU.Scheme == "wss" || tunnelU.Scheme == "ws" {
+			return cfg, fmt.Errorf("--tunnel-url must use an https:// URL, not %s:// — the URL is the HTTP endpoint that upgrades to WebSocket after authentication", tunnelU.Scheme)
+		}
 		return cfg, errors.New("--tunnel-url must use an https:// URL; use --insecure-tunnel-url to allow plaintext (development only)")
 	}
 	if cfg.OIDCIssuer != "" {
