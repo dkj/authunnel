@@ -269,7 +269,36 @@ If the unix-socket parent directory does not already exist, the client creates
 it with `0700` permissions. It also tightens the socket itself to `0600` so
 other local users cannot connect by default on shared hosts.
 
-Unix socket mode works on Windows 10 1803 and later.
+On shared POSIX hosts the client fails closed if the socket's parent directory
+is group- or world-writable, or if it is owned by another local user. It also
+walks every ancestor up to the filesystem root: any ancestor directory a peer
+can `rename(2)` past would let them swap the private subtree between
+validation and bind, so ancestors that are writable by others without the
+sticky bit, or owned by an unprivileged user other than the operator, are
+rejected too. Sticky directories (the classic case is `/tmp`, mode `1777`)
+are accepted as ancestors because sticky-bit semantics restrict renames to
+the entry's owner — but the leaf must still be a private subdirectory (for
+example `/tmp/authunnel/`, mode `0700`), so point `--unix-socket` at a file
+inside it rather than directly at `/tmp/proxy.sock`. A bare filename like
+`--unix-socket proxy.sock` is validated against the current working
+directory under the same rules, so starting the client from a shared cwd
+(such as `/tmp` itself) is refused. The same checks apply to the OIDC token
+cache directory (`--oidc-cache`) and its advisory-lock companion file, so a
+directory that is safe for the socket is also safe for cached tokens.
+
+During listener creation the client restricts its process umask to `0o077`,
+so the socket inode is created owner-only in the first place; the follow-up
+`chmod` to `0600` is kept as a safety net for filesystems that ignore umask
+on AF_UNIX bind. Stale-socket cleanup after a previous crash refuses to
+remove anything other than a unix-domain socket owned by the current user,
+so a regular file accidentally placed at the socket path will surface as an
+error rather than being silently unlinked.
+
+Unix socket mode works on Windows 10 1803 and later. Windows uses NTFS ACLs
+rather than POSIX mode bits, so the parent-directory safety check there only
+verifies that the target path exists as a directory; detailed ACL inspection
+is out of scope and operators should rely on the default `%AppData%`
+location, which is already user-scoped.
 
 ## OIDC Client Registration
 

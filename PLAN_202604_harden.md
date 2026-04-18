@@ -320,11 +320,31 @@ Implemented in [server/server.go](server/server.go):
 
 Tests in [server/server_test.go](server/server_test.go): `TestParseServerConfigRejectsEmptyAllowlistByDefault`, `TestParseServerConfigAcceptsAllowOpenEgressFlag`, `TestParseServerConfigAcceptsAllowOpenEgressEnv`, `TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress`, and `TestParseServerConfigRejectsAllowRulesWithOpenEgress` cover each branch of the new posture gate. A companion helper `minimalServerEnvWithRules` keeps the pre-existing `--allow`-based tests from inheriting the shortcut and tripping the new mutual-exclusion rule. README examples under "Start server", "Security Posture", and the Keycloak test-env section now demonstrate the explicit posture choice.
 
-### Task E: Local client filesystem hardening
+### Task E: Local client filesystem hardening ✓ done
 
 - Validate parent directory safety.
 - Tighten socket and cache path behavior.
 - Add local-permission tests.
+
+Implemented as two small platform-specific helpers in [client/safefs_unix.go](client/safefs_unix.go) and [client/safefs_windows.go](client/safefs_windows.go), wired into the three code paths that create private per-user files:
+
+- `ensurePrivateDir` replaces the ad-hoc `os.MkdirAll(..., 0o755)` calls in [client/auth.go](client/auth.go) (cache dir), [client/flock_unix.go](client/flock_unix.go) / [client/flock_windows.go](client/flock_windows.go) (lock dir), and the socket-dir path in [client/client.go](client/client.go). On POSIX it creates missing directories `0o700` and Chmod-tightens against umask drift; on existing directories it leaves the operator's permissions alone but validates them. Validation rejects any directory that is group- or world-writable (mode & `0o022`) or owned by another local uid — catching sticky `/tmp` (`1777`), shared group-writable staging areas, and directories pre-created by a malicious local peer. The Windows variant is intentionally a lighter check (directory exists + is a directory) because NTFS uses ACLs rather than POSIX mode bits.
+- `safelyRemoveExistingSocket` replaces the previous "`os.Remove` and hope" stale-socket cleanup in [client/client.go](client/client.go). It lstats the path, refuses anything that is not a unix-domain socket, and on POSIX additionally refuses sockets owned by a different uid. A regular file accidentally placed at the socket path now surfaces as an error instead of being silently unlinked.
+- `withUmask(0o077, ...)` wraps the `net.Listen("unix", ...)` call so the socket inode is created with owner-only permissions in the first place, closing the window in which another local user could connect between `bind` and the follow-up `tightenUnixSocketPermissions`. The existing `chmod` to `0o600` is kept as a safety net for filesystems that ignore umask on AF_UNIX bind.
+
+Tests in [client/safefs_unix_test.go](client/safefs_unix_test.go) cover:
+
+- creation with owner-only mode under a permissive process umask (`0o022`),
+- acceptance of an existing `0o755` owner-owned directory (default home-directory shape),
+- rejection of group-writable (`0o775`), world-writable (`0o777`), and sticky-world-writable (`0o1777`) directories,
+- rejection of a non-directory path,
+- `safelyRemoveExistingSocket` no-op on missing paths, refusal on regular files, and successful removal of a real stale unix-domain socket,
+- end-to-end umask behaviour: the socket inode created via the `runUnixSocketMode` sequence has no group/world permission bits even before `tightenUnixSocketPermissions` runs,
+- the admission-layer hardening propagates to the token cache and lock file: `acquireFileLock` and `managedOIDCTokenSource.AccessToken` both refuse a group-writable cache directory with the same error message operators will see elsewhere.
+
+README [README.md](README.md) documents the new failure mode and points operators at the documented `/tmp/authunnel/` subdirectory pattern.
+
+Intentionally deferred / out of scope: sticky-bit "allow if owned by me" exception (the plan explicitly flags it as requiring review, and the subdirectory pattern is already documented); POSIX-style ACL inspection on Windows (the default `%AppData%` path is already user-scoped by the OS).
 
 ### Task F: Documentation cleanup
 
