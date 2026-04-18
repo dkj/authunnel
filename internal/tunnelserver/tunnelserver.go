@@ -177,6 +177,11 @@ type HandlerOptions struct {
 
 	// Longevity controls connection lifetime enforcement.
 	Longevity LongevityConfig
+
+	// Admission enforces concurrency, per-user, and rate-limit admission
+	// policy before the WebSocket upgrade. A nil value disables admission
+	// checks entirely.
+	Admission *Admitter
 }
 
 // NewHandler installs the small HTTP surface used by the server:
@@ -226,6 +231,12 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		if !ok {
 			return
 		}
+		decision, release, retryAfter := opt.Admission.Admit(claims.Subject)
+		if decision != AdmitOK {
+			writeAdmissionDenied(w, r, decision, retryAfter, claims.Subject)
+			return
+		}
+		defer release()
 		// websocket.Accept hijacks the HTTP/1.1 connection. Clear any
 		// server-level deadlines first so the upgraded SOCKS tunnel can stay
 		// open independently of the HTTP request timeout budget.

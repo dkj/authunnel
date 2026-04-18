@@ -9,14 +9,17 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/time/rate"
 
 	"authunnel/internal/security"
 	"authunnel/internal/tunnelserver"
@@ -45,6 +48,13 @@ type serverConfig struct {
 	NoConnectionTokenExpiry bool          // when true, tunnel lifetime is NOT tied to access token expiry
 	ExpiryWarning              time.Duration // warning period before either limit
 	ExpiryGrace                time.Duration // grace period beyond token exp for cached-token providers
+
+	// Admission and resource limits
+	MaxConcurrentTunnels int           // global cap; 0 = unlimited
+	MaxTunnelsPerUser    int           // per-subject concurrent cap; 0 = unlimited
+	TunnelOpenRate       float64       // per-subject rate (tunnels/sec); 0 = disabled
+	TunnelOpenBurst      int           // per-subject token-bucket burst; defaults to ceil(rate) when rate>0
+	DialTimeout          time.Duration // per-outbound-dial timeout; default 10s
 }
 
 func serverUsage(w io.Writer) {
@@ -86,6 +96,22 @@ Connection longevity:
   --expiry-grace <duration>
                              Grace period beyond token exp for providers that cache access tokens; the
                              connection deadline becomes exp + grace (env: EXPIRY_GRACE, default: 0)
+
+Admission and resource limits:
+
+  --max-concurrent-tunnels <n>
+                             Maximum concurrent tunnels across all users (env: MAX_CONCURRENT_TUNNELS, default: 0 = unlimited).
+                             Over-capacity requests are rejected with HTTP 503 before the WebSocket upgrade.
+  --max-tunnels-per-user <n>
+                             Maximum concurrent tunnels per user, keyed on the token subject claim
+                             (env: MAX_TUNNELS_PER_USER, default: 0 = unlimited). Over-cap requests get HTTP 429.
+  --tunnel-open-rate <rate>
+                             Sustained tunnel-open rate per user, tunnels/second as a float
+                             (env: TUNNEL_OPEN_RATE, default: 0 = disabled). Rate-exceeding requests get HTTP 429.
+  --tunnel-open-burst <n>    Burst size for --tunnel-open-rate (env: TUNNEL_OPEN_BURST, default: ceil(rate))
+  --dial-timeout <duration>  Per-outbound-dial timeout (env: DIAL_TIMEOUT, default: 10s). Zero disables the
+                             timeout and lets authenticated users tie up goroutines on blackholed destinations;
+                             not recommended.
 
 Other:
 
@@ -129,7 +155,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules),
+	admitter := tunnelserver.NewAdmitter(tunnelserver.AdmissionConfig{
+		GlobalMax:    cfg.MaxConcurrentTunnels,
+		PerUserMax:   cfg.MaxTunnelsPerUser,
+		PerUserRate:  rate.Limit(cfg.TunnelOpenRate),
+		PerUserBurst: cfg.TunnelOpenBurst,
+	})
+	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules, cfg.DialTimeout),
 		tunnelserver.HandlerOptions{
 			TrustForwardedProto: cfg.PlaintextBehindProxy,
 			Longevity: tunnelserver.LongevityConfig{
@@ -138,6 +170,7 @@ func main() {
 				ExpiryWarning:    cfg.ExpiryWarning,
 				ExpiryGrace:      cfg.ExpiryGrace,
 			},
+			Admission: admitter,
 		})
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -196,6 +229,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		ACMECacheDir:               "/var/cache/authunnel/acme",
 		LogLevel:                   slog.LevelInfo,
 		ExpiryWarning: 3 * time.Minute,
+		DialTimeout:                10 * time.Second,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
@@ -241,6 +275,56 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 			return cfg, fmt.Errorf("EXPIRY_GRACE: must not be negative")
 		}
 		cfg.ExpiryGrace = d
+	}
+	if v := getenv("MAX_CONCURRENT_TUNNELS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("MAX_CONCURRENT_TUNNELS: %w", err)
+		}
+		if n < 0 {
+			return cfg, fmt.Errorf("MAX_CONCURRENT_TUNNELS: must not be negative")
+		}
+		cfg.MaxConcurrentTunnels = n
+	}
+	if v := getenv("MAX_TUNNELS_PER_USER"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("MAX_TUNNELS_PER_USER: %w", err)
+		}
+		if n < 0 {
+			return cfg, fmt.Errorf("MAX_TUNNELS_PER_USER: must not be negative")
+		}
+		cfg.MaxTunnelsPerUser = n
+	}
+	if v := getenv("TUNNEL_OPEN_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: %w", err)
+		}
+		if f < 0 {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: must not be negative")
+		}
+		cfg.TunnelOpenRate = f
+	}
+	if v := getenv("TUNNEL_OPEN_BURST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_BURST: %w", err)
+		}
+		if n < 0 {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_BURST: must not be negative")
+		}
+		cfg.TunnelOpenBurst = n
+	}
+	if v := getenv("DIAL_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("DIAL_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("DIAL_TIMEOUT: must not be negative")
+		}
+		cfg.DialTimeout = d
 	}
 
 	envLogLevel := getenv("LOG_LEVEL")
@@ -329,6 +413,61 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		cfg.ExpiryGrace = d
 		return nil
 	})
+	fs.Func("max-concurrent-tunnels", "Maximum concurrent tunnels across all users; 0 = unlimited", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if n < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.MaxConcurrentTunnels = n
+		return nil
+	})
+	fs.Func("max-tunnels-per-user", "Maximum concurrent tunnels per user (subject); 0 = unlimited", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if n < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.MaxTunnelsPerUser = n
+		return nil
+	})
+	fs.Func("tunnel-open-rate", "Sustained tunnel-open rate per user in tunnels/second; 0 = disabled", func(value string) error {
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		if f < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.TunnelOpenRate = f
+		return nil
+	})
+	fs.Func("tunnel-open-burst", "Burst size for --tunnel-open-rate; defaults to ceil(rate) when rate > 0", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if n < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.TunnelOpenBurst = n
+		return nil
+	})
+	fs.Func("dial-timeout", "Per-outbound-dial timeout, e.g. 10s; 0 = unlimited (not recommended)", func(value string) error {
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		if d < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.DialTimeout = d
+		return nil
+	})
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			serverUsage(os.Stdout)
@@ -414,6 +553,20 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 	if modes == 0 {
 		return cfg, errors.New("one of --tls-cert/--tls-key, --acme-domain, or --plaintext-behind-reverse-proxy is required")
+	}
+
+	// Admission sub-validation. Burst defaults to ceil(rate) when rate is
+	// positive but burst was not explicitly set, which gives a sensible
+	// minimum without forcing operators to tune both knobs.
+	if cfg.TunnelOpenBurst > 0 && cfg.TunnelOpenRate == 0 {
+		return cfg, errors.New("--tunnel-open-burst requires --tunnel-open-rate to be set")
+	}
+	if cfg.TunnelOpenRate > 0 && cfg.TunnelOpenBurst == 0 {
+		burst := int(math.Ceil(cfg.TunnelOpenRate))
+		if burst < 1 {
+			burst = 1
+		}
+		cfg.TunnelOpenBurst = burst
 	}
 
 	// Per-mode sub-validation.

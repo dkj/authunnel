@@ -60,6 +60,7 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 		ACMECacheDir:               "/var/cache/authunnel/acme",
 		LogLevel:                   slog.LevelInfo,
 		ExpiryWarning: 3 * time.Minute,
+		DialTimeout:                10 * time.Second,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("unexpected config: got %#v want %#v", cfg, want)
@@ -727,6 +728,113 @@ func TestParseServerConfigAllowFlagAndEnvAreCombined(t *testing.T) {
 	}
 }
 
+func TestParseServerConfigAdmissionFlags(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--max-concurrent-tunnels", "100",
+		"--max-tunnels-per-user", "3",
+		"--tunnel-open-rate", "2.5",
+		"--tunnel-open-burst", "5",
+		"--dial-timeout", "5s",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.MaxConcurrentTunnels != 100 {
+		t.Errorf("MaxConcurrentTunnels: got %d want 100", cfg.MaxConcurrentTunnels)
+	}
+	if cfg.MaxTunnelsPerUser != 3 {
+		t.Errorf("MaxTunnelsPerUser: got %d want 3", cfg.MaxTunnelsPerUser)
+	}
+	if cfg.TunnelOpenRate != 2.5 {
+		t.Errorf("TunnelOpenRate: got %v want 2.5", cfg.TunnelOpenRate)
+	}
+	if cfg.TunnelOpenBurst != 5 {
+		t.Errorf("TunnelOpenBurst: got %d want 5", cfg.TunnelOpenBurst)
+	}
+	if cfg.DialTimeout != 5*time.Second {
+		t.Errorf("DialTimeout: got %v want 5s", cfg.DialTimeout)
+	}
+}
+
+func TestParseServerConfigAdmissionFromEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "MAX_CONCURRENT_TUNNELS":
+			return "50"
+		case "MAX_TUNNELS_PER_USER":
+			return "2"
+		case "TUNNEL_OPEN_RATE":
+			return "1"
+		case "DIAL_TIMEOUT":
+			return "3s"
+		default:
+			return minimalServerEnv(key)
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.MaxConcurrentTunnels != 50 {
+		t.Errorf("MaxConcurrentTunnels: got %d want 50", cfg.MaxConcurrentTunnels)
+	}
+	if cfg.MaxTunnelsPerUser != 2 {
+		t.Errorf("MaxTunnelsPerUser: got %d want 2", cfg.MaxTunnelsPerUser)
+	}
+	if cfg.TunnelOpenRate != 1 {
+		t.Errorf("TunnelOpenRate: got %v want 1", cfg.TunnelOpenRate)
+	}
+	// Burst is derived from rate when unset.
+	if cfg.TunnelOpenBurst != 1 {
+		t.Errorf("TunnelOpenBurst (derived): got %d want 1", cfg.TunnelOpenBurst)
+	}
+	if cfg.DialTimeout != 3*time.Second {
+		t.Errorf("DialTimeout: got %v want 3s", cfg.DialTimeout)
+	}
+}
+
+func TestParseServerConfigBurstDerivedFromRate(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--tunnel-open-rate", "4.2",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	// ceil(4.2) = 5
+	if cfg.TunnelOpenBurst != 5 {
+		t.Errorf("TunnelOpenBurst (derived): got %d want 5", cfg.TunnelOpenBurst)
+	}
+}
+
+func TestParseServerConfigRejectsBurstWithoutRate(t *testing.T) {
+	_, err := parseServerConfig([]string{
+		"--tunnel-open-burst", "5",
+	}, minimalServerEnv)
+	if err == nil {
+		t.Fatalf("expected error when --tunnel-open-burst set without --tunnel-open-rate")
+	}
+}
+
+func TestParseServerConfigRejectsNegativeAdmissionValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		flags []string
+		env   string
+	}{
+		{"max-concurrent-tunnels", []string{"--max-concurrent-tunnels", "-1"}, ""},
+		{"max-tunnels-per-user", []string{"--max-tunnels-per-user", "-1"}, ""},
+		{"tunnel-open-rate", []string{"--tunnel-open-rate", "-0.5"}, ""},
+		{"dial-timeout", []string{"--dial-timeout", "-1s"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseServerConfig(tc.flags, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected error for negative %s", tc.name)
+			}
+		})
+	}
+}
+
 func TestParseServerConfigRejectsInvalidAllowRule(t *testing.T) {
 	_, err := parseServerConfig([]string{
 		"--allow", "notarule",
@@ -1250,7 +1358,7 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 		t.Fatalf("create socks server: %v", err)
 	}
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				MaxDuration:      200 * time.Millisecond,
@@ -1369,7 +1477,7 @@ func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				MaxDuration:      2 * time.Second,
@@ -1499,7 +1607,7 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
@@ -1614,7 +1722,7 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
@@ -1770,7 +1878,7 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 
 	// Key: ExpiryGrace is set, and ExpiryWarning > ExpiryGrace (the
 	// scenario that triggered the reviewer concern).
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,

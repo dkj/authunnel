@@ -269,7 +269,7 @@ This order front-loads the issues most likely to silently weaken the trust model
 - Add tests for rejected insecure issuer and tunnel URLs.
 - Update usage/help text.
 
-### Task B: Token validation hardening — **Done (2026-04-18)**
+### Task B: Token validation hardening ✓ done
 
 - Enforce `nbf`.
 - Decide and implement `iat` handling.
@@ -284,13 +284,26 @@ Implemented in [internal/tunnelserver/tunnelserver.go](internal/tunnelserver/tun
 
 Tests: `TestValidateStandardClaims` and `TestCheckTokenUsableBy` cover the pure-claim checks and each failure mode; `TestTokenRefreshAcceptedFutureNbfWithinDeadline` and `TestTokenRefreshRejectedNbfAfterDeadline` exercise the refresh handover end-to-end. Existing refresh coverage (subject mismatch, expiry reduced, same-expiry) continues to pass unchanged.
 
-### Task C: Admission and resource limiting
+### Task C: Admission and resource limiting ✓ done
 
 - Add global concurrent tunnel limits.
 - Add per-user concurrent tunnel limits.
 - Add tunnel-open rate limiting.
 - Add dial timeout and, if needed, in-progress dial caps.
 - Add focused tests for rejection and timeout behavior.
+
+Implemented as a single `Admitter` controller in [internal/tunnelserver/admission.go](internal/tunnelserver/admission.go), wired into the handler after token validation and before the WebSocket upgrade at [internal/tunnelserver/tunnelserver.go](internal/tunnelserver/tunnelserver.go):
+
+- `AdmissionConfig` exposes `GlobalMax`, `PerUserMax`, `PerUserRate`, and `PerUserBurst`; zero values disable the corresponding control, so existing deployments keep today's behaviour until an operator opts in. Per-user state is keyed on the validated `sub` claim (Task B guarantees it is non-empty, so admission does not re-check).
+- Rate limiting uses `golang.org/x/time/rate` with a cancel-on-deny pattern so failed attempts do not consume tokens.
+- Rejections distinguish `global` (503 + `Retry-After`), `per_user` (429 + `Retry-After`), and `rate` (429 with delay derived from the token-bucket reservation). A single structured warn record per rejection (`event=tunnel_admission_denied`, `reason=...`, `subject`, `remote_ip`, `retry_after_ms`) lets operators distinguish abuse from undersized limits without adding a metrics dependency.
+- Outbound SOCKS dials now use a bounded `net.Dialer.Timeout` threaded through `NewObservedSOCKSServer` at [internal/tunnelserver/observability.go](internal/tunnelserver/observability.go), removing the previous zero-timeout hole for blackholed destinations. Default is `10s`.
+- Five new flags/envs in [server/server.go](server/server.go): `--max-concurrent-tunnels`, `--max-tunnels-per-user`, `--tunnel-open-rate`, `--tunnel-open-burst` (auto-derived from rate when unset), `--dial-timeout`. Burst without rate is a startup error.
+- The client now captures `*http.Response` from `websocket.Dial` and returns a typed `tunnelDialError` carrying `StatusCode` and `Retry-After` at [client/client.go](client/client.go), so 401/429/503 surface as distinct operator-visible messages instead of the prior opaque `"websocket dial failed"`. Automatic retry/backoff is intentionally deferred to a separate PR.
+
+Tests: `TestAdmit_*` in [internal/tunnelserver/admission_test.go](internal/tunnelserver/admission_test.go) cover the global cap, per-user cap, deterministic rate-limit behaviour (fake-clock), idle-user GC, bucket preservation on partial drain, idempotent release, and concurrent safety. `TestHandler_RejectsWhenGlobalCapExceeded` exercises the handler rejection path end-to-end; `TestObservedSOCKSDial_RespectsDialTimeout` verifies the dial timeout. Server config coverage in [server/server_test.go](server/server_test.go) verifies flag/env parsing, burst-from-rate derivation, and negative-value rejection. `TestDialTunnel_SurfacesAdmissionRejection` / `TestDialTunnel_SurfacesCapacityRejection` cover the client wrapper, and `TestE2E_GlobalTunnelCapRejects` / `TestE2E_PerUserTunnelCapRejects` in [client/oidc_e2e_test.go](client/oidc_e2e_test.go) exercise the full real-server + real-OIDC + real-client path.
+
+Intentionally deferred: per-source-IP rate limiting, in-progress outbound dial cap (dial timeout + per-user cap already bound resource use), Prometheus metrics (structured warn logs are sufficient for v1), and automatic client-side retry/backoff on 429/503.
 
 ### Task D: Allowlist default posture
 

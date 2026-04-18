@@ -410,7 +410,60 @@ func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket
 	if cfg.HTTPClient != nil {
 		options.HTTPClient = cfg.HTTPClient
 	}
-	return websocket.Dial(ctx, cfg.TunnelURL, options)
+	conn, resp, err := websocket.Dial(ctx, cfg.TunnelURL, options)
+	if err != nil && resp != nil {
+		// The server rejected the upgrade with a real HTTP response. The
+		// coder/websocket error wraps the body snippet but does not expose
+		// the status code or headers, so decorate the error here with the
+		// information operators need to distinguish 401 (auth) from 429/503
+		// (admission limits) and to honour Retry-After manually.
+		return conn, resp, &tunnelDialError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: resp.Header.Get("Retry-After"),
+			Err:        err,
+		}
+	}
+	return conn, resp, err
+}
+
+// tunnelDialError augments a websocket dial failure with the server's HTTP
+// status and Retry-After header so the CLI can print a message that tells
+// the operator what went wrong and whether to retry.
+type tunnelDialError struct {
+	StatusCode int
+	RetryAfter string
+	Err        error
+}
+
+func (e *tunnelDialError) Error() string {
+	msg := e.categoryMessage()
+	if e.RetryAfter != "" && (e.StatusCode == http.StatusTooManyRequests || e.StatusCode == http.StatusServiceUnavailable) {
+		return fmt.Sprintf("%s (retry after %s)", msg, e.RetryAfter)
+	}
+	return msg
+}
+
+func (e *tunnelDialError) Unwrap() error { return e.Err }
+
+func (e *tunnelDialError) categoryMessage() string {
+	switch e.StatusCode {
+	case http.StatusUnauthorized:
+		return "tunnel authentication rejected"
+	case http.StatusForbidden:
+		return "tunnel authorization rejected"
+	case http.StatusTooManyRequests:
+		return "tunnel rate-limited by server"
+	case http.StatusServiceUnavailable:
+		return "tunnel server at capacity"
+	default:
+		// Unhandled status: preserve the underlying coder/websocket message
+		// (which carries the server's body snippet) so operators debugging an
+		// unexpected upgrade failure do not lose diagnostic detail.
+		if e.Err != nil {
+			return fmt.Sprintf("tunnel dial rejected with HTTP %d: %v", e.StatusCode, e.Err)
+		}
+		return fmt.Sprintf("tunnel dial rejected with HTTP %d", e.StatusCode)
+	}
 }
 
 // handleControlMessages reads from the MultiplexConn's control channel and
