@@ -97,11 +97,11 @@ Choose one authentication method (mutually exclusive):
     --access-token <token>       Bearer token passed as a flag
     ACCESS_TOKEN                 Bearer token via environment variable
 
-Connection:
+Connection (one of these is required):
 
   --tunnel-url <url>           HTTPS endpoint URL (not wss://); auth is checked
                                before the connection is upgraded to WebSocket
-                               (default: https://localhost:8443/protected/tunnel)
+  AUTHUNNEL_TUNNEL_URL         Same, via environment variable (flag takes precedence)
 
 Other:
 
@@ -171,7 +171,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	var showVersion bool
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.AccessToken, "access-token", cfg.AccessToken, "Bearer token for manual authentication (not recommended; prefer OIDC or ACCESS_TOKEN env var)")
-	fs.StringVar(&cfg.TunnelURL, "tunnel-url", "https://localhost:8443/protected/tunnel", "HTTPS endpoint URL (not wss://); auth is checked before the connection is upgraded to WebSocket")
+	fs.StringVar(&cfg.TunnelURL, "tunnel-url", getenv("AUTHUNNEL_TUNNEL_URL"), "HTTPS endpoint URL (not wss://); auth is checked before the connection is upgraded to WebSocket. Falls back to AUTHUNNEL_TUNNEL_URL.")
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
@@ -235,6 +235,9 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 		}
 	}
 
+	if cfg.TunnelURL == "" {
+		return cfg, errors.New("tunnel endpoint URL is required: pass --tunnel-url or set AUTHUNNEL_TUNNEL_URL")
+	}
 	tunnelU, err := url.Parse(cfg.TunnelURL)
 	if err != nil || tunnelU.Host == "" {
 		return cfg, fmt.Errorf("--tunnel-url %q is not a valid URL", cfg.TunnelURL)
