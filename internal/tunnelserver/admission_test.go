@@ -297,7 +297,7 @@ func TestHandler_RejectsWhenGlobalCapExceeded(t *testing.T) {
 	}
 }
 
-func TestObservedSOCKSDial_RespectsDialTimeout(t *testing.T) {
+func TestObservedSOCKSDial_DoesNotBlockPastConfiguredTimeout(t *testing.T) {
 	// A listener that accepts connections but never reads drives the dial
 	// straight into timeout territory. SYN-then-idle is the closest local
 	// stand-in for a blackholed destination.
@@ -308,11 +308,11 @@ func TestObservedSOCKSDial_RespectsDialTimeout(t *testing.T) {
 	t.Cleanup(func() { ln.Close() })
 
 	// A half-open TCP handshake is tricky to simulate locally — the local
-	// stack completes the handshake. To force the dial to hit the deadline
-	// we instead target an unroutable address (RFC5737 TEST-NET-1) with a
-	// tight timeout. This avoids flakes because the kernel returns
-	// immediately for SYNs to a nonexistent host only on some networks;
-	// what we really want is the Dialer timeout to fire first.
+	// stack completes the handshake. To exercise the timeout guardrail we
+	// target an unroutable address (RFC5737 TEST-NET-1) with a tight
+	// timeout. Different kernels and routing tables may fail fast with
+	// "network is unreachable" before timeout, so the assertion below only
+	// requires that the dial returns promptly and with an error.
 	dial := observedSOCKSDial(nil, 50*time.Millisecond)
 	start := time.Now()
 	conn, err := dial(context.Background(), "tcp", "192.0.2.1:65000")
@@ -325,9 +325,15 @@ func TestObservedSOCKSDial_RespectsDialTimeout(t *testing.T) {
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("dial took %v, timeout not enforced", elapsed)
 	}
-	netErr, ok := err.(net.Error)
-	if !ok || !netErr.Timeout() {
-		t.Fatalf("expected net.Error Timeout, got %v", err)
+	// Timeout is preferred, but some environments fail earlier with an
+	// unroutable-network error. Both outcomes are acceptable as long as
+	// the call respects the configured upper bound.
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return
+	}
+	errText := strings.ToLower(err.Error())
+	if !strings.Contains(errText, "unreachable") && !strings.Contains(errText, "no route") {
+		t.Fatalf("expected timeout or unreachable-network error, got %v", err)
 	}
 }
 
