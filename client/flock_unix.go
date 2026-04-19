@@ -17,8 +17,8 @@ import (
 // the kernel releases the lock when the owning process exits, which avoids both
 // age-based lock stealing and stale lock files after crashes.
 func acquireFileLock(ctx context.Context, lockPath string) (func(), error) {
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		return nil, fmt.Errorf("create lock directory: %w", err)
+	if err := ensurePrivateDir(filepath.Dir(lockPath)); err != nil {
+		return nil, fmt.Errorf("prepare lock directory: %w", err)
 	}
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

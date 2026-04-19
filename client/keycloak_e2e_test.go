@@ -114,7 +114,7 @@ func TestKeycloakProxyCommandManagedOIDCE2E(t *testing.T) {
 		OIDCScopes:       normalizeScopes("openid"),
 		OIDCCache:        cachePath,
 		OIDCRedirectPort: freeLoopbackPortForTest(t),
-		WebSocketURL:     server.URL + "/protected/socks",
+		TunnelURL:        server.URL + "/protected/tunnel",
 		ProxyCommandMode: true,
 		TargetHost:       "127.0.0.1",
 		TargetPort:       targetListener.Addr().(*net.TCPAddr).Port,

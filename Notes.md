@@ -20,7 +20,9 @@ export TOKEN_AUDIENCE=authunnel-server
 export TLS_CERT_FILE=$PWD/cert.pem
 export TLS_KEY_FILE=$PWD/key.pem
 
-(cd server; go run .)
+# Startup now requires an egress posture: pass --allow rules, or
+# --allow-open-egress for a local-dev flow that tunnels to arbitrary targets.
+(cd server; go run . --allow-open-egress)
 ```
 
 Check the localhost TLS setup working ok. The smoke test should trust the CA
@@ -109,6 +111,7 @@ Protected OK 2024-08-01 11:30:37.729193176 +0000 UTC m=+7.188534380
 #### so try to run proper client
 ```bash
 SSL_CERT_FILE=dev-ca.pem go run ./client \
+  --tunnel-url https://localhost:8443/protected/tunnel \
   --oidc-issuer "$OIDC_ISSUER" \
   --oidc-client-id "$CLIENT_ID" \
   --oidc-audience "$TOKEN_AUDIENCE" \
@@ -242,7 +245,9 @@ Then use it with Authunnel:
 export TLS_CERT_FILE=$PWD/cert.pem
 export TLS_KEY_FILE=$PWD/key.pem
 
-(cd server; go run .)
+# --allow-open-egress is the explicit opt-in for running without an allowlist;
+# use --allow rules instead when you want to restrict tunnel destinations.
+(cd server; go run . --allow-open-egress)
 ```
 
 From another shell, verify the cert and endpoint:
@@ -257,6 +262,7 @@ bundle is still reasonable:
 
 ```bash
 SSL_CERT_FILE=$PWD/dev-ca.pem go run ./client \
+  --tunnel-url https://localhost:8443/protected/tunnel \
   --oidc-issuer "$OIDC_ISSUER" \
   --oidc-client-id "$CLIENT_ID" \
   --oidc-audience "$TOKEN_AUDIENCE" \
@@ -302,6 +308,10 @@ At runtime the server validates:
 - issuer
 - expiry
 - audience
+- subject (`sub`) is non-empty — the tunnel's refresh identity is pinned to `sub`
+- `iat` is not meaningfully in the future (within a 30 s clock-skew allowance)
+- `nbf` is not after `exp`
+- at admission, `nbf` has been reached (the 30 s skew allowance applies here, since the comparison is against wall-clock `time.Now()`); on refresh, `nbf` must be at or before the current enforced deadline (`exp + --expiry-grace`) — this comparison is strict with no additional skew, so refresh cannot stretch enforcement past the configured grace window
 
 For manual debugging, either decode the JWT locally to inspect `aud`, or hit
 `/protected` with the bearer token and expect a `200 OK` only when the token is

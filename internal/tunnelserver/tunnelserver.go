@@ -30,6 +30,12 @@ type TokenValidator interface {
 	ValidateAccessToken(ctx context.Context, token string) (*oidc.AccessTokenClaims, error)
 }
 
+// tokenClockSkew is the allowance applied to time-based token checks (nbf,
+// iat) to accommodate modest clock drift between the IdP and this server.
+// Kept deliberately small and compile-time constant; if operators report
+// problems it can be promoted to a flag later.
+const tokenClockSkew = 30 * time.Second
+
 // JWTTokenValidator validates bearer access tokens against issuer discovery and
 // the issuer's JWKS, then applies an explicit audience check for the protected
 // resource.
@@ -63,9 +69,13 @@ func NewJWTTokenValidator(ctx context.Context, issuer, audience string, httpClie
 	}, nil
 }
 
-// ValidateAccessToken verifies signature, issuer, expiry and standard token
-// claims via the Zitadel verifier, then enforces the configured resource
-// audience separately so that resource identity stays explicit in Authunnel.
+// ValidateAccessToken verifies signature, issuer and expiry via the Zitadel
+// verifier, enforces the configured resource audience, and applies the
+// authenticity-adjacent claim checks in validateStandardClaims (non-empty
+// sub, sane iat, nbf <= exp). Whether the token is usable *now* versus only
+// in the future is a caller concern — admission requires "usable now" via
+// checkTokenUsableBy, while the refresh path may tolerate a token that
+// becomes valid before the current connection deadline.
 func (v *JWTTokenValidator) ValidateAccessToken(ctx context.Context, token string) (*oidc.AccessTokenClaims, error) {
 	claims, err := op.VerifyAccessToken[*oidc.AccessTokenClaims](ctx, token, v.verifier)
 	if err != nil {
@@ -74,7 +84,54 @@ func (v *JWTTokenValidator) ValidateAccessToken(ctx context.Context, token strin
 	if err := oidc.CheckAudience(claims, v.audience); err != nil {
 		return nil, err
 	}
+	if err := validateStandardClaims(claims, time.Now()); err != nil {
+		return nil, err
+	}
 	return claims, nil
+}
+
+// validateStandardClaims enforces authenticity-adjacent claims that are
+// independent of when the token is evaluated: subject must be non-empty
+// (Authunnel pins tunnel identity to sub on refresh), iat must not be
+// meaningfully in the future, and nbf must not be after exp (a token that
+// would never be valid). The "is this token usable yet?" temporal policy
+// is separate — see checkTokenUsableBy.
+func validateStandardClaims(claims *oidc.AccessTokenClaims, now time.Time) error {
+	if claims.Subject == "" {
+		return errors.New("token missing subject")
+	}
+	if iat := claims.IssuedAt.AsTime(); !iat.IsZero() && iat.After(now.Add(tokenClockSkew)) {
+		return fmt.Errorf("token iat %s is in the future", iat.Format(time.RFC3339))
+	}
+	nbf := claims.NotBefore.AsTime()
+	exp := claims.GetExpiration()
+	if !nbf.IsZero() && !exp.IsZero() && nbf.After(exp) {
+		return fmt.Errorf("token nbf %s is after exp %s", nbf.Format(time.RFC3339), exp.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// checkTokenUsableBy enforces that the token's not-before claim is at or
+// before usableBy — a strict comparison, with no implicit skew. The caller
+// picks usableBy to match the policy boundary it is enforcing:
+//
+//   - admission passes time.Now().Add(tokenClockSkew) so IdP clock drift
+//     does not reject tokens whose nbf is a few seconds ahead of the
+//     server's wall clock;
+//   - refresh passes the current connection deadline (exp + ExpiryGrace)
+//     as-is, because that deadline is a server-chosen policy point, not a
+//     wall-clock measurement — applying skew there would silently extend
+//     the configured enforcement window past exp + grace.
+func checkTokenUsableBy(claims *oidc.AccessTokenClaims, usableBy time.Time) error {
+	nbf := claims.NotBefore.AsTime()
+	if nbf.IsZero() {
+		return nil
+	}
+	if nbf.After(usableBy) {
+		return fmt.Errorf("token not valid until %s (needed by %s)",
+			nbf.Format(time.RFC3339), usableBy.Format(time.RFC3339))
+	}
+	return nil
 }
 
 // LongevityConfig controls connection lifetime enforcement. MaxDuration and
@@ -120,12 +177,17 @@ type HandlerOptions struct {
 
 	// Longevity controls connection lifetime enforcement.
 	Longevity LongevityConfig
+
+	// Admission enforces concurrency, per-user, and rate-limit admission
+	// policy before the WebSocket upgrade. A nil value disables admission
+	// checks entirely.
+	Admission *Admitter
 }
 
 // NewHandler installs the small HTTP surface used by the server:
 //   - "/" for a simple liveness response
 //   - "/protected" for token-validation smoke testing
-//   - "/protected/socks" for the authenticated websocket-to-SOCKS bridge
+//   - "/protected/tunnel" for the authenticated websocket-to-SOCKS bridge
 //
 // When Longevity is configured in the handler options, each tunnel is managed
 // by a background goroutine that enforces connection lifetime limits and
@@ -161,7 +223,7 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		_, _ = w.Write([]byte("Protected OK " + time.Now().String()))
 	})
 
-	mux.HandleFunc("/protected/socks", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/protected/tunnel", func(w http.ResponseWriter, r *http.Request) {
 		if !checkWebSocketRequest(w, r, opt.TrustForwardedProto) {
 			return
 		}
@@ -169,6 +231,12 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		if !ok {
 			return
 		}
+		decision, release, retryAfter := opt.Admission.Admit(claims.Subject)
+		if decision != AdmitOK {
+			writeAdmissionDenied(w, r, decision, retryAfter, claims.Subject)
+			return
+		}
+		defer release()
 		// websocket.Accept hijacks the HTTP/1.1 connection. Clear any
 		// server-level deadlines first so the upgraded SOCKS tunnel can stay
 		// open independently of the HTTP request timeout budget.
@@ -343,6 +411,23 @@ func manageTunnelLongevity(
 				_ = conn.SendControl(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "validation_failed"}),
+				})
+				continue
+			}
+			// A future-nbf token is admissible on refresh only if it
+			// activates at or before the tunnel's current enforced
+			// deadline (exp + ExpiryGrace). connDeadline is the
+			// operator-chosen policy boundary — during ExpiryGrace the
+			// underlying JWT is already past its own exp, so the
+			// operator has explicitly opted into extending enforcement
+			// to that point. The comparison is strict (no clock skew)
+			// to make sure a refresh handover never silently stretches
+			// the configured deadline beyond exp + grace.
+			if err := checkTokenUsableBy(newClaims, connDeadline); err != nil {
+				logger.Warn("token_refresh_rejected_not_yet_valid", slog.String("error", err.Error()))
+				_ = conn.SendControl(wsconn.ControlMessage{
+					Type: "token_rejected",
+					Data: mustMarshal(map[string]string{"reason": "not_yet_valid"}),
 				})
 				continue
 			}
@@ -541,6 +626,18 @@ func validateRequestToken(w http.ResponseWriter, r *http.Request, validator Toke
 		// Do not reflect verifier details (signature, issuer/audience mismatch,
 		// expiry parsing errors, etc.) back to callers. Returning a fixed message
 		// keeps the auth surface predictable while preserving diagnostics in logs.
+		loggerFromContext(r.Context()).Warn("auth_failure",
+			slog.String("error", err.Error()),
+		)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil, false
+	}
+	// Admission requires the token to be usable right now. The small
+	// skew allowance absorbs modest IdP/server clock drift; it applies
+	// only at this wall-clock boundary, not at the refresh-vs-deadline
+	// comparison, so it cannot silently stretch the configured
+	// exp + grace policy on established tunnels.
+	if err := checkTokenUsableBy(claims, time.Now().Add(tokenClockSkew)); err != nil {
 		loggerFromContext(r.Context()).Warn("auth_failure",
 			slog.String("error", err.Error()),
 		)

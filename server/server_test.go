@@ -35,6 +35,7 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 			"--listen-addr", "127.0.0.1:9443",
 			"--tls-cert", "/flags/server.crt",
 			"--tls-key", "/flags/server.key",
+			"--allow-open-egress",
 		},
 		func(key string) string {
 			switch key {
@@ -52,17 +53,71 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 	}
 
 	want := serverConfig{
-		Issuer:                     "https://flag-issuer.example",
-		TokenAudience:              "authunnel-server",
-		ListenAddr:                 "127.0.0.1:9443",
-		TLSCertPath:                "/flags/server.crt",
-		TLSKeyPath:                 "/flags/server.key",
-		ACMECacheDir:               "/var/cache/authunnel/acme",
-		LogLevel:                   slog.LevelInfo,
-		ExpiryWarning: 3 * time.Minute,
+		Issuer:          "https://flag-issuer.example",
+		TokenAudience:   "authunnel-server",
+		ListenAddr:      "127.0.0.1:9443",
+		TLSCertPath:     "/flags/server.crt",
+		TLSKeyPath:      "/flags/server.key",
+		ACMECacheDir:    "/var/cache/authunnel/acme",
+		LogLevel:        slog.LevelInfo,
+		AllowOpenEgress: true,
+		ExpiryWarning:   3 * time.Minute,
+		DialTimeout:     10 * time.Second,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("unexpected config: got %#v want %#v", cfg, want)
+	}
+}
+
+func TestParseServerConfigRejectsHTTPIssuer(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{
+			"--oidc-issuer", "http://issuer.example",
+			"--token-audience", "authunnel-server",
+			"--tls-cert", "/srv/server.crt",
+			"--tls-key", "/srv/server.key",
+		},
+		func(string) string { return "" },
+	)
+	if err == nil || !strings.Contains(err.Error(), "https://") {
+		t.Fatalf("expected https rejection for http issuer, got: %v", err)
+	}
+}
+
+func TestParseServerConfigAcceptsHTTPIssuerWithFlag(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{
+			"--oidc-issuer", "http://issuer.example",
+			"--token-audience", "authunnel-server",
+			"--tls-cert", "/srv/server.crt",
+			"--tls-key", "/srv/server.key",
+			"--insecure-oidc-issuer",
+		},
+		func(string) string { return "" },
+	)
+	// May fail for other reasons (TLS files don't exist at runtime) but must NOT reject the http scheme.
+	if err != nil && strings.Contains(err.Error(), "https://") {
+		t.Fatalf("insecure-oidc-issuer flag should suppress scheme error, got: %v", err)
+	}
+}
+
+func TestParseServerConfigAcceptsHTTPIssuerViaEnv(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{
+			"--oidc-issuer", "http://issuer.example",
+			"--token-audience", "authunnel-server",
+			"--tls-cert", "/srv/server.crt",
+			"--tls-key", "/srv/server.key",
+		},
+		func(key string) string {
+			if key == "INSECURE_OIDC_ISSUER" {
+				return "true"
+			}
+			return ""
+		},
+	)
+	if err != nil && strings.Contains(err.Error(), "https://") {
+		t.Fatalf("INSECURE_OIDC_ISSUER=true should suppress scheme error, got: %v", err)
 	}
 }
 
@@ -77,6 +132,8 @@ func TestParseServerConfigAcceptsTLSPathsFromEnv(t *testing.T) {
 			return "/env/server.crt"
 		case "TLS_KEY_FILE":
 			return "/env/server.key"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -112,6 +169,8 @@ func TestParseServerConfigAcceptsLogLevelFromFlagAndEnv(t *testing.T) {
 			return "authunnel-server"
 		case "LOG_LEVEL":
 			return "warn"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -137,6 +196,8 @@ func TestParseServerConfigAllowsValidFlagWhenEnvLogLevelIsInvalid(t *testing.T) 
 			return "authunnel-server"
 		case "LOG_LEVEL":
 			return "verbose"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -350,7 +411,7 @@ func TestProtectedSocksRejectsNonWebSocketRequestsBeforeAuth(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
 	req.Header.Set("Authorization", "Bearer valid-token")
 	rr := httptest.NewRecorder()
 
@@ -371,7 +432,7 @@ func TestProtectedSocksRejectsNonGETMethod(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodPost, "/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodPost, "/protected/tunnel", nil)
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Authorization", "Bearer valid-token")
@@ -391,7 +452,7 @@ func TestProtectedSocksRejectsCrossOriginWebSocketRequests(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -416,7 +477,7 @@ func TestProtectedSocksRejectsOriginWithDifferentScheme(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -438,7 +499,7 @@ func TestProtectedSocksRejectsOriginWithDifferentPort(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example:8443/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example:8443/protected/tunnel", nil)
 	req.Host = "authunnel.example:8443"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -460,7 +521,7 @@ func TestProtectedSocksAllowsSameHostOriginToReachAuth(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticFailValidator{err: errors.New("token rejected")}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -485,7 +546,7 @@ func TestProtectedSocksAllowsOriginWithImplicitDefaultHTTPSPort(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticFailValidator{err: errors.New("token rejected")}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "https://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example:443"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -615,6 +676,17 @@ func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	return server
 }
 
+// minimalServerEnvWithRules is the companion to minimalServerEnv for tests
+// that supply their own --allow rules and therefore must NOT inherit the
+// ALLOW_OPEN_EGRESS shortcut, which would now conflict with the rules and be
+// rejected as an ambiguous posture.
+func minimalServerEnvWithRules(key string) string {
+	if key == "ALLOW_OPEN_EGRESS" {
+		return ""
+	}
+	return minimalServerEnv(key)
+}
+
 func minimalServerEnv(key string) string {
 	switch key {
 	case "OIDC_ISSUER":
@@ -625,6 +697,12 @@ func minimalServerEnv(key string) string {
 		return "/env/server.crt"
 	case "TLS_KEY_FILE":
 		return "/env/server.key"
+	case "ALLOW_OPEN_EGRESS":
+		// Tests that do not exercise the egress-posture gate rely on this
+		// helper to satisfy the default-deny allowlist check introduced in
+		// Task D. Tests that specifically cover that gate construct their
+		// own env function and leave ALLOW_OPEN_EGRESS unset.
+		return "true"
 	default:
 		return ""
 	}
@@ -634,7 +712,7 @@ func TestParseServerConfigAllowFlag(t *testing.T) {
 	cfg, err := parseServerConfig([]string{
 		"--allow", "*.internal:22",
 		"--allow", "10.0.0.0/8:443",
-	}, minimalServerEnv)
+	}, minimalServerEnvWithRules)
 	if err != nil {
 		t.Fatalf("parseServerConfig returned error: %v", err)
 	}
@@ -648,13 +726,155 @@ func TestParseServerConfigAllowRulesEnv(t *testing.T) {
 		if key == "ALLOW_RULES" {
 			return "*.internal:22,10.0.0.0/8:443"
 		}
-		return minimalServerEnv(key)
+		return minimalServerEnvWithRules(key)
 	})
 	if err != nil {
 		t.Fatalf("parseServerConfig returned error: %v", err)
 	}
 	if len(cfg.AllowRules) != 2 {
 		t.Fatalf("expected 2 allow rules from env, got %d", len(cfg.AllowRules))
+	}
+}
+
+// TestParseServerConfigRejectsEmptyAllowlistByDefault verifies the Task D
+// default-deny posture: absent both --allow rules and --allow-open-egress,
+// startup must fail so a misconfigured deployment cannot silently become a
+// general-purpose authenticated TCP pivot.
+func TestParseServerConfigRejectsEmptyAllowlistByDefault(t *testing.T) {
+	_, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err == nil {
+		t.Fatal("expected startup to fail with no allow rules and no --allow-open-egress")
+	}
+	if !strings.Contains(err.Error(), "--allow") || !strings.Contains(err.Error(), "--allow-open-egress") {
+		t.Fatalf("error should mention both --allow and --allow-open-egress so operators can pick a posture, got: %v", err)
+	}
+}
+
+// TestParseServerConfigAcceptsAllowOpenEgressFlag verifies the explicit escape
+// hatch: --allow-open-egress alone is enough to start the server with no
+// allowlist, preserving today's open-mode behaviour for operators who opt in.
+func TestParseServerConfigAcceptsAllowOpenEgressFlag(t *testing.T) {
+	cfg, err := parseServerConfig([]string{"--allow-open-egress"}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if !cfg.AllowOpenEgress {
+		t.Fatal("AllowOpenEgress should be true when --allow-open-egress is set")
+	}
+	if len(cfg.AllowRules) != 0 {
+		t.Fatalf("expected 0 allow rules in open-egress mode, got %d", len(cfg.AllowRules))
+	}
+}
+
+// TestParseServerConfigAcceptsAllowOpenEgressEnv mirrors the flag test for
+// the ALLOW_OPEN_EGRESS environment variable, so containerised deployments can
+// opt in through env without shell flags.
+func TestParseServerConfigAcceptsAllowOpenEgressEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if !cfg.AllowOpenEgress {
+		t.Fatal("AllowOpenEgress should be true when ALLOW_OPEN_EGRESS=true")
+	}
+}
+
+// TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress is the positive path
+// for restrictive mode: a non-empty allowlist is sufficient and does not
+// require the open-egress escape hatch.
+func TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress(t *testing.T) {
+	cfg, err := parseServerConfig([]string{"--allow", "*.internal:22"}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.AllowOpenEgress {
+		t.Fatal("AllowOpenEgress should remain false when only --allow rules are set")
+	}
+	if len(cfg.AllowRules) != 1 {
+		t.Fatalf("expected 1 allow rule, got %d", len(cfg.AllowRules))
+	}
+}
+
+// TestParseServerConfigRejectsAllowRulesWithOpenEgress forbids the ambiguous
+// combination of allowlist rules and the open-egress escape hatch. Accepting
+// both would obscure the active posture — operators should pick one.
+func TestParseServerConfigRejectsAllowRulesWithOpenEgress(t *testing.T) {
+	_, err := parseServerConfig([]string{
+		"--allow", "*.internal:22",
+		"--allow-open-egress",
+	}, func(key string) string {
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		default:
+			return ""
+		}
+	})
+	if err == nil {
+		t.Fatal("expected --allow and --allow-open-egress together to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected 'mutually exclusive' error, got: %v", err)
 	}
 }
 
@@ -665,13 +885,267 @@ func TestParseServerConfigAllowFlagAndEnvAreCombined(t *testing.T) {
 		if key == "ALLOW_RULES" {
 			return "*.internal:22"
 		}
-		return minimalServerEnv(key)
+		return minimalServerEnvWithRules(key)
 	})
 	if err != nil {
 		t.Fatalf("parseServerConfig returned error: %v", err)
 	}
 	if len(cfg.AllowRules) != 2 {
 		t.Fatalf("expected 2 allow rules (env + flag), got %d", len(cfg.AllowRules))
+	}
+}
+
+func TestParseServerConfigAdmissionFlags(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--max-concurrent-tunnels", "100",
+		"--max-tunnels-per-user", "3",
+		"--tunnel-open-rate", "2.5",
+		"--tunnel-open-burst", "5",
+		"--dial-timeout", "5s",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.MaxConcurrentTunnels != 100 {
+		t.Errorf("MaxConcurrentTunnels: got %d want 100", cfg.MaxConcurrentTunnels)
+	}
+	if cfg.MaxTunnelsPerUser != 3 {
+		t.Errorf("MaxTunnelsPerUser: got %d want 3", cfg.MaxTunnelsPerUser)
+	}
+	if cfg.TunnelOpenRate != 2.5 {
+		t.Errorf("TunnelOpenRate: got %v want 2.5", cfg.TunnelOpenRate)
+	}
+	if cfg.TunnelOpenBurst != 5 {
+		t.Errorf("TunnelOpenBurst: got %d want 5", cfg.TunnelOpenBurst)
+	}
+	if cfg.DialTimeout != 5*time.Second {
+		t.Errorf("DialTimeout: got %v want 5s", cfg.DialTimeout)
+	}
+}
+
+func TestParseServerConfigAdmissionFromEnv(t *testing.T) {
+	cfg, err := parseServerConfig(nil, func(key string) string {
+		switch key {
+		case "MAX_CONCURRENT_TUNNELS":
+			return "50"
+		case "MAX_TUNNELS_PER_USER":
+			return "2"
+		case "TUNNEL_OPEN_RATE":
+			return "1"
+		case "DIAL_TIMEOUT":
+			return "3s"
+		default:
+			return minimalServerEnv(key)
+		}
+	})
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.MaxConcurrentTunnels != 50 {
+		t.Errorf("MaxConcurrentTunnels: got %d want 50", cfg.MaxConcurrentTunnels)
+	}
+	if cfg.MaxTunnelsPerUser != 2 {
+		t.Errorf("MaxTunnelsPerUser: got %d want 2", cfg.MaxTunnelsPerUser)
+	}
+	if cfg.TunnelOpenRate != 1 {
+		t.Errorf("TunnelOpenRate: got %v want 1", cfg.TunnelOpenRate)
+	}
+	// Burst is derived from rate when unset.
+	if cfg.TunnelOpenBurst != 1 {
+		t.Errorf("TunnelOpenBurst (derived): got %d want 1", cfg.TunnelOpenBurst)
+	}
+	if cfg.DialTimeout != 3*time.Second {
+		t.Errorf("DialTimeout: got %v want 3s", cfg.DialTimeout)
+	}
+}
+
+func TestParseServerConfigBurstDerivedFromRate(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--tunnel-open-rate", "4.2",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	// ceil(4.2) = 5
+	if cfg.TunnelOpenBurst != 5 {
+		t.Errorf("TunnelOpenBurst (derived): got %d want 5", cfg.TunnelOpenBurst)
+	}
+}
+
+func TestParseServerConfigAcceptsMaxTunnelOpenRate(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--tunnel-open-rate", "10000",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.TunnelOpenRate != maxTunnelOpenRate {
+		t.Errorf("TunnelOpenRate: got %v want %d", cfg.TunnelOpenRate, maxTunnelOpenRate)
+	}
+	if cfg.TunnelOpenBurst != maxTunnelOpenRate {
+		t.Errorf("TunnelOpenBurst (derived): got %d want %d", cfg.TunnelOpenBurst, maxTunnelOpenRate)
+	}
+}
+
+func TestParseServerConfigAcceptsMaxExpiryGrace(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--expiry-grace", "1h",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.ExpiryGrace != maxExpiryGrace {
+		t.Errorf("ExpiryGrace: got %v want %v", cfg.ExpiryGrace, maxExpiryGrace)
+	}
+}
+
+func TestParseServerConfigRejectsBurstWithoutRate(t *testing.T) {
+	_, err := parseServerConfig([]string{
+		"--tunnel-open-burst", "5",
+	}, minimalServerEnv)
+	if err == nil {
+		t.Fatalf("expected error when --tunnel-open-burst set without --tunnel-open-rate")
+	}
+}
+
+func TestParseServerConfigRejectsNegativeAdmissionValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		flags []string
+		env   string
+	}{
+		{"max-concurrent-tunnels", []string{"--max-concurrent-tunnels", "-1"}, ""},
+		{"max-tunnels-per-user", []string{"--max-tunnels-per-user", "-1"}, ""},
+		{"tunnel-open-rate", []string{"--tunnel-open-rate", "-0.5"}, ""},
+		{"dial-timeout", []string{"--dial-timeout", "-1s"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseServerConfig(tc.flags, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected error for negative %s", tc.name)
+			}
+		})
+	}
+}
+
+// TestParseServerConfigRejectsNonFiniteTunnelOpenRate ensures NaN and ±Inf
+// are rejected on both the flag and env paths. strconv.ParseFloat accepts
+// those spellings, and they are not meaningful operator policies here.
+func TestParseServerConfigRejectsNonFiniteTunnelOpenRate(t *testing.T) {
+	cases := []string{"NaN", "nan", "+Inf", "-Inf", "Inf"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{"--tunnel-open-rate", v}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --tunnel-open-rate=%q", v)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				if key == "TUNNEL_OPEN_RATE" {
+					return v
+				}
+				return minimalServerEnv(key)
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of TUNNEL_OPEN_RATE=%q", v)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigRejectsTooLargeTunnelOpenRate(t *testing.T) {
+	cases := []string{"10000.1", "10001"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{"--tunnel-open-rate", v}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --tunnel-open-rate=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be a non-negative finite number not exceeding 10000") {
+				t.Fatalf("unexpected error for --tunnel-open-rate=%q: %v", v, err)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				if key == "TUNNEL_OPEN_RATE" {
+					return v
+				}
+				return minimalServerEnv(key)
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of TUNNEL_OPEN_RATE=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be a non-negative finite number not exceeding 10000") {
+				t.Fatalf("unexpected error for TUNNEL_OPEN_RATE=%q: %v", v, err)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigRejectsTooLargeTunnelOpenBurst(t *testing.T) {
+	cases := []string{"10001"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{
+				"--tunnel-open-rate", "1",
+				"--tunnel-open-burst", v,
+			}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --tunnel-open-burst=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 10000") {
+				t.Fatalf("unexpected error for --tunnel-open-burst=%q: %v", v, err)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				switch key {
+				case "TUNNEL_OPEN_RATE":
+					return "1"
+				case "TUNNEL_OPEN_BURST":
+					return v
+				default:
+					return minimalServerEnv(key)
+				}
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of TUNNEL_OPEN_BURST=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 10000") {
+				t.Fatalf("unexpected error for TUNNEL_OPEN_BURST=%q: %v", v, err)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigRejectsTooLargeExpiryGrace(t *testing.T) {
+	cases := []string{"1h1s", "2h"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{"--expiry-grace", v}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --expiry-grace=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 1h0m0s") {
+				t.Fatalf("unexpected error for --expiry-grace=%q: %v", v, err)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				if key == "EXPIRY_GRACE" {
+					return v
+				}
+				return minimalServerEnv(key)
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of EXPIRY_GRACE=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 1h0m0s") {
+				t.Fatalf("unexpected error for EXPIRY_GRACE=%q: %v", v, err)
+			}
+		})
 	}
 }
 
@@ -694,6 +1168,8 @@ func TestParseServerConfigACMEDomainFromFlag(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -721,6 +1197,8 @@ func TestParseServerConfigACMEDomainFromEnv(t *testing.T) {
 			return "authunnel-server"
 		case "ACME_DOMAINS":
 			return "authunnel.example.com, www.example.com"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -744,6 +1222,8 @@ func TestParseServerConfigACMEFlagAndEnvCombined(t *testing.T) {
 			return "authunnel-server"
 		case "ACME_DOMAINS":
 			return "env.example.com"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -767,6 +1247,8 @@ func TestParseServerConfigACMECacheDirOverride(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -788,6 +1270,8 @@ func TestParseServerConfigPlaintextMode(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -811,6 +1295,8 @@ func TestParseServerConfigPlaintextModeFromEnv(t *testing.T) {
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
 		case "PLAINTEXT_BEHIND_REVERSE_PROXY":
+			return "true"
+		case "ALLOW_OPEN_EGRESS":
 			return "true"
 		default:
 			return ""
@@ -836,6 +1322,8 @@ func TestParseServerConfigACMEDomainsEnvFiltersEmptyEntries(t *testing.T) {
 			return "authunnel-server"
 		case "ACME_DOMAINS":
 			return "authunnel.example.com, , ,other.example.com,"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -882,6 +1370,8 @@ func TestParseServerConfigListenAddrOverridesACMEDefault(t *testing.T) {
 			return "https://issuer.example"
 		case "TOKEN_AUDIENCE":
 			return "authunnel-server"
+		case "ALLOW_OPEN_EGRESS":
+			return "true"
 		default:
 			return ""
 		}
@@ -942,7 +1432,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedProto(t *testing.T) {
 
 	// Simulate a browser WebSocket request forwarded by a TLS-terminating
 	// reverse proxy: Origin is https:// but the backend sees plain HTTP.
-	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -972,7 +1462,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedHost(t *testing.T) {
 
 	// Proxy rewrites Host to the backend address but sets X-Forwarded-Host
 	// and X-Forwarded-Proto to the external values.
-	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/tunnel", nil)
 	req.Host = "localhost:8080"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1002,7 +1492,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedProtoMultiProxy(t *testing
 
 	// Multi-proxy deployment: X-Forwarded-Proto is comma-separated; the
 	// leftmost entry is the original client-facing scheme.
-	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example.com/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example.com/protected/tunnel", nil)
 	req.Host = "authunnel.example.com"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1031,7 +1521,7 @@ func TestPlaintextModeAcceptsBrowserOriginViaForwardedHostMultiProxy(t *testing.
 
 	// Multi-proxy deployment: X-Forwarded-Host is comma-separated; the
 	// leftmost entry is the original client-facing host.
-	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/tunnel", nil)
 	req.Host = "localhost:8080"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1055,7 +1545,7 @@ func TestPlaintextModeIgnoresForwardedHostWhenNotEnabled(t *testing.T) {
 	}
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/protected/tunnel", nil)
 	req.Host = "localhost:8080"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1083,7 +1573,7 @@ func TestPlaintextModeIgnoresForwardedProtoWhenNotEnabled(t *testing.T) {
 	// Default handler: TrustForwardedProto not set.
 	handler := tunnelserver.NewHandler(staticSuccessValidator{}, socks)
 
-	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/socks", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://authunnel.example/protected/tunnel", nil)
 	req.Host = "authunnel.example"
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -1108,6 +1598,8 @@ func minimalACMElessEnv(key string) string {
 		return "https://issuer.example"
 	case "TOKEN_AUDIENCE":
 		return "authunnel-server"
+	case "ALLOW_OPEN_EGRESS":
+		return "true"
 	default:
 		return ""
 	}
@@ -1154,6 +1646,12 @@ func TestParseServerConfigRejectsNegativeDurations(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected error for negative duration, got nil")
 			}
+			if tt.envKey == "EXPIRY_GRACE" || tt.flag == "--expiry-grace" {
+				if !strings.Contains(err.Error(), "must be between 0 and 1h0m0s") {
+					t.Fatalf("expected expiry-grace bounds error, got: %v", err)
+				}
+				return
+			}
 			if !strings.Contains(err.Error(), "negative") {
 				t.Fatalf("expected error mentioning 'negative', got: %v", err)
 			}
@@ -1198,7 +1696,7 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 		t.Fatalf("create socks server: %v", err)
 	}
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				MaxDuration:      200 * time.Millisecond,
@@ -1212,7 +1710,7 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
 	// Dial the WebSocket tunnel.
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
@@ -1317,7 +1815,7 @@ func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				MaxDuration:      2 * time.Second,
@@ -1329,7 +1827,7 @@ func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
@@ -1447,7 +1945,7 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
@@ -1458,7 +1956,7 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
@@ -1562,7 +2060,7 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
@@ -1574,7 +2072,7 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
 	// Dial the WebSocket tunnel with the short-lived initial token.
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + initialToken}},
@@ -1718,7 +2216,7 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 
 	// Key: ExpiryGrace is set, and ExpiryWarning > ExpiryGrace (the
 	// scenario that triggered the reviewer concern).
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
@@ -1730,7 +2228,7 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
 		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/socks"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
 	wsConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + initialToken}},

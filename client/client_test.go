@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -467,5 +468,67 @@ func TestHandleControlMessagesIgnoresNonTokenWarning(t *testing.T) {
 		t.Fatalf("unexpected control message from client: %+v", msg)
 	default:
 		// Good — no token_refresh was sent.
+	}
+}
+
+// TestDialTunnel_SurfacesAdmissionRejection verifies the client turns a
+// server-side 429 with Retry-After into a typed error whose message names
+// the rate-limit category and includes the retry hint. Without this the
+// operator would see a generic "websocket dial failed" on perfectly
+// recoverable admission denials.
+func TestDialTunnel_SurfacesAdmissionRejection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "15")
+		http.Error(w, "tunnel-open rate limit exceeded", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	cfg := clientConfig{TunnelURL: "ws" + strings.TrimPrefix(srv.URL, "http")}
+	_, _, err := dialTunnel(context.Background(), cfg, "token")
+	if err == nil {
+		t.Fatalf("expected error on 429 upgrade")
+	}
+
+	var dialErr *tunnelDialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("error should wrap *tunnelDialError, got %T: %v", err, err)
+	}
+	if dialErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status code: got %d want 429", dialErr.StatusCode)
+	}
+	if dialErr.RetryAfter != "15" {
+		t.Fatalf("retry-after: got %q want %q", dialErr.RetryAfter, "15")
+	}
+	if !strings.Contains(err.Error(), "rate-limited") {
+		t.Fatalf("error message should mention rate-limiting: %v", err)
+	}
+	if !strings.Contains(err.Error(), "15") {
+		t.Fatalf("error message should include retry-after: %v", err)
+	}
+}
+
+// TestDialTunnel_SurfacesCapacityRejection covers the 503 case alongside
+// 429 — both need to be distinguishable from auth failures.
+func TestDialTunnel_SurfacesCapacityRejection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "server at tunnel capacity", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	cfg := clientConfig{TunnelURL: "ws" + strings.TrimPrefix(srv.URL, "http")}
+	_, _, err := dialTunnel(context.Background(), cfg, "token")
+	if err == nil {
+		t.Fatalf("expected error on 503 upgrade")
+	}
+	var dialErr *tunnelDialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("error should wrap *tunnelDialError, got %T", err)
+	}
+	if dialErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status code: got %d want 503", dialErr.StatusCode)
+	}
+	if !strings.Contains(err.Error(), "capacity") {
+		t.Fatalf("error message should mention capacity: %v", err)
 	}
 }
