@@ -346,10 +346,17 @@ README [README.md](README.md) documents the new failure mode and points operator
 
 Intentionally deferred / out of scope: sticky-bit "allow if owned by me" exception (the plan explicitly flags it as requiring review, and the subdirectory pattern is already documented); POSIX-style ACL inspection on Windows (the default `%AppData%` path is already user-scoped by the OS).
 
-### Task F: Documentation cleanup
+### Task F: Documentation cleanup ✓ done
 
 - Reconcile README with final merged behavior.
 - Add a hardening checklist and migration notes.
+
+Implemented in [README.md](README.md):
+
+- "Security Posture" restructured into three explicit subsections: *Required guarantees* (unconditional enforcement: JWT fields, subject pinning, refresh deadline, secure transport, explicit egress posture), *Operator-controlled* (allowlist vs open-egress, connection longevity, admission limits), and *Known non-goals* (live revocation, tunnel-chain observability, architecture redesign).
+- "Deployment Hardening Checklist" section added with eight pre-production checks covering insecure flags (`--insecure-oidc-issuer`, `--insecure-tunnel-url`, `--no-connection-token-expiry`), egress posture, connection ceiling, admission limits, dial timeout, unix-socket path placement, and reverse-proxy exposure.
+- "Testing" section bullet list updated to reflect coverage added in Tasks A–E: transport hardening, token validation, admission controls, egress posture startup, and filesystem safety.
+- "Versioning" section added noting that Authunnel follows SemVer and a new major version may introduce breaking changes to flags or the wire protocol.
 
 ## Test Expectations
 
