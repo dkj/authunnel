@@ -12,7 +12,7 @@ Authunnel is a lightweight, purpose-built tool that fills these gaps. It tunnels
 
 ## What Authunnel Is
 
-Authunnel is an authenticated tunnel for reaching internal SSH services. Users run `ssh` as normal; the Authunnel client, configured as an SSH `ProxyCommand`, transparently handles Okta login via the browser and establishes an encrypted WebSocket tunnel to the server. The server acts as an OAuth2 resource server — it validates the Okta-issued JWT access token (signature, issuer, expiry, audience) and proxies the SSH connection to the requested internal host. Tunnel lifetime is bound to the access token's expiry by default: when the token expires the tunnel closes, unless the client refreshes the token (typically silently) while the tunnel is still alive. The entire system is a single Go binary with no database, no external state, and no licence fees.
+Authunnel is an authenticated tunnel for reaching internal SSH services. Users run `ssh` as normal; the Authunnel client, configured as an SSH `ProxyCommand`, transparently handles Okta login via the browser and establishes an encrypted WebSocket tunnel to the server. The server acts as an OAuth2 resource server — it validates the Okta-issued JWT access token (signature, issuer, expiry, audience, subject presence, `iat` sanity, `nbf`) and proxies the SSH connection to the requested internal host. Tunnel lifetime is bound to the access token's expiry by default: when the token expires the tunnel closes, unless the client refreshes the token (typically silently) while the tunnel is still alive. The entire system is a single Go binary with no database, no external state, and no licence fees.
 
 ## Why Authunnel
 
@@ -22,11 +22,12 @@ Authunnel is an authenticated tunnel for reaching internal SSH services. Users r
 
 3. **Can run behind Ivanti Traffic Manager (vTM).** Authunnel can run in plaintext mode behind a TLS-terminating reverse proxy, benefiting from the team's existing knowledge and experience of Ivanti as an external interface. Ivanti handles TLS certificates and termination as it already does for other services. No new TLS infrastructure is needed.
 
-4. **Minimal attack surface.** The entire codebase is approximately 2,000 lines of Go (excluding tests). A security reviewer can read it in full in an afternoon. On Linux, the server drops all capabilities and sets `PR_SET_NO_NEW_PRIVS` after binding ports, limiting the impact of any future vulnerability.
+4. **Minimal attack surface.** The entire codebase is approximately 3,400 lines of Go source (excluding tests, comments, and blanks). A security reviewer can read it in full over a day or two. On Linux, the server drops all capabilities and sets `PR_SET_NO_NEW_PRIVS` after binding ports, limiting the impact of any future vulnerability. The OIDC issuer and tunnel URLs must use HTTPS (plain HTTP is rejected at startup). The client validates ownership and permissions on its token-cache and unix-socket directories before use — important for shared hosts such as HPC login nodes.
 
 5. **Scoped access at multiple levels.** Access can be restricted at several independent layers, each enforced by a different part of the infrastructure:
-   - **Application layer:** The `--allow` option restricts which destinations authenticated users can reach, using host glob patterns and CIDR rules (e.g. `*.internal:22`, `10.0.0.0/8:22`).
-   - **Network layer:** VMware or OpenStack security groups on the server VM control both inbound access (who can reach the Authunnel server) and outbound access (which internal hosts the server can connect to).
+   - **Destination allowlist:** The `--allow` option restricts which destinations authenticated users can reach, using host glob patterns and CIDR rules (e.g. `*.internal:22`, `10.0.0.0/8:22`). Starting the server without either `--allow` rules or an explicit `--allow-open-egress` flag is rejected — the egress posture is never silently permissive.
+   - **Admission limits:** Per-user and global caps on concurrent tunnels, plus per-user open-rate limits, bound the impact of credential abuse or misbehaving clients.
+   - **Network layer:** VMware or OpenStack security groups on the server VM control both inbound access (only from the Ivanti VIP) and outbound access. The outbound allowlist must include the Okta OIDC endpoints (for discovery and JWKS), the centralised logging endpoints (ELK / Splunk), and the permitted internal SSH destinations — and nothing else.
 
    This is useful for granting access to specific services only, or for limiting exposure to the broader network.
 
@@ -39,6 +40,8 @@ Authunnel is an authenticated tunnel for reaching internal SSH services. Users r
 9. **Maintainable by design.** The codebase is deliberately kept small and simple. Any developer comfortable with Go should be able to understand and patch the code if required.
 
 10. **Horizontally scalable.** Server instances share no state. Multiple instances can run behind Ivanti load balancing for high availability. Scaling is simply adding another VM.
+
+11. **Admission controls against abuse.** The server supports optional global and per-user caps on concurrent tunnels, a per-user tunnel-open rate limit with burst, and a bounded dial timeout for outbound SOCKS CONNECT. Over-limit requests receive `429`/`503` with `Retry-After`. This bounds the blast radius of a compromised credential or a misbehaving client without requiring an external rate-limiting layer.
 
 ## Deployment Architecture
 
@@ -55,7 +58,7 @@ ssh internal-host
 **Components:**
 
 - **Ivanti Traffic Manager** — TLS termination at `st.sanger.ac.uk:443`, forwarding to the backend VM on port 8080. Configured to accept HTTPS only — any plain HTTP listener should either be absent or redirect to HTTPS; it must never accept plaintext client traffic. Requires WebSocket upgrade pass-through and setting `X-Forwarded-Proto` and `X-Forwarded-Host` headers on forwarded requests.
-- **Server VM** (VMware or OpenStack) — a single small Linux VM running the authunnel-server binary, managed by systemd. No database, no disk state beyond the binary and a configuration file. Security groups restrict both inbound access (to the Ivanti VIP) and outbound access (to permitted internal hosts only).
+- **Server VM** (VMware or OpenStack) — a single small Linux VM running the authunnel-server binary, managed by systemd. No database, no disk state beyond the binary and a configuration file. Security groups restrict inbound access (only from the Ivanti VIP) and outbound access (only to Okta OIDC endpoints, centralised logging endpoints, and the permitted internal SSH destinations).
 - **Okta** — one public OIDC client registration (for the CLI tool) and one audience/resource entry (for token scoping to `authunnel-server`).
 - **DNS** — `st.sanger.ac.uk` pointing at the Ivanti VIP.
 
@@ -68,12 +71,14 @@ PLAINTEXT_BEHIND_REVERSE_PROXY=true
 ALLOW_RULES='*.internal.sanger.ac.uk:22'
 ```
 
+Initial deployment would limit egress to `*.internal.sanger.ac.uk:22`, or a tightly monitored subset. The server refuses to start without either one or more `--allow` rules or an explicit `--allow-open-egress` flag, so the egress posture is always a deliberate operator choice.
+
 **Client configuration** is an SSH config entry:
 
 ```sshconfig
 Host *.internal.sanger.ac.uk
   ProxyCommand authunnel-client \
-    --ws-url https://st.sanger.ac.uk/protected/socks \
+    --tunnel-url https://st.sanger.ac.uk/protected/tunnel \
     --oidc-issuer https://<okta-issuer-url> \
     --oidc-client-id authunnel-cli \
     --oidc-audience authunnel-server \
@@ -97,6 +102,8 @@ Host *.internal.sanger.ac.uk
 | Security review of codebase and deployment architecture | Security team | See below |
 | Client binary distribution + SSH config docs | Authunnel maintainer | Documentation task |
 
+The repository's [Deployment Hardening Checklist](https://github.com/dkj/authunnel/blob/main/README.md#deployment-hardening-checklist) provides a concrete pre-production checklist (HTTPS enforcement, egress posture, admission limits, dial timeout, socket hygiene, reverse-proxy header handling, etc.) that the infrastructure and security teams can work against directly.
+
 ## Logging & Observability
 
 Authunnel emits structured JSON logs to stderr via Go's `slog.JSONHandler`. Every log line is a self-contained JSON object. Systemd captures stderr by default, so logs are available in the journal immediately.
@@ -112,6 +119,7 @@ Authunnel emits structured JSON logs to stderr via Go's `slog.JSONHandler`. Ever
 | Token refresh accepted | info | `tunnel_id`, `new_expiry`, plus identity fields |
 | Token refresh rejected | warn | `tunnel_id`, reason (signature / subject mismatch / expiry reduced), plus identity fields |
 | Tunnel closed on token expiry | info | `tunnel_id`, plus identity fields |
+| Admission denied | warn | `reason` (`global`, `per_user`, or `rate`), `remote_ip`, `request_id`, plus identity fields |
 | SOCKS destination | debug | `target_host`, `target_port`, plus tunnel and identity fields |
 | Connection denied | warn | `target_host`, `target_port`, plus tunnel and identity fields |
 | Auth failure | warn | `remote_ip`, `request_id`, error detail |
@@ -150,7 +158,7 @@ Setting `--log-level debug` enables per-connection destination logging, providin
 | WebSocket blocked by network policy | Authunnel uses standard HTTPS on port 443 with a WebSocket upgrade — the same mechanism used by most modern web applications. Ivanti already handles WebSocket traffic. |
 | Okta outage prevents new logins or token refresh | Existing tunnels continue until the current access token expires (typically an hour or less, depending on Okta policy). New logins and token refreshes require live Okta connectivity. This is a deliberate trade-off — tying tunnel lifetime to token expiry is what makes offboarding prompt. |
 | Single server is a single point of failure | Server instances are stateless. Run two or more behind Ivanti load balancing for high availability. |
-| Maintainability over time | The codebase is ~2,000 lines of Go with an explicit design goal of auditability. It has significantly lower maintenance burden than a full platform like Teleport. |
+| Maintainability over time | The codebase is ~3,400 lines of Go source (excluding tests, comments, and blanks) with an explicit design goal of auditability. It has significantly lower maintenance burden than a full platform like Teleport. |
 | Security of non-Sanger client machines | Authunnel does not trust the client machine. It provides only a tunnel — the SSH host still requires its own authentication (keys, certificates, etc.). Allow rules and VM security groups independently limit which destinations a tunnel can reach. |
 
 ## Scope & Limitations
@@ -161,13 +169,16 @@ Authunnel's current functionality is SSH tunnelling. It does not provide the add
 
 We would like the security team to consider reviewing the deployment architecture and the code with the prospect of a production rollout. A non-exhaustive list where their input would be valuable:
 
-- **Authentication model** — the server validates JWT access tokens locally via OIDC discovery and JWKS. Is the token validation (signature, issuer, expiry, audience) sufficient? 
-- **Network architecture** — the server runs behind Ivanti with security groups restricting inbound and outbound traffic. Are the proposed security group rules and allow rules appropriate?
-- **Capability dropping** — on Linux, the server drops all capabilities and sets `PR_SET_NO_NEW_PRIVS` after binding ports. Is this hardening adequate for the deployment environment?
+- **Authentication model** — the server validates JWT access tokens locally via OIDC discovery and JWKS, checking signature, issuer, expiry, audience, subject presence, `iat` sanity, and `nbf` (with a 30s clock-skew tolerance at admission). Tunnel lifetime is bound to token expiry, with optional client-driven refresh over a control channel. Are these choices appropriate for the deployment environment, and are the refresh rules (pin to original subject, refuse refresh that reduces expiry) the right ones?
+- **Egress posture** — the server refuses to start without either one or more `--allow` rules or an explicit `--allow-open-egress` flag. The initial deployment would use `*.internal.sanger.ac.uk:22` (or a tightly monitored subset). Is this adequate as a default policy, and what additional rules or review cadence should apply before widening the allowlist?
+- **Admission controls** — the server supports global and per-user concurrent-tunnel caps, a per-user rate limit with burst, and a bounded dial timeout. Are the proposed limits and defaults appropriate for abuse resistance?
+- **Network architecture** — the server runs behind Ivanti with security groups restricting inbound and outbound traffic. Are the proposed security group rules appropriate?
+- **Capability dropping** — on Linux, the server drops all capabilities and sets `PR_SET_NO_NEW_PRIVS` after binding ports. Is this hardening adequate?
+- **Client-side hardening** — the client validates ownership and permissions on its token-cache and unix-socket parent directories. Is this adequate for the shared hosts where the client is expected to run?
 - **Logging and monitoring** — are the logged fields sufficient for incident response and audit purposes? Are there additional events or fields the security team would want to see?
 - **Threat model** — what residual risks does the security team see with an authenticated WebSocket tunnel to internal SSH hosts, how do these compare with the existing Teleport provision, and what additional controls (if any) would they recommend?
 
-The [codebase is open](https://github.com/dkj/authunnel/blob/main/README.md) and so avialable for review now. Given its size (~2,000 lines of Go excluding tests), a full read-through is realistic within a single session.
+The [codebase is open](https://github.com/dkj/authunnel/blob/main/README.md) and so available for review now. Given its size (~3,400 lines of Go source, excluding tests, comments, and blanks), a full read-through is realistic within a day or two.
 
 ## Proposed Rollout
 
