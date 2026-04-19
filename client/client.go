@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -54,11 +55,14 @@ type clientConfig struct {
 	OIDCNoBrowser    bool
 	OIDCRedirectPort int
 
-	WebSocketURL     string
+	TunnelURL        string
 	UnixSocketPath   string
 	ProxyCommandMode bool
 	TargetHost       string
 	TargetPort       int
+
+	InsecureOIDCIssuer bool
+	InsecureTunnelURL  bool
 
 	HTTPClient     *http.Client
 	AuthHTTPClient *http.Client
@@ -93,14 +97,21 @@ Choose one authentication method (mutually exclusive):
     --access-token <token>       Bearer token passed as a flag
     ACCESS_TOKEN                 Bearer token via environment variable
 
-Connection:
+Connection (one of these is required):
 
-  --ws-url <url>               WebSocket tunnel endpoint URL
-                               (default: https://localhost:8443/protected/socks)
+  --tunnel-url <url>           Tunnel endpoint URL. Secure schemes: https:// or
+                               wss://. Plaintext http:// or ws:// requires
+                               --insecure-tunnel-url
+  AUTHUNNEL_TUNNEL_URL         Same, via environment variable (flag takes precedence)
 
 Other:
 
   version, --version           Print version and exit
+
+Development / unsafe overrides (do not use in production):
+
+  --insecure-oidc-issuer       Allow a non-HTTPS OIDC issuer URL
+  --insecure-tunnel-url        Allow a non-HTTPS tunnel endpoint URL
 `)
 }
 
@@ -161,7 +172,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	var showVersion bool
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.AccessToken, "access-token", cfg.AccessToken, "Bearer token for manual authentication (not recommended; prefer OIDC or ACCESS_TOKEN env var)")
-	fs.StringVar(&cfg.WebSocketURL, "ws-url", "https://localhost:8443/protected/socks", "WebSocket URL for the authenticated socks tunnel endpoint")
+	fs.StringVar(&cfg.TunnelURL, "tunnel-url", getenv("AUTHUNNEL_TUNNEL_URL"), "Tunnel endpoint URL. Secure schemes: https:// or wss://. Plaintext http:// or ws:// requires --insecure-tunnel-url. Falls back to AUTHUNNEL_TUNNEL_URL.")
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
@@ -171,6 +182,8 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
 	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
 	fs.IntVar(&cfg.OIDCRedirectPort, "oidc-redirect-port", 0, "Loopback port for the OIDC callback listener; 0 chooses a random port")
+	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", false, "Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
+	fs.BoolVar(&cfg.InsecureTunnelURL, "insecure-tunnel-url", false, "Allow a non-HTTPS tunnel endpoint URL (development only; do not use in production)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			clientUsage(os.Stdout)
@@ -223,6 +236,36 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 		}
 	}
 
+	if cfg.TunnelURL == "" {
+		return cfg, errors.New("tunnel endpoint URL is required: pass --tunnel-url or set AUTHUNNEL_TUNNEL_URL")
+	}
+	tunnelU, err := url.Parse(cfg.TunnelURL)
+	if err != nil || tunnelU.Host == "" {
+		return cfg, fmt.Errorf("--tunnel-url %q is not a valid URL", cfg.TunnelURL)
+	}
+	// github.com/coder/websocket accepts ws/wss and rewrites them to
+	// http/https for the authenticated upgrade request, so all four schemes
+	// are usable here. Secure schemes (https/wss) are allowed by default;
+	// plaintext schemes (http/ws) require the explicit insecure override.
+	switch tunnelU.Scheme {
+	case "https", "wss":
+	case "http", "ws":
+		if !cfg.InsecureTunnelURL {
+			return cfg, errors.New("--tunnel-url must use a secure scheme (https:// or wss://); use --insecure-tunnel-url to allow plaintext http:// or ws:// (development only)")
+		}
+	default:
+		return cfg, errors.New("--tunnel-url must use one of https://, wss://, http://, or ws://")
+	}
+	if cfg.OIDCIssuer != "" {
+		issuerU, err := url.Parse(cfg.OIDCIssuer)
+		if err != nil || issuerU.Host == "" {
+			return cfg, fmt.Errorf("--oidc-issuer %q is not a valid URL", cfg.OIDCIssuer)
+		}
+		if issuerU.Scheme != "https" && !cfg.InsecureOIDCIssuer {
+			return cfg, errors.New("--oidc-issuer must use an https:// URL; use --insecure-oidc-issuer to allow plaintext (development only)")
+		}
+	}
+
 	if cfg.ProxyCommandMode {
 		positional := fs.Args()
 		if len(positional) != 2 {
@@ -246,16 +289,28 @@ func runUnixSocketMode(ctx context.Context, cfg clientConfig, source authTokenSo
 		return err
 	}
 
-	if err := os.Remove(cfg.UnixSocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to remove stale socket %q: %w", cfg.UnixSocketPath, err)
+	if err := safelyRemoveExistingSocket(cfg.UnixSocketPath); err != nil {
+		return err
 	}
 
-	proxyListen, err := net.Listen("unix", cfg.UnixSocketPath)
-	if err != nil {
+	var proxyListen net.Listener
+	// umask 0o077 ensures the socket inode is created with owner-only
+	// permissions in the first place, closing the window in which another
+	// local user could have connected between bind and the follow-up Chmod.
+	if err := withUmask(0o077, func() error {
+		listener, listenErr := net.Listen("unix", cfg.UnixSocketPath)
+		if listenErr != nil {
+			return listenErr
+		}
+		proxyListen = listener
+		return nil
+	}); err != nil {
 		return fmt.Errorf("unix socket listen problem: %w", err)
 	}
 	defer proxyListen.Close()
 	defer os.Remove(cfg.UnixSocketPath)
+	// Belt-and-braces tightening for platforms/filesystems that do not honour
+	// umask on AF_UNIX bind.
 	if err := tightenUnixSocketPermissions(cfg.UnixSocketPath); err != nil {
 		return err
 	}
@@ -276,24 +331,13 @@ func runUnixSocketMode(ctx context.Context, cfg clientConfig, source authTokenSo
 }
 
 func ensureUnixSocketDir(unixSocketPath string) error {
-	dir := filepath.Dir(unixSocketPath)
-	if dir == "." {
-		return nil
-	}
-	_, err := os.Stat(dir)
-	switch {
-	case err == nil:
-		return nil
-	case !errors.Is(err, os.ErrNotExist):
-		return fmt.Errorf("stat directory for socket %q: %w", unixSocketPath, err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("failed to create directory for socket %q: %w", unixSocketPath, err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("failed to set directory permissions for socket %q: %w", unixSocketPath, err)
-	}
-	return nil
+	// A bare filename resolves to "." — the current working directory.
+	// ensurePrivateDir canonicalises via filepath.Abs + EvalSymlinks before
+	// validating, so the cwd is subject to the same ancestor/ownership
+	// rules as any explicit path. We intentionally do not exempt it: binding
+	// a socket under a shared cwd (e.g. /tmp) is exactly the attack we're
+	// defending against.
+	return ensurePrivateDir(filepath.Dir(unixSocketPath))
 }
 
 func tightenUnixSocketPermissions(unixSocketPath string) error {
@@ -372,7 +416,60 @@ func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket
 	if cfg.HTTPClient != nil {
 		options.HTTPClient = cfg.HTTPClient
 	}
-	return websocket.Dial(ctx, cfg.WebSocketURL, options)
+	conn, resp, err := websocket.Dial(ctx, cfg.TunnelURL, options)
+	if err != nil && resp != nil {
+		// The server rejected the upgrade with a real HTTP response. The
+		// coder/websocket error wraps the body snippet but does not expose
+		// the status code or headers, so decorate the error here with the
+		// information operators need to distinguish 401 (auth) from 429/503
+		// (admission limits) and to honour Retry-After manually.
+		return conn, resp, &tunnelDialError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: resp.Header.Get("Retry-After"),
+			Err:        err,
+		}
+	}
+	return conn, resp, err
+}
+
+// tunnelDialError augments a websocket dial failure with the server's HTTP
+// status and Retry-After header so the CLI can print a message that tells
+// the operator what went wrong and whether to retry.
+type tunnelDialError struct {
+	StatusCode int
+	RetryAfter string
+	Err        error
+}
+
+func (e *tunnelDialError) Error() string {
+	msg := e.categoryMessage()
+	if e.RetryAfter != "" && (e.StatusCode == http.StatusTooManyRequests || e.StatusCode == http.StatusServiceUnavailable) {
+		return fmt.Sprintf("%s (retry after %s)", msg, e.RetryAfter)
+	}
+	return msg
+}
+
+func (e *tunnelDialError) Unwrap() error { return e.Err }
+
+func (e *tunnelDialError) categoryMessage() string {
+	switch e.StatusCode {
+	case http.StatusUnauthorized:
+		return "tunnel authentication rejected"
+	case http.StatusForbidden:
+		return "tunnel authorization rejected"
+	case http.StatusTooManyRequests:
+		return "tunnel rate-limited by server"
+	case http.StatusServiceUnavailable:
+		return "tunnel server at capacity"
+	default:
+		// Unhandled status: preserve the underlying coder/websocket message
+		// (which carries the server's body snippet) so operators debugging an
+		// unexpected upgrade failure do not lose diagnostic detail.
+		if e.Err != nil {
+			return fmt.Sprintf("tunnel dial rejected with HTTP %d: %v", e.StatusCode, e.Err)
+		}
+		return fmt.Sprintf("tunnel dial rejected with HTTP %d", e.StatusCode)
+	}
 }
 
 // handleControlMessages reads from the MultiplexConn's control channel and

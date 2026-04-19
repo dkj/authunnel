@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -43,7 +44,7 @@ func TestManagedOIDCProxyCommandE2EWithAudienceAndRedirectPort(t *testing.T) {
 		OIDCScopes:       normalizeScopes("openid"),
 		OIDCCache:        filepathForTest(t, "tokens.json"),
 		OIDCRedirectPort: redirectPort,
-		WebSocketURL:     server.URL + "/protected/socks",
+		TunnelURL:        server.URL + "/protected/tunnel",
 		ProxyCommandMode: true,
 		TargetHost:       "127.0.0.1",
 		TargetPort:       targetListener.Addr().(*net.TCPAddr).Port,
@@ -139,7 +140,7 @@ func TestManagedOIDCProxyCommandE2ERejectsWrongAudience(t *testing.T) {
 		OIDCScopes:       normalizeScopes("openid"),
 		OIDCCache:        filepathForTest(t, "tokens.json"),
 		OIDCRedirectPort: freeLoopbackPortForTest(t),
-		WebSocketURL:     server.URL + "/protected/socks",
+		TunnelURL:        server.URL + "/protected/tunnel",
 		ProxyCommandMode: true,
 		TargetHost:       "127.0.0.1",
 		TargetPort:       targetListener.Addr().(*net.TCPAddr).Port,
@@ -176,6 +177,90 @@ func TestManagedOIDCProxyCommandE2ERejectsWrongAudience(t *testing.T) {
 		}
 		t.Fatalf("target should not receive a connection when audience validation fails")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestE2E_GlobalTunnelCapRejects boots the full OIDC → tunnel server path
+// with GlobalMax=1 and checks a real client dial is rejected with HTTP 503
+// and a Retry-After hint while a first tunnel is still active.
+func TestE2E_GlobalTunnelCapRejects(t *testing.T) {
+	provider := newJWTBackedOIDCProvider(t, "default-audience")
+	admitter := tunnelserver.NewAdmitter(tunnelserver.AdmissionConfig{GlobalMax: 1})
+	server, wsHTTPClient := newJWTValidatedTunnelServer(t, provider.issuer(), "authunnel-server", provider.server.Client(),
+		tunnelserver.HandlerOptions{Admission: admitter},
+	)
+
+	tunnelURL := "wss" + strings.TrimPrefix(server.URL, "https") + "/protected/tunnel"
+	token, err := provider.signAccessToken(provider.issuer(), "authunnel-server")
+	if err != nil {
+		t.Fatalf("sign access token: %v", err)
+	}
+	cfg := clientConfig{TunnelURL: tunnelURL, HTTPClient: wsHTTPClient}
+
+	// First dial holds the single global slot until the test ends.
+	firstCtx, cancelFirst := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFirst()
+	wsFirst, _, err := dialTunnel(firstCtx, cfg, token)
+	if err != nil {
+		t.Fatalf("first dial should succeed: %v", err)
+	}
+	defer wsFirst.CloseNow()
+
+	// Second dial races into the global cap and must be rejected.
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSecond()
+	_, _, err = dialTunnel(secondCtx, cfg, token)
+	if err == nil {
+		t.Fatalf("second dial must be rejected while first is active")
+	}
+	var dialErr *tunnelDialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("error should wrap *tunnelDialError, got %T: %v", err, err)
+	}
+	if dialErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", dialErr.StatusCode)
+	}
+	if dialErr.RetryAfter == "" {
+		t.Fatalf("expected Retry-After to be set")
+	}
+}
+
+// TestE2E_PerUserTunnelCapRejects validates that the per-subject cap fires
+// with HTTP 429 when the same user opens more tunnels than permitted.
+func TestE2E_PerUserTunnelCapRejects(t *testing.T) {
+	provider := newJWTBackedOIDCProvider(t, "default-audience")
+	admitter := tunnelserver.NewAdmitter(tunnelserver.AdmissionConfig{PerUserMax: 1})
+	server, wsHTTPClient := newJWTValidatedTunnelServer(t, provider.issuer(), "authunnel-server", provider.server.Client(),
+		tunnelserver.HandlerOptions{Admission: admitter},
+	)
+
+	tunnelURL := "wss" + strings.TrimPrefix(server.URL, "https") + "/protected/tunnel"
+	token, err := provider.signAccessToken(provider.issuer(), "authunnel-server")
+	if err != nil {
+		t.Fatalf("sign access token: %v", err)
+	}
+	cfg := clientConfig{TunnelURL: tunnelURL, HTTPClient: wsHTTPClient}
+
+	firstCtx, cancelFirst := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFirst()
+	wsFirst, _, err := dialTunnel(firstCtx, cfg, token)
+	if err != nil {
+		t.Fatalf("first dial should succeed: %v", err)
+	}
+	defer wsFirst.CloseNow()
+
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSecond()
+	_, _, err = dialTunnel(secondCtx, cfg, token)
+	if err == nil {
+		t.Fatalf("second dial must be rejected by per-user cap")
+	}
+	var dialErr *tunnelDialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("error should wrap *tunnelDialError, got %T: %v", err, err)
+	}
+	if dialErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", dialErr.StatusCode)
 	}
 }
 
@@ -356,7 +441,7 @@ func (p *jwtBackedOIDCProvider) signAccessToken(issuer, audience string) (string
 	return jwt.Signed(signer).Claims(claims).Serialize()
 }
 
-func newJWTValidatedTunnelServer(t *testing.T, issuer, audience string, validatorHTTPClient *http.Client) (*httptest.Server, *http.Client) {
+func newJWTValidatedTunnelServer(t *testing.T, issuer, audience string, validatorHTTPClient *http.Client, opts ...tunnelserver.HandlerOptions) (*httptest.Server, *http.Client) {
 	t.Helper()
 
 	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, validatorHTTPClient)
@@ -367,7 +452,7 @@ func newJWTValidatedTunnelServer(t *testing.T, issuer, audience string, validato
 	if err != nil {
 		t.Fatalf("create SOCKS5 server: %v", err)
 	}
-	server := newIPv4TLSTestServer(t, tunnelserver.NewHandler(validator, socks))
+	server := newIPv4TLSTestServer(t, tunnelserver.NewHandler(validator, socks, opts...))
 	client := server.Client()
 	client.Timeout = 5 * time.Second
 	return server, client

@@ -9,19 +9,29 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/time/rate"
 
 	"authunnel/internal/security"
 	"authunnel/internal/tunnelserver"
 )
 
 var version = "dev"
+
+// maxTunnelOpenRate caps both TunnelOpenRate (float64) and TunnelOpenBurst (int)
+// within an auditable, operationally meaningful range and guarantees the
+// auto-derived burst (ceil(rate)) fits comfortably in int.
+const maxTunnelOpenRate = 10_000
+const maxExpiryGrace = time.Hour
 
 type serverConfig struct {
 	Issuer        string
@@ -35,13 +45,27 @@ type serverConfig struct {
 	ACMECacheDir string
 	// Plaintext mode (behind a TLS-terminating reverse proxy)
 	PlaintextBehindProxy bool
-	LogLevel      slog.Level
-	AllowRules    tunnelserver.Allowlist
+	// Development override: allow non-HTTPS OIDC issuer
+	InsecureOIDCIssuer bool
+	LogLevel           slog.Level
+	AllowRules         tunnelserver.Allowlist
+	// AllowOpenEgress is the explicit opt-in for running without an allowlist.
+	// Startup fails when both this flag and --allow rules are absent so the
+	// default posture is restrictive; operators who genuinely want full egress
+	// have to say so.
+	AllowOpenEgress bool
 	// Connection longevity
-	MaxConnectionDuration      time.Duration // hard max tunnel lifetime; 0 = unlimited
+	MaxConnectionDuration   time.Duration // hard max tunnel lifetime; 0 = unlimited
 	NoConnectionTokenExpiry bool          // when true, tunnel lifetime is NOT tied to access token expiry
-	ExpiryWarning              time.Duration // warning period before either limit
-	ExpiryGrace                time.Duration // grace period beyond token exp for cached-token providers
+	ExpiryWarning           time.Duration // warning period before either limit
+	ExpiryGrace             time.Duration // grace period beyond token exp for cached-token providers, max 1h
+
+	// Admission and resource limits
+	MaxConcurrentTunnels int           // global cap; 0 = unlimited
+	MaxTunnelsPerUser    int           // per-subject concurrent cap; 0 = unlimited
+	TunnelOpenRate       float64       // per-subject rate (tunnels/sec); 0 = disabled, max 10000
+	TunnelOpenBurst      int           // per-subject token-bucket burst; defaults to ceil(rate) when rate>0, max 10000
+	DialTimeout          time.Duration // per-outbound-dial timeout; default 10s
 }
 
 func serverUsage(w io.Writer) {
@@ -56,7 +80,10 @@ Flags and their environment variable equivalents:
   --allow <rule>             Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated).
                              Rule formats: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi.
                              IPv6 addresses must use bracketed notation, e.g. [::1]:22.
-                             With no rules, all connections are allowed.
+                             At least one --allow rule is required unless --allow-open-egress is set.
+  --allow-open-egress        Explicit opt-in for running with no allowlist; authenticated clients may CONNECT to any
+                             destination the server process can reach (env: ALLOW_OPEN_EGRESS=true). Mutually exclusive
+                             with --allow. Use only when the risk of arbitrary egress is acceptable for the deployment.
 
 TLS mode (choose exactly one):
 
@@ -82,11 +109,31 @@ Connection longevity:
                              Warning period before either longevity limit (env: EXPIRY_WARNING, default: 3m)
   --expiry-grace <duration>
                              Grace period beyond token exp for providers that cache access tokens; the
-                             connection deadline becomes exp + grace (env: EXPIRY_GRACE, default: 0)
+                             connection deadline becomes exp + grace (env: EXPIRY_GRACE, default: 0, max: 1h)
+
+Admission and resource limits:
+
+  --max-concurrent-tunnels <n>
+                             Maximum concurrent tunnels across all users (env: MAX_CONCURRENT_TUNNELS, default: 0 = unlimited).
+                             Over-capacity requests are rejected with HTTP 503 before the WebSocket upgrade.
+  --max-tunnels-per-user <n>
+                             Maximum concurrent tunnels per user, keyed on the token subject claim
+                             (env: MAX_TUNNELS_PER_USER, default: 0 = unlimited). Over-cap requests get HTTP 429.
+  --tunnel-open-rate <rate>
+                             Sustained tunnel-open rate per user, tunnels/second as a float
+                             (env: TUNNEL_OPEN_RATE, default: 0 = disabled, max: 10000). Rate-exceeding requests get HTTP 429.
+  --tunnel-open-burst <n>    Burst size for --tunnel-open-rate (env: TUNNEL_OPEN_BURST, default: ceil(rate), max: 10000)
+  --dial-timeout <duration>  Per-outbound-dial timeout (env: DIAL_TIMEOUT, default: 10s). Zero disables the
+                             timeout and lets authenticated users tie up goroutines on blackholed destinations;
+                             not recommended.
 
 Other:
 
   version, --version         Print version and exit
+
+Development / unsafe overrides (do not use in production):
+
+  --insecure-oidc-issuer     Allow a non-HTTPS OIDC issuer URL (env: INSECURE_OIDC_ISSUER=true)
 `)
 }
 
@@ -108,6 +155,17 @@ func main() {
 	}
 
 	logger.Info("server_starting", slog.String("version", version))
+	if cfg.AllowOpenEgress {
+		logger.Warn("egress_mode_open",
+			slog.String("mode", "open"),
+			slog.String("hint", "--allow-open-egress is set; authenticated clients may CONNECT to any destination reachable by the server"),
+		)
+	} else {
+		logger.Info("egress_mode_allowlist",
+			slog.String("mode", "allowlist"),
+			slog.Int("rules", len(cfg.AllowRules)),
+		)
+	}
 
 	if len(cfg.ACMEDomains) > 0 {
 		if err := checkACMECacheDir(cfg.ACMECacheDir); err != nil {
@@ -122,7 +180,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules),
+	admitter := tunnelserver.NewAdmitter(tunnelserver.AdmissionConfig{
+		GlobalMax:    cfg.MaxConcurrentTunnels,
+		PerUserMax:   cfg.MaxTunnelsPerUser,
+		PerUserRate:  rate.Limit(cfg.TunnelOpenRate),
+		PerUserBurst: cfg.TunnelOpenBurst,
+	})
+	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules, cfg.DialTimeout),
 		tunnelserver.HandlerOptions{
 			TrustForwardedProto: cfg.PlaintextBehindProxy,
 			Longevity: tunnelserver.LongevityConfig{
@@ -131,6 +195,7 @@ func main() {
 				ExpiryWarning:    cfg.ExpiryWarning,
 				ExpiryGrace:      cfg.ExpiryGrace,
 			},
+			Admission: admitter,
 		})
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -182,13 +247,14 @@ func main() {
 
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {
 	cfg := serverConfig{
-		Issuer:                     getenv("OIDC_ISSUER"),
-		TokenAudience:              getenv("TOKEN_AUDIENCE"),
-		TLSCertPath:                getenv("TLS_CERT_FILE"),
-		TLSKeyPath:                 getenv("TLS_KEY_FILE"),
-		ACMECacheDir:               "/var/cache/authunnel/acme",
-		LogLevel:                   slog.LevelInfo,
+		Issuer:        getenv("OIDC_ISSUER"),
+		TokenAudience: getenv("TOKEN_AUDIENCE"),
+		TLSCertPath:   getenv("TLS_CERT_FILE"),
+		TLSKeyPath:    getenv("TLS_KEY_FILE"),
+		ACMECacheDir:  "/var/cache/authunnel/acme",
+		LogLevel:      slog.LevelInfo,
 		ExpiryWarning: 3 * time.Minute,
+		DialTimeout:   10 * time.Second,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
@@ -198,6 +264,12 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 	if getenv("PLAINTEXT_BEHIND_REVERSE_PROXY") == "true" {
 		cfg.PlaintextBehindProxy = true
+	}
+	if getenv("INSECURE_OIDC_ISSUER") == "true" {
+		cfg.InsecureOIDCIssuer = true
+	}
+	if getenv("ALLOW_OPEN_EGRESS") == "true" {
+		cfg.AllowOpenEgress = true
 	}
 	if v := getenv("MAX_CONNECTION_DURATION"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -227,10 +299,63 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		if err != nil {
 			return cfg, fmt.Errorf("EXPIRY_GRACE: %w", err)
 		}
-		if d < 0 {
-			return cfg, fmt.Errorf("EXPIRY_GRACE: must not be negative")
+		if d < 0 || d > maxExpiryGrace {
+			return cfg, fmt.Errorf("EXPIRY_GRACE: must be between 0 and %s", maxExpiryGrace)
 		}
 		cfg.ExpiryGrace = d
+	}
+	if v := getenv("MAX_CONCURRENT_TUNNELS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("MAX_CONCURRENT_TUNNELS: %w", err)
+		}
+		if n < 0 {
+			return cfg, fmt.Errorf("MAX_CONCURRENT_TUNNELS: must not be negative")
+		}
+		cfg.MaxConcurrentTunnels = n
+	}
+	if v := getenv("MAX_TUNNELS_PER_USER"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("MAX_TUNNELS_PER_USER: %w", err)
+		}
+		if n < 0 {
+			return cfg, fmt.Errorf("MAX_TUNNELS_PER_USER: must not be negative")
+		}
+		cfg.MaxTunnelsPerUser = n
+	}
+	if v := getenv("TUNNEL_OPEN_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: %w", err)
+		}
+		// strconv.ParseFloat accepts NaN and ±Inf. Negative values are also not a
+		// meaningful operator policy. Reject all of those up front, and cap large
+		// finite values so auto-deriving ceil(rate) stays explicit and bounded.
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > maxTunnelOpenRate {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: must be a non-negative finite number not exceeding %d", maxTunnelOpenRate)
+		}
+		cfg.TunnelOpenRate = f
+	}
+	if v := getenv("TUNNEL_OPEN_BURST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_BURST: %w", err)
+		}
+		if n < 0 || n > maxTunnelOpenRate {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_BURST: must be between 0 and %d", maxTunnelOpenRate)
+		}
+		cfg.TunnelOpenBurst = n
+	}
+	if v := getenv("DIAL_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("DIAL_TIMEOUT: %w", err)
+		}
+		if d < 0 {
+			return cfg, fmt.Errorf("DIAL_TIMEOUT: must not be negative")
+		}
+		cfg.DialTimeout = d
 	}
 
 	envLogLevel := getenv("LOG_LEVEL")
@@ -259,6 +384,10 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	fs.StringVar(&cfg.ACMECacheDir, "acme-cache-dir", cfg.ACMECacheDir, "Directory to cache ACME certificates")
 	fs.BoolVar(&cfg.PlaintextBehindProxy, "plaintext-behind-reverse-proxy", cfg.PlaintextBehindProxy,
 		"Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks")
+	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", cfg.InsecureOIDCIssuer,
+		"Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
+	fs.BoolVar(&cfg.AllowOpenEgress, "allow-open-egress", cfg.AllowOpenEgress,
+		"Explicit opt-in for running without an allowlist; mutually exclusive with --allow")
 	fs.Func("listen-addr", "Listen address", func(value string) error {
 		cfg.ListenAddr = value
 		listenAddrFlagSet = true
@@ -272,7 +401,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		return nil
 	})
 	fs.Var(&tunnelserver.AllowlistFlag{Rules: &cfg.AllowRules}, "allow",
-		"Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated). Rule: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi. IPv6 requires bracketed notation e.g. [::1]:22. With no rules all connections are allowed.")
+		"Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated). Rule: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi. IPv6 requires bracketed notation e.g. [::1]:22. At least one rule is required unless --allow-open-egress is set.")
 	fs.Func("log-level", "Structured log level: debug, info, warn, or error", func(value string) error {
 		level, err := parseServerLogLevel(value)
 		if err != nil {
@@ -306,7 +435,62 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		cfg.ExpiryWarning = d
 		return nil
 	})
-	fs.Func("expiry-grace", "Grace period beyond token exp for providers that cache access tokens (default: 0)", func(value string) error {
+	fs.Func("expiry-grace", "Grace period beyond token exp for providers that cache access tokens (default: 0, max 1h)", func(value string) error {
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		if d < 0 || d > maxExpiryGrace {
+			return fmt.Errorf("must be between 0 and %s", maxExpiryGrace)
+		}
+		cfg.ExpiryGrace = d
+		return nil
+	})
+	fs.Func("max-concurrent-tunnels", "Maximum concurrent tunnels across all users; 0 = unlimited", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if n < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.MaxConcurrentTunnels = n
+		return nil
+	})
+	fs.Func("max-tunnels-per-user", "Maximum concurrent tunnels per user (subject); 0 = unlimited", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if n < 0 {
+			return fmt.Errorf("must not be negative")
+		}
+		cfg.MaxTunnelsPerUser = n
+		return nil
+	})
+	fs.Func("tunnel-open-rate", "Sustained tunnel-open rate per user in tunnels/second; 0 = disabled, max 10000", func(value string) error {
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > maxTunnelOpenRate {
+			return fmt.Errorf("must be a non-negative finite number not exceeding %d", maxTunnelOpenRate)
+		}
+		cfg.TunnelOpenRate = f
+		return nil
+	})
+	fs.Func("tunnel-open-burst", "Burst size for --tunnel-open-rate; defaults to ceil(rate) when rate > 0, max 10000", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if n < 0 || n > maxTunnelOpenRate {
+			return fmt.Errorf("must be between 0 and %d", maxTunnelOpenRate)
+		}
+		cfg.TunnelOpenBurst = n
+		return nil
+	})
+	fs.Func("dial-timeout", "Per-outbound-dial timeout, e.g. 10s; 0 = unlimited (not recommended)", func(value string) error {
 		d, err := time.ParseDuration(value)
 		if err != nil {
 			return err
@@ -314,7 +498,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		if d < 0 {
 			return fmt.Errorf("must not be negative")
 		}
-		cfg.ExpiryGrace = d
+		cfg.DialTimeout = d
 		return nil
 	})
 	if err := fs.Parse(args); err != nil {
@@ -372,6 +556,13 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	if cfg.Issuer == "" {
 		return cfg, errors.New("--oidc-issuer or OIDC_ISSUER is required")
 	}
+	issuerU, err := url.Parse(cfg.Issuer)
+	if err != nil || issuerU.Host == "" {
+		return cfg, fmt.Errorf("--oidc-issuer %q is not a valid URL", cfg.Issuer)
+	}
+	if issuerU.Scheme != "https" && !cfg.InsecureOIDCIssuer {
+		return cfg, errors.New("--oidc-issuer must use an https:// URL; use --insecure-oidc-issuer or INSECURE_OIDC_ISSUER=true to allow plaintext (development only)")
+	}
 	if cfg.TokenAudience == "" {
 		return cfg, errors.New("--token-audience or TOKEN_AUDIENCE is required")
 	}
@@ -395,6 +586,33 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 	if modes == 0 {
 		return cfg, errors.New("one of --tls-cert/--tls-key, --acme-domain, or --plaintext-behind-reverse-proxy is required")
+	}
+
+	// Egress posture: default-deny. The server refuses to start without either
+	// a non-empty allowlist or an explicit opt-in for broad-access mode, so
+	// authenticated tunnels cannot silently become a general-purpose TCP pivot
+	// into loopback, metadata, or internal control-plane destinations.
+	switch {
+	case len(cfg.AllowRules) == 0 && !cfg.AllowOpenEgress:
+		return cfg, errors.New("at least one --allow rule is required, or pass --allow-open-egress (ALLOW_OPEN_EGRESS=true) to explicitly opt into open mode")
+	case len(cfg.AllowRules) > 0 && cfg.AllowOpenEgress:
+		return cfg, errors.New("--allow-open-egress is mutually exclusive with --allow/ALLOW_RULES; pick one egress posture")
+	}
+
+	// Admission sub-validation. Burst defaults to ceil(rate) when rate is
+	// positive but burst was not explicitly set, which gives a sensible
+	// minimum without forcing operators to tune both knobs.
+	if cfg.TunnelOpenBurst > 0 && cfg.TunnelOpenRate == 0 {
+		return cfg, errors.New("--tunnel-open-burst requires --tunnel-open-rate to be set")
+	}
+	if cfg.TunnelOpenRate > 0 && cfg.TunnelOpenBurst == 0 {
+		// TunnelOpenRate validation above caps the value, so ceil(rate) remains
+		// bounded and the derived burst fits cleanly in int.
+		burst := int(math.Ceil(cfg.TunnelOpenRate))
+		if burst < 1 {
+			burst = 1
+		}
+		cfg.TunnelOpenBurst = burst
 	}
 
 	// Per-mode sub-validation.

@@ -269,6 +269,131 @@ func TestTokenRefreshRejectedSubjectMismatch(t *testing.T) {
 	}
 }
 
+// TestTokenRefreshAcceptedFutureNbfWithinDeadline verifies that a refresh
+// carrying a token whose nbf is in the future is accepted as long as the
+// token activates before the current connection deadline. The old token
+// keeps the tunnel authenticated until nbf arrives, so there is no
+// unauthenticated interval.
+func TestTokenRefreshAcceptedFutureNbfWithinDeadline(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	// Original token: the tunnel's initial authorisation window.
+	originalExpiry := time.Now().Add(3 * time.Second)
+	claims := makeClaims("user-1", originalExpiry)
+
+	// Refresh token: nbf 1s in the future (still inside the original
+	// deadline), exp far in the future. connDeadline after refresh should
+	// jump to the new exp.
+	newNbf := time.Now().Add(1 * time.Second)
+	newExpiry := time.Now().Add(1 * time.Hour)
+	newClaims := makeClaims("user-1", newExpiry)
+	newClaims.NotBefore = oidc.FromTime(newNbf)
+
+	validator := &mockValidator{
+		tokens: map[string]*oidc.AccessTokenClaims{
+			"fresh-token": newClaims,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    500 * time.Millisecond,
+	}, time.Now(), slog.Default())
+
+	err := clientConn.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: mustMarshal(map[string]string{"access_token": "fresh-token"}),
+	})
+	if err != nil {
+		t.Fatalf("send token_refresh: %v", err)
+	}
+
+	// Drain any concurrent expiry_warning that may have raced the refresh.
+	var msg wsconn.ControlMessage
+	for i := 0; i < 3; i++ {
+		m, ok := readControl(t, clientConn, 2*time.Second)
+		if !ok {
+			t.Fatal("timed out waiting for token_accepted")
+		}
+		if m.Type == "token_accepted" {
+			msg = m
+			break
+		}
+	}
+	if msg.Type != "token_accepted" {
+		t.Fatalf("expected token_accepted, got %s", msg.Type)
+	}
+
+	// The tunnel should still be alive past the original 3s expiry.
+	time.Sleep(3500 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		t.Fatal("tunnel was closed despite refresh with future-nbf token within deadline")
+	default:
+	}
+}
+
+// TestTokenRefreshRejectedNbfAfterDeadline verifies that a refresh carrying
+// a token whose nbf is past the current connection deadline is rejected —
+// accepting it would leave the tunnel unauthenticated between the old
+// token's expiry and the new token's activation.
+func TestTokenRefreshRejectedNbfAfterDeadline(t *testing.T) {
+	serverConn, clientConn := wsPair(t)
+	drainBinary(t, clientConn)
+	drainBinary(t, serverConn)
+
+	claims := makeClaims("user-1", time.Now().Add(10*time.Minute))
+
+	// Refresh token activates an hour from now — far past the current
+	// connection deadline of ~10 minutes, so there would be an auth gap.
+	newNbf := time.Now().Add(1 * time.Hour)
+	newExpiry := time.Now().Add(2 * time.Hour)
+	newClaims := makeClaims("user-1", newExpiry)
+	newClaims.NotBefore = oidc.FromTime(newNbf)
+
+	validator := &mockValidator{
+		tokens: map[string]*oidc.AccessTokenClaims{
+			"future-token": newClaims,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go manageTunnelLongevity(ctx, cancel, serverConn, validator, claims, LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    time.Minute,
+	}, time.Now(), slog.Default())
+
+	err := clientConn.SendControl(wsconn.ControlMessage{
+		Type: "token_refresh",
+		Data: mustMarshal(map[string]string{"access_token": "future-token"}),
+	})
+	if err != nil {
+		t.Fatalf("send token_refresh: %v", err)
+	}
+
+	msg, ok := readControl(t, clientConn, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for token_rejected")
+	}
+	if msg.Type != "token_rejected" {
+		t.Fatalf("expected token_rejected, got %s", msg.Type)
+	}
+	var data map[string]string
+	if err := json.Unmarshal(msg.Data, &data); err != nil {
+		t.Fatalf("unmarshal data: %v", err)
+	}
+	if data["reason"] != "not_yet_valid" {
+		t.Fatalf("expected reason not_yet_valid, got %s", data["reason"])
+	}
+}
+
 func TestTokenRefreshRejectedEmptyPayload(t *testing.T) {
 	serverConn, clientConn := wsPair(t)
 	drainBinary(t, clientConn)

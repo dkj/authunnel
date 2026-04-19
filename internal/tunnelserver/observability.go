@@ -37,8 +37,9 @@ type SOCKSServer interface {
 }
 
 type observedSOCKSServer struct {
-	stdLogger  *log.Logger
-	allowRules Allowlist
+	stdLogger   *log.Logger
+	allowRules  Allowlist
+	dialTimeout time.Duration
 }
 
 type observedTunnelConn struct {
@@ -52,8 +53,18 @@ type socksConnectDetails struct {
 	TargetPort int
 }
 
-func NewObservedSOCKSServer(stdLogger *log.Logger, rules Allowlist) SOCKSServer {
-	return &observedSOCKSServer{stdLogger: stdLogger, allowRules: rules}
+// NewObservedSOCKSServer constructs a SOCKS5 server wrapper that logs
+// CONNECT events and enforces the operator-configured allowlist. dialTimeout
+// caps the time each outbound TCP dial may block; a zero value disables the
+// per-dial timeout and should only be used in tests — in production
+// unbounded dials let authenticated users tie up goroutines and fds on
+// blackholed destinations.
+func NewObservedSOCKSServer(stdLogger *log.Logger, rules Allowlist, dialTimeout time.Duration) SOCKSServer {
+	return &observedSOCKSServer{
+		stdLogger:   stdLogger,
+		allowRules:  rules,
+		dialTimeout: dialTimeout,
+	}
 }
 
 // newObservedTunnelConn preserves the concrete net.Conn behavior used by the
@@ -81,7 +92,7 @@ func (c *observedTunnelConn) TunnelLogger() *slog.Logger {
 //     that inherits request_id and trace_id, so all tunnel lifecycle events
 //     (open, SOCKS CONNECT, close) carry all three IDs.
 //
-// For a /protected/socks request the relationship is 1:1 — one HTTP request
+// For a /protected/tunnel request the relationship is 1:1 — one HTTP request
 // produces one tunnel. The IDs serve different scopes: request_id is for HTTP
 // admission, trace_id is for cross-system tracing, and tunnel_id is for the
 // long-lived tunnel session and its per-destination SOCKS events.
@@ -219,7 +230,7 @@ func (s *observedSOCKSServer) ServeConn(conn net.Conn) error {
 	server, err := socks5.New(&socks5.Config{
 		Logger: s.stdLogger,
 		Rules:  observedSOCKSRuleSet{logger: logger, allowRules: s.allowRules},
-		Dial:   observedSOCKSDial(logger),
+		Dial:   observedSOCKSDial(logger, s.dialTimeout),
 	})
 	if err != nil {
 		return fmt.Errorf("create observed socks5 server: %w", err)
@@ -255,8 +266,10 @@ func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (c
 			slog.Int("target_port", details.TargetPort),
 		)
 	}
-	// Security decision: apply operator-configured allowlist.
-	// Empty allowlist = open mode (allow all). Non-empty = deny unless a rule matches.
+	// Security decision: apply operator-configured allowlist. Non-empty rules
+	// mean deny unless a rule matches; an empty Allowlist permits everything
+	// and only reaches here when the operator explicitly chose --allow-open-egress
+	// at startup (parseServerConfig rejects an empty allowlist without that flag).
 	// Pass the raw FQDN and IP separately so CIDR rules and hostname-glob rules
 	// are evaluated independently — details.TargetHost collapses the two.
 	if !r.allowRules.Permits(req.DestAddr.FQDN, req.DestAddr.IP, req.DestAddr.Port) {
@@ -269,11 +282,11 @@ func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (c
 	return context.WithValue(ctx, socksConnectContextKey, details), true
 }
 
-func observedSOCKSDial(logger *slog.Logger) func(context.Context, string, string) (net.Conn, error) {
+func observedSOCKSDial(logger *slog.Logger, dialTimeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	dialer := net.Dialer{}
+	dialer := net.Dialer{Timeout: dialTimeout}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		details := socksConnectDetailsFromContext(ctx)
 		logAttrs := []slog.Attr{

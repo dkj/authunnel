@@ -135,8 +135,8 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := os.MkdirAll(filepath.Dir(s.cachePath), 0o755); err != nil {
-		return "", fmt.Errorf("create cache directory: %w", err)
+	if err := ensurePrivateDir(filepath.Dir(s.cachePath)); err != nil {
+		return "", fmt.Errorf("prepare cache directory: %w", err)
 	}
 
 	release, err := acquireFileLock(ctx, s.cachePath+".lock")
@@ -216,8 +216,8 @@ func (s *managedOIDCTokenSource) loadCache() (tokenCache, error) {
 }
 
 func (s *managedOIDCTokenSource) saveCache(cache tokenCache) error {
-	if err := os.MkdirAll(filepath.Dir(s.cachePath), 0o755); err != nil {
-		return fmt.Errorf("create cache directory: %w", err)
+	if err := ensurePrivateDir(filepath.Dir(s.cachePath)); err != nil {
+		return fmt.Errorf("prepare cache directory: %w", err)
 	}
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
