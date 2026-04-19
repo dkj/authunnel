@@ -27,6 +27,12 @@ import (
 
 var version = "dev"
 
+// maxTunnelOpenRate caps both TunnelOpenRate (float64) and TunnelOpenBurst (int)
+// within an auditable, operationally meaningful range and guarantees the
+// auto-derived burst (ceil(rate)) fits comfortably in int.
+const maxTunnelOpenRate = 10_000
+const maxExpiryGrace = time.Hour
+
 type serverConfig struct {
 	Issuer        string
 	TokenAudience string
@@ -41,24 +47,24 @@ type serverConfig struct {
 	PlaintextBehindProxy bool
 	// Development override: allow non-HTTPS OIDC issuer
 	InsecureOIDCIssuer bool
-	LogLevel      slog.Level
-	AllowRules    tunnelserver.Allowlist
+	LogLevel           slog.Level
+	AllowRules         tunnelserver.Allowlist
 	// AllowOpenEgress is the explicit opt-in for running without an allowlist.
 	// Startup fails when both this flag and --allow rules are absent so the
 	// default posture is restrictive; operators who genuinely want full egress
 	// have to say so.
 	AllowOpenEgress bool
 	// Connection longevity
-	MaxConnectionDuration      time.Duration // hard max tunnel lifetime; 0 = unlimited
+	MaxConnectionDuration   time.Duration // hard max tunnel lifetime; 0 = unlimited
 	NoConnectionTokenExpiry bool          // when true, tunnel lifetime is NOT tied to access token expiry
-	ExpiryWarning              time.Duration // warning period before either limit
-	ExpiryGrace                time.Duration // grace period beyond token exp for cached-token providers
+	ExpiryWarning           time.Duration // warning period before either limit
+	ExpiryGrace             time.Duration // grace period beyond token exp for cached-token providers, max 1h
 
 	// Admission and resource limits
 	MaxConcurrentTunnels int           // global cap; 0 = unlimited
 	MaxTunnelsPerUser    int           // per-subject concurrent cap; 0 = unlimited
-	TunnelOpenRate       float64       // per-subject rate (tunnels/sec); 0 = disabled
-	TunnelOpenBurst      int           // per-subject token-bucket burst; defaults to ceil(rate) when rate>0
+	TunnelOpenRate       float64       // per-subject rate (tunnels/sec); 0 = disabled, max 10000
+	TunnelOpenBurst      int           // per-subject token-bucket burst; defaults to ceil(rate) when rate>0, max 10000
 	DialTimeout          time.Duration // per-outbound-dial timeout; default 10s
 }
 
@@ -103,7 +109,7 @@ Connection longevity:
                              Warning period before either longevity limit (env: EXPIRY_WARNING, default: 3m)
   --expiry-grace <duration>
                              Grace period beyond token exp for providers that cache access tokens; the
-                             connection deadline becomes exp + grace (env: EXPIRY_GRACE, default: 0)
+                             connection deadline becomes exp + grace (env: EXPIRY_GRACE, default: 0, max: 1h)
 
 Admission and resource limits:
 
@@ -115,8 +121,8 @@ Admission and resource limits:
                              (env: MAX_TUNNELS_PER_USER, default: 0 = unlimited). Over-cap requests get HTTP 429.
   --tunnel-open-rate <rate>
                              Sustained tunnel-open rate per user, tunnels/second as a float
-                             (env: TUNNEL_OPEN_RATE, default: 0 = disabled). Rate-exceeding requests get HTTP 429.
-  --tunnel-open-burst <n>    Burst size for --tunnel-open-rate (env: TUNNEL_OPEN_BURST, default: ceil(rate))
+                             (env: TUNNEL_OPEN_RATE, default: 0 = disabled, max: 10000). Rate-exceeding requests get HTTP 429.
+  --tunnel-open-burst <n>    Burst size for --tunnel-open-rate (env: TUNNEL_OPEN_BURST, default: ceil(rate), max: 10000)
   --dial-timeout <duration>  Per-outbound-dial timeout (env: DIAL_TIMEOUT, default: 10s). Zero disables the
                              timeout and lets authenticated users tie up goroutines on blackholed destinations;
                              not recommended.
@@ -241,14 +247,14 @@ func main() {
 
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {
 	cfg := serverConfig{
-		Issuer:                     getenv("OIDC_ISSUER"),
-		TokenAudience:              getenv("TOKEN_AUDIENCE"),
-		TLSCertPath:                getenv("TLS_CERT_FILE"),
-		TLSKeyPath:                 getenv("TLS_KEY_FILE"),
-		ACMECacheDir:               "/var/cache/authunnel/acme",
-		LogLevel:                   slog.LevelInfo,
+		Issuer:        getenv("OIDC_ISSUER"),
+		TokenAudience: getenv("TOKEN_AUDIENCE"),
+		TLSCertPath:   getenv("TLS_CERT_FILE"),
+		TLSKeyPath:    getenv("TLS_KEY_FILE"),
+		ACMECacheDir:  "/var/cache/authunnel/acme",
+		LogLevel:      slog.LevelInfo,
 		ExpiryWarning: 3 * time.Minute,
-		DialTimeout:                10 * time.Second,
+		DialTimeout:   10 * time.Second,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
@@ -293,8 +299,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		if err != nil {
 			return cfg, fmt.Errorf("EXPIRY_GRACE: %w", err)
 		}
-		if d < 0 {
-			return cfg, fmt.Errorf("EXPIRY_GRACE: must not be negative")
+		if d < 0 || d > maxExpiryGrace {
+			return cfg, fmt.Errorf("EXPIRY_GRACE: must be between 0 and %s", maxExpiryGrace)
 		}
 		cfg.ExpiryGrace = d
 	}
@@ -323,14 +329,11 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		if err != nil {
 			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: %w", err)
 		}
-		// strconv.ParseFloat accepts NaN and ±Inf, and a negative value is
-		// also not a meaningful operator policy: NaN would silently disable
-		// the rate limiter (TunnelOpenRate > 0 is false), +Inf would feed
-		// math.Ceil during burst derivation, and a negative rate is
-		// nonsensical. Reject all three in one condition so the error is a
-		// single, stable string.
-		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
-			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: must be a non-negative finite number")
+		// strconv.ParseFloat accepts NaN and ±Inf. Negative values are also not a
+		// meaningful operator policy. Reject all of those up front, and cap large
+		// finite values so auto-deriving ceil(rate) stays explicit and bounded.
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > maxTunnelOpenRate {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_RATE: must be a non-negative finite number not exceeding %d", maxTunnelOpenRate)
 		}
 		cfg.TunnelOpenRate = f
 	}
@@ -339,8 +342,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		if err != nil {
 			return cfg, fmt.Errorf("TUNNEL_OPEN_BURST: %w", err)
 		}
-		if n < 0 {
-			return cfg, fmt.Errorf("TUNNEL_OPEN_BURST: must not be negative")
+		if n < 0 || n > maxTunnelOpenRate {
+			return cfg, fmt.Errorf("TUNNEL_OPEN_BURST: must be between 0 and %d", maxTunnelOpenRate)
 		}
 		cfg.TunnelOpenBurst = n
 	}
@@ -432,13 +435,13 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		cfg.ExpiryWarning = d
 		return nil
 	})
-	fs.Func("expiry-grace", "Grace period beyond token exp for providers that cache access tokens (default: 0)", func(value string) error {
+	fs.Func("expiry-grace", "Grace period beyond token exp for providers that cache access tokens (default: 0, max 1h)", func(value string) error {
 		d, err := time.ParseDuration(value)
 		if err != nil {
 			return err
 		}
-		if d < 0 {
-			return fmt.Errorf("must not be negative")
+		if d < 0 || d > maxExpiryGrace {
+			return fmt.Errorf("must be between 0 and %s", maxExpiryGrace)
 		}
 		cfg.ExpiryGrace = d
 		return nil
@@ -465,24 +468,24 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		cfg.MaxTunnelsPerUser = n
 		return nil
 	})
-	fs.Func("tunnel-open-rate", "Sustained tunnel-open rate per user in tunnels/second; 0 = disabled", func(value string) error {
+	fs.Func("tunnel-open-rate", "Sustained tunnel-open rate per user in tunnels/second; 0 = disabled, max 10000", func(value string) error {
 		f, err := strconv.ParseFloat(value, 64)
 		if err != nil {
 			return err
 		}
-		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
-			return fmt.Errorf("must be a non-negative finite number")
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > maxTunnelOpenRate {
+			return fmt.Errorf("must be a non-negative finite number not exceeding %d", maxTunnelOpenRate)
 		}
 		cfg.TunnelOpenRate = f
 		return nil
 	})
-	fs.Func("tunnel-open-burst", "Burst size for --tunnel-open-rate; defaults to ceil(rate) when rate > 0", func(value string) error {
+	fs.Func("tunnel-open-burst", "Burst size for --tunnel-open-rate; defaults to ceil(rate) when rate > 0, max 10000", func(value string) error {
 		n, err := strconv.Atoi(value)
 		if err != nil {
 			return err
 		}
-		if n < 0 {
-			return fmt.Errorf("must not be negative")
+		if n < 0 || n > maxTunnelOpenRate {
+			return fmt.Errorf("must be between 0 and %d", maxTunnelOpenRate)
 		}
 		cfg.TunnelOpenBurst = n
 		return nil
@@ -603,6 +606,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		return cfg, errors.New("--tunnel-open-burst requires --tunnel-open-rate to be set")
 	}
 	if cfg.TunnelOpenRate > 0 && cfg.TunnelOpenBurst == 0 {
+		// TunnelOpenRate validation above caps the value, so ceil(rate) remains
+		// bounded and the derived burst fits cleanly in int.
 		burst := int(math.Ceil(cfg.TunnelOpenRate))
 		if burst < 1 {
 			burst = 1

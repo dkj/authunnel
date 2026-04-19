@@ -53,16 +53,16 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 	}
 
 	want := serverConfig{
-		Issuer:                     "https://flag-issuer.example",
-		TokenAudience:              "authunnel-server",
-		ListenAddr:                 "127.0.0.1:9443",
-		TLSCertPath:                "/flags/server.crt",
-		TLSKeyPath:                 "/flags/server.key",
-		ACMECacheDir:               "/var/cache/authunnel/acme",
-		LogLevel:                   slog.LevelInfo,
-		AllowOpenEgress:            true,
-		ExpiryWarning: 3 * time.Minute,
-		DialTimeout:                10 * time.Second,
+		Issuer:          "https://flag-issuer.example",
+		TokenAudience:   "authunnel-server",
+		ListenAddr:      "127.0.0.1:9443",
+		TLSCertPath:     "/flags/server.crt",
+		TLSKeyPath:      "/flags/server.key",
+		ACMECacheDir:    "/var/cache/authunnel/acme",
+		LogLevel:        slog.LevelInfo,
+		AllowOpenEgress: true,
+		ExpiryWarning:   3 * time.Minute,
+		DialTimeout:     10 * time.Second,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("unexpected config: got %#v want %#v", cfg, want)
@@ -972,6 +972,33 @@ func TestParseServerConfigBurstDerivedFromRate(t *testing.T) {
 	}
 }
 
+func TestParseServerConfigAcceptsMaxTunnelOpenRate(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--tunnel-open-rate", "10000",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.TunnelOpenRate != maxTunnelOpenRate {
+		t.Errorf("TunnelOpenRate: got %v want %d", cfg.TunnelOpenRate, maxTunnelOpenRate)
+	}
+	if cfg.TunnelOpenBurst != maxTunnelOpenRate {
+		t.Errorf("TunnelOpenBurst (derived): got %d want %d", cfg.TunnelOpenBurst, maxTunnelOpenRate)
+	}
+}
+
+func TestParseServerConfigAcceptsMaxExpiryGrace(t *testing.T) {
+	cfg, err := parseServerConfig([]string{
+		"--expiry-grace", "1h",
+	}, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.ExpiryGrace != maxExpiryGrace {
+		t.Errorf("ExpiryGrace: got %v want %v", cfg.ExpiryGrace, maxExpiryGrace)
+	}
+}
+
 func TestParseServerConfigRejectsBurstWithoutRate(t *testing.T) {
 	_, err := parseServerConfig([]string{
 		"--tunnel-open-burst", "5",
@@ -1004,9 +1031,7 @@ func TestParseServerConfigRejectsNegativeAdmissionValues(t *testing.T) {
 
 // TestParseServerConfigRejectsNonFiniteTunnelOpenRate ensures NaN and ±Inf
 // are rejected on both the flag and env paths. strconv.ParseFloat accepts
-// those spellings, and prior to this check NaN would silently disable the
-// rate limiter (f > 0 is false) while +Inf would feed math.Ceil and an
-// undefined float-to-int conversion into burst derivation.
+// those spellings, and they are not meaningful operator policies here.
 func TestParseServerConfigRejectsNonFiniteTunnelOpenRate(t *testing.T) {
 	cases := []string{"NaN", "nan", "+Inf", "-Inf", "Inf"}
 	for _, v := range cases {
@@ -1025,6 +1050,100 @@ func TestParseServerConfigRejectsNonFiniteTunnelOpenRate(t *testing.T) {
 			})
 			if err == nil {
 				t.Fatalf("expected rejection of TUNNEL_OPEN_RATE=%q", v)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigRejectsTooLargeTunnelOpenRate(t *testing.T) {
+	cases := []string{"10000.1", "10001"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{"--tunnel-open-rate", v}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --tunnel-open-rate=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be a non-negative finite number not exceeding 10000") {
+				t.Fatalf("unexpected error for --tunnel-open-rate=%q: %v", v, err)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				if key == "TUNNEL_OPEN_RATE" {
+					return v
+				}
+				return minimalServerEnv(key)
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of TUNNEL_OPEN_RATE=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be a non-negative finite number not exceeding 10000") {
+				t.Fatalf("unexpected error for TUNNEL_OPEN_RATE=%q: %v", v, err)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigRejectsTooLargeTunnelOpenBurst(t *testing.T) {
+	cases := []string{"10001"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{
+				"--tunnel-open-rate", "1",
+				"--tunnel-open-burst", v,
+			}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --tunnel-open-burst=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 10000") {
+				t.Fatalf("unexpected error for --tunnel-open-burst=%q: %v", v, err)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				switch key {
+				case "TUNNEL_OPEN_RATE":
+					return "1"
+				case "TUNNEL_OPEN_BURST":
+					return v
+				default:
+					return minimalServerEnv(key)
+				}
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of TUNNEL_OPEN_BURST=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 10000") {
+				t.Fatalf("unexpected error for TUNNEL_OPEN_BURST=%q: %v", v, err)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigRejectsTooLargeExpiryGrace(t *testing.T) {
+	cases := []string{"1h1s", "2h"}
+	for _, v := range cases {
+		t.Run("flag/"+v, func(t *testing.T) {
+			_, err := parseServerConfig([]string{"--expiry-grace", v}, minimalServerEnv)
+			if err == nil {
+				t.Fatalf("expected rejection of --expiry-grace=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 1h0m0s") {
+				t.Fatalf("unexpected error for --expiry-grace=%q: %v", v, err)
+			}
+		})
+		t.Run("env/"+v, func(t *testing.T) {
+			_, err := parseServerConfig(nil, func(key string) string {
+				if key == "EXPIRY_GRACE" {
+					return v
+				}
+				return minimalServerEnv(key)
+			})
+			if err == nil {
+				t.Fatalf("expected rejection of EXPIRY_GRACE=%q", v)
+			}
+			if !strings.Contains(err.Error(), "must be between 0 and 1h0m0s") {
+				t.Fatalf("unexpected error for EXPIRY_GRACE=%q: %v", v, err)
 			}
 		})
 	}
@@ -1526,6 +1645,12 @@ func TestParseServerConfigRejectsNegativeDurations(t *testing.T) {
 			_, err := parseServerConfig(args, env)
 			if err == nil {
 				t.Fatal("expected error for negative duration, got nil")
+			}
+			if tt.envKey == "EXPIRY_GRACE" || tt.flag == "--expiry-grace" {
+				if !strings.Contains(err.Error(), "must be between 0 and 1h0m0s") {
+					t.Fatalf("expected expiry-grace bounds error, got: %v", err)
+				}
+				return
 			}
 			if !strings.Contains(err.Error(), "negative") {
 				t.Fatalf("expected error mentioning 'negative', got: %v", err)
