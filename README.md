@@ -12,8 +12,6 @@ The target workflow is:
 4. The server hosts a SOCKS5 backend and opens the requested `%h:%p` destination.
 5. SSH stdio is bridged over that authenticated path.
 
-The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for tools such as `socat`.
-
 ## Components
 
 - `server/server.go`
@@ -64,15 +62,44 @@ The project also supports a unix-domain SOCKS5 endpoint mode (`proxy.sock`) for 
 
 Authunnel is deliberately simple in both functionality and implementation — a small, focused codebase that is intended to be easy to read and audit in full. Complexity is kept low by design; if a feature would make the security model harder to reason about, that is a reason not to add it.
 
-Authunnel enforces authentication (JWT validation) at the WebSocket layer before any SOCKS5 connection can be attempted. By default, tunnel lifetime is tied to the access token's `exp` claim, so an expired token causes the tunnel to close rather than persisting indefinitely. Clients with a valid refresh token can extend tunnels by refreshing before expiry; the server validates the new token, pins it to the original subject, and rejects refreshes that would reduce the expiry. The connection's enforced deadline is the token's `exp` plus any configured `--expiry-grace` — during the grace window the underlying JWT has already passed its own `exp`, but the operator has explicitly opted into extending enforcement to that point (e.g. for IdPs that cache access tokens). A refresh carrying a token whose `nbf` is in the future is accepted only when `nbf` is at or before that enforced deadline; the comparison is strict (no additional clock-skew allowance beyond `--expiry-grace`), so a refresh handover never silently stretches the policy further. A refresh whose `nbf` would fall past the enforced deadline is rejected. This can be disabled with `--no-connection-token-expiry` if needed. An optional hard maximum duration (`--max-connection-duration`) provides an additional ceiling. Both limits are orthogonal and can be active simultaneously. Some identity providers (e.g. Auth0) cache access tokens and return the same one on refresh until it expires; `--expiry-grace` adds a grace period beyond the token's `exp`, giving the client time to obtain a genuinely new token after the old one expires at the provider. Note: revoking a token at the identity provider does not terminate an already-established tunnel — the server enforces token expiry but does not perform live revocation checks. The `--allow` option provides a further layer of control over *where* an authenticated user can connect.
+### Required guarantees
 
-The server refuses to start without an egress posture. Operators pick one of two modes:
+The following properties are enforced by default with no silent bypass. Where a development override exists it is noted explicitly:
 
-**Allowlist mode (one or more `--allow` rules — the recommended default):** Only destinations matching a rule are permitted. Denied attempts are logged at warn level. This limits exposure if a credential is compromised, at the cost of requiring explicit enumeration of allowed targets.
+- **Bearer token validation** at the WebSocket layer before any SOCKS5 connection can be attempted: signature, issuer, audience (`aud`), expiry (`exp`), non-empty subject (`sub`), not-before (`nbf` must be usable at admission time, with a 30-second clock-skew allowance), and sane issued-at (`iat` must not be meaningfully in the future).
+- **Subject pinning during token refresh**: the server rejects any refreshed token whose `sub` differs from the original tunnel's subject.
+- **Refresh deadline enforcement**: a refreshed token whose `nbf` falls after the current enforced connection deadline (`exp + --expiry-grace`) is rejected. A refresh handover cannot silently extend the policy beyond what the operator has opted into. The comparison is strict — no additional clock-skew allowance applies beyond `--expiry-grace`.
+- **Secure transport by default**: the OIDC issuer URL must be `https://`; the client's tunnel endpoint URL must be `https://` or `wss://`. Plaintext variants require explicit override flags (see *Development overrides* in the flag reference below).
+- **Explicit egress posture at startup**: the server refuses to start without either `--allow` rules or `--allow-open-egress`. This prevents a misconfigured deployment from silently becoming an open TCP pivot.
 
-**Open mode (`--allow-open-egress`, no `--allow` rules):** Any destination reachable by the server process is accessible to authenticated clients. Every SOCKS CONNECT destination is logged at debug level. The flag must be set explicitly — it is mutually exclusive with `--allow` and is logged at warn level on startup — so the broader blast radius is always a deliberate operator choice rather than a silent default.
+### Operator-controlled
 
-**Note:** Like any tunnel, Authunnel can only log and control the connections it directly brokers; what an authenticated client does once a connection is open is outside its scope — for example, a client could SOCKS CONNECT to a second tunnel or proxy, creating a chain that Authunnel cannot observe.
+The following are disabled or unlimited by default and must be explicitly configured for a hardened deployment:
+
+- **Egress allowlist** (`--allow`): limits the destinations authenticated clients may reach. Recommended for production; restricts the blast radius if a credential is compromised.
+- **Egress open mode** (`--allow-open-egress`): explicit opt-in to allow any destination reachable by the server process. Logged at warn level on startup. Mutually exclusive with `--allow`.
+- **Connection longevity** (`--max-connection-duration`, `--expiry-grace`, `--no-connection-token-expiry`): by default tunnel lifetime is tied to the access token's `exp`. These flags let operators tune for specific IdP behaviors or impose hard ceilings. Some IdPs (e.g. Auth0) cache access tokens; `--expiry-grace` extends the enforcement deadline beyond `exp` to give the client time to obtain a genuinely new token.
+- **Admission limits** (`--max-concurrent-tunnels`, `--max-tunnels-per-user`, `--tunnel-open-rate`, `--dial-timeout`): zero or default by default. Configure for production to bound resource use and prevent a single credential from monopolising tunnel capacity or tying up goroutines on blackholed destinations.
+
+### Known non-goals
+
+- **Live token revocation**: revoking a token at the IdP does not terminate an already-established tunnel. Authunnel enforces token expiry but does not perform per-request introspection checks.
+- **Tunnel chain observability**: Authunnel can only log and control connections it directly brokers. A client could SOCKS CONNECT to a second tunnel or proxy, creating a chain Authunnel cannot observe.
+- **Session architecture redesign**: the current WebSocket-to-SOCKS model is intentionally simple and is not expected to change.
+
+## Deployment Hardening Checklist
+
+Before going to production, verify:
+
+- [ ] OIDC issuer is `https://` — `--insecure-oidc-issuer` is **not** set.
+- [ ] Tunnel endpoint is `https://` or `wss://` — `--insecure-tunnel-url` is **not** set on the client.
+- [ ] Token-expiry enforcement is active — `--no-connection-token-expiry` is **not** set. By default, tunnels close when the access token expires and clients must refresh. Disabling this removes token expiry as a tunnel lifetime control; tunnels will still close at `--max-connection-duration` if set, but without that limit they persist until the client disconnects.
+- [ ] At least one `--allow` rule is configured. `--allow-open-egress` should only appear in deployments where arbitrary authenticated egress from the server host is explicitly acceptable.
+- [ ] A hard connection ceiling is set (`--max-connection-duration`) appropriate for your session-length policy.
+- [ ] Admission limits are sized for expected load: `--max-concurrent-tunnels`, `--max-tunnels-per-user`, and `--tunnel-open-rate` are set.
+- [ ] `--dial-timeout` is set (default `10s`). Setting it to `0` allows authenticated users to hold goroutines open on blackholed destinations indefinitely.
+- [ ] The unix-socket path (if used) lives inside a private directory such as `/tmp/authunnel/` (`0700`), not directly under a world-writable parent like `/tmp`.
+- [ ] The authunnel server (if using `--plaintext-behind-reverse-proxy`) is not directly reachable over untrusted networks — only the TLS-terminating reverse proxy should be. The proxy must also strip or overwrite client-supplied `X-Forwarded-Proto` / `X-Forwarded-Host` headers before forwarding.
 
 ## Usage
 
@@ -334,6 +361,11 @@ Current fast coverage includes:
 - bidirectional proxy forwarding behavior
 - server authorization-header rejection and JWT audience validation
 - WebSocket multiplexing: binary data round-trip, control message routing, interleaved text/binary frame handling, bidirectional control messages
+- transport hardening: insecure OIDC issuer and tunnel URL rejection, secure-scheme enforcement on client and server
+- token validation: `nbf` not-before enforcement, `iat` sanity check, non-empty `sub` requirement, refresh subject pinning, refresh deadline enforcement
+- admission controls: global concurrent cap, per-user concurrent cap, per-user rate limiting (fake-clock deterministic), dial timeout against blackholed destinations, handler-level rejection with correct HTTP status and `Retry-After`
+- egress posture: startup rejection when neither `--allow` rules nor `--allow-open-egress` is present, mutual exclusion between the two modes, env-var equivalents
+- filesystem safety: unix socket directory permission checks (group/world-writable rejection, foreign-owner rejection), stale-socket cleanup refusal on non-socket paths, umask-tightened socket creation, token cache and lock directory safety
 
 ## Developer Notes
 
@@ -438,6 +470,10 @@ AUTHUNNEL_E2E=1 go test ./client -run TestKeycloakProxyCommandManagedOIDCE2E -co
 ```
 
 The GitHub Actions workflow in [`.github/workflows/keycloak-e2e.yml`](.github/workflows/keycloak-e2e.yml) starts Keycloak from `testenv/keycloak/docker-compose.yml` and runs that test in CI.
+
+## Versioning
+
+Authunnel follows [Semantic Versioning](https://semver.org/). A new major version may introduce breaking changes to configuration flags, environment variables, or the wire protocol. Check the release notes before upgrading across a major version boundary.
 
 ## License
 
