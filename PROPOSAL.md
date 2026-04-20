@@ -100,6 +100,9 @@ Host *.internal.sanger.ac.uk
 | Ivanti access/TLS log shipping to the same logging system | Network / Ivanti team + Logging team | Standard config; ideally configure Ivanti to emit a `Traceparent` header so server logs and Ivanti logs can be joined by `trace_id` |
 | Log receiver configuration (Elasticsearch index + Kibana, or Splunk index + sourcetype) for both Authunnel server and Ivanti logs, plus any required dashboards or alerts | Logging / observability team | Standard config — structured JSON means fields are available without parsing |
 | Security review of codebase and deployment architecture | Security team | See below |
+| Host vulnerability scanning enrolment (Rapid7 InsightVM or equivalent) for the server VM | Infrastructure / Security team | Standard config — enrol VM in existing scanner |
+| SAST/SCA CI jobs (`govulncheck`, `gosec`, `staticcheck`, `go vet`, Dependabot) | Authunnel maintainer | Already in place (daily cron + per-PR); CodeQL can be added if required |
+| SBOM generation per release (CycloneDX JSON) | Authunnel maintainer | Already in place — generated and published automatically per release binary |
 | Client binary distribution + SSH config docs | Authunnel maintainer | Documentation task |
 
 The repository's [Deployment Hardening Checklist](https://github.com/dkj/authunnel/blob/main/README.md#deployment-hardening-checklist) provides a concrete pre-production checklist (HTTPS enforcement, egress posture, admission limits, dial timeout, socket hygiene, reverse-proxy header handling, etc.) that the infrastructure and security teams can work against directly.
@@ -174,11 +177,30 @@ We would like the security team to consider reviewing the deployment architectur
 - **Admission controls** — the server supports global and per-user concurrent-tunnel caps, a per-user rate limit with burst, and a bounded dial timeout. Are the proposed limits and defaults appropriate for abuse resistance?
 - **Network architecture** — the server runs behind Ivanti with security groups restricting inbound and outbound traffic. Are the proposed security group rules appropriate?
 - **Capability dropping** — on Linux, the server drops all capabilities and sets `PR_SET_NO_NEW_PRIVS` after binding ports. Is this hardening adequate?
-- **Client-side hardening** — the client validates ownership and permissions on its token-cache and unix-socket parent directories. Is this adequate for the shared hosts where the client is expected to run?
+- **Client-side hardening** — the client validates ownership and permissions on its token-cache and unix-socket parent directories. The token cache is plaintext JSON at `0600` inside a `0700` directory with validated ancestry; this defends against co-tenant read access on shared hosts but not against same-uid processes, root, or offline disk access. Is this model adequate, and does the deployment environment warrant additional at-rest protection (full-disk encryption, secrets-manager-sourced tokens)?
 - **Logging and monitoring** — are the logged fields sufficient for incident response and audit purposes? Are there additional events or fields the security team would want to see?
 - **Threat model** — what residual risks does the security team see with an authenticated WebSocket tunnel to internal SSH hosts, how do these compare with the existing Teleport provision, and what additional controls (if any) would they recommend?
 
 The [codebase is open](https://github.com/dkj/authunnel/blob/main/README.md) and so available for review now. Given its size (~3,400 lines of Go source, excluding tests, comments, and blanks), a full read-through is realistic within a day or two.
+
+## Vulnerability Management
+
+Vulnerability management covers three independent layers:
+
+**Host.** The server VM is enrolled in Sanger's existing host vulnerability management (Rapid7 InsightVM or equivalent) so OS-level CVEs, missing patches, and configuration drift are picked up by routine scans. Rapid7 is a commercial product, but the assumption is that Sanger already operates it under existing licensing — adding the Authunnel VM to the scan scope should be marginal cost at most. Because the VM runs a single static Go binary under `DynamicUser=yes` and no ancillary services, the host surface is deliberately small, but routine scanning still catches drift in the base image.
+
+**Source code (SAST).** A dedicated GitHub Actions workflow (`.github/workflows/security.yml`) runs on every push and pull request, plus a daily 06:00 UTC cron so newly published CVEs are caught even when the codebase has not changed. The workflow runs:
+
+- **`govulncheck`** (from the Go team) — reports vulnerabilities from the Go vulnerability database that are actually reachable from `main`, giving a very low false-positive rate.
+- **`gosec`** — Go-specific security linter for patterns like hardcoded credentials and weak crypto.
+- **`staticcheck`** — broad correctness and style checks.
+- **`go vet`** — standard Go correctness analyser.
+
+CodeQL (GitHub native) can be added if the security team wants an additional layer.
+
+**Supply chain (SCA).** `govulncheck` also scans module dependencies, so the same CI job doubles as SCA. **Dependabot** is configured (`.github/dependabot.yml`) to propose weekly update PRs for both `gomod` dependencies and GitHub Actions versions. The dependency footprint is small and easy to review: eight direct dependencies (`armon/go-socks5`, `coder/websocket`, `go-jose/v4`, `zitadel/oidc/v3`, and four `golang.org/x/*` modules — `crypto`, `oauth2`, `sys`, `time`) and a further ~19 transitive modules declared in `go.mod` (under 50 in total once all tooling-adjacent modules are counted), all from well-known Go ecosystem sources. A CycloneDX JSON SBOM is generated automatically per release (one per OS/architecture per component, via the `make sbom` target wired into the release workflow) and published alongside the release binaries.
+
+All three layers are cheap to add and keep running. The SAST and SCA tools (`govulncheck`, `gosec`, CodeQL for public repositories, Dependabot) are all free and self-service; the CI additions are a few lines of YAML each. Only the host scanner is commercial, and that cost is assumed to fall under existing Sanger licensing.
 
 ## Proposed Rollout
 
