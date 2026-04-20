@@ -105,7 +105,7 @@ Before going to production, verify:
 
 ### Prerequisites
 
-- Go 1.25.0+
+- Go 1.26.2+
 - An OIDC provider that issues JWT access tokens carrying both a server audience (emitted as `aud`) and a non-empty `sub` — Authunnel pins each tunnel's refresh identity to `sub`, so tokens without one are rejected at admission. Most IdPs emit `sub` by default; on Keycloak 26+ the client's default scopes must cover it (the built-in `basic` scope, or an equivalent custom scope with an `oidc-sub-mapper` — see [`testenv/keycloak/authunnel-realm.json`](testenv/keycloak/authunnel-realm.json) for a working example)
 - A TLS certificate trusted by the client runtime (for TLS-files mode; not required for ACME or plaintext-behind-reverse-proxy modes)
 
@@ -312,6 +312,31 @@ directory under the same rules, so starting the client from a shared cwd
 (such as `/tmp` itself) is refused. The same checks apply to the OIDC token
 cache directory (`--oidc-cache`) and its advisory-lock companion file, so a
 directory that is safe for the socket is also safe for cached tokens.
+
+#### Token cache at rest
+
+Managed OIDC mode writes the cached access token and refresh token to
+`--oidc-cache` as plaintext JSON. Confidentiality on disk is enforced by
+POSIX filesystem permissions alone: the cache file is created `0600` via
+atomic rename, inside a `0700` directory whose ancestors have been
+validated against peer `rename(2)` as described above.
+
+This design matches the pattern used by most OIDC CLIs, but operators
+should be explicit about what it does and does not defend against:
+
+- **Defended:** read access by other unprivileged users on the same host,
+  including concurrent attackers who can observe the config directory but
+  not write into it.
+- **Not defended:** the machine's root user, offline forensic access to an
+  unencrypted disk or disk image, backups of the user's config directory,
+  or any process running as the same uid (which by construction already
+  has the same tokens available through the authunnel client itself).
+
+If your threat model requires stronger at-rest protection, either run
+authunnel on a system with full-disk encryption (so offline disk access is
+excluded), or supply the access token directly via `--access-token` /
+`ACCESS_TOKEN` from a secrets manager so no refresh token is ever
+persisted by authunnel.
 
 During listener creation the client restricts its process umask to `0o077`,
 so the socket inode is created owner-only in the first place; the follow-up

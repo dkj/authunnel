@@ -27,9 +27,8 @@ type requestMetadata struct {
 type contextKey string
 
 const (
-	loggerContextKey          contextKey = "logger"
-	requestMetadataContextKey contextKey = "request-metadata"
-	socksConnectContextKey    contextKey = "socks-connect"
+	loggerContextKey       contextKey = "logger"
+	socksConnectContextKey contextKey = "socks-connect"
 )
 
 type SOCKSServer interface {
@@ -113,7 +112,6 @@ func NewRequestLoggingMiddleware(baseLogger *slog.Logger, next http.Handler) htt
 			slog.String("trace_id", metadata.TraceID),
 		)
 		ctx := context.WithValue(r.Context(), loggerContextKey, logger)
-		ctx = context.WithValue(ctx, requestMetadataContextKey, metadata)
 		r = r.WithContext(ctx)
 
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -137,13 +135,6 @@ func loggerFromContext(ctx context.Context) *slog.Logger {
 		return logger
 	}
 	return slog.Default()
-}
-
-func requestMetadataFromContext(ctx context.Context) requestMetadata {
-	if metadata, ok := ctx.Value(requestMetadataContextKey).(requestMetadata); ok {
-		return metadata
-	}
-	return requestMetadata{}
 }
 
 func newLogID() string {
