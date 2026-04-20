@@ -1,0 +1,68 @@
+name: Security & Static Analysis
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  schedule:
+    # Daily at 06:00 UTC — catches newly published CVEs
+    # even when the codebase has not changed.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  vet:
+    name: go vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go vet ./...
+
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Reports only vulnerabilities reachable from main — very low false-positive rate.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  gosec:
+    name: gosec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go run github.com/securego/gosec/v2/cmd/gosec@latest ./...

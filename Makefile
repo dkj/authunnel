@@ -35,3 +35,22 @@ clean:
 .PHONY: test
 test:
 	go test ./...
+
+.PHONY: vet
+vet:
+	go vet ./...
+
+.PHONY: staticcheck
+staticcheck:
+	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+.PHONY: govulncheck
+govulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+.PHONY: gosec
+gosec:
+	go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
+
+.PHONY: lint
+lint: vet staticcheck govulncheck gosec

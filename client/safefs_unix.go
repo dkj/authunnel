@@ -34,6 +34,8 @@ func ensurePrivateDir(dir string) error {
 			return fmt.Errorf("create directory %q: %w", dir, err)
 		}
 		// MkdirAll honours the process umask, so re-tighten explicitly.
+		// #nosec G302 -- 0o700 is correct for a *directory* (owner needs
+		// exec bit to enter); gosec's rule assumes the target is a file.
 		if err := os.Chmod(dir, 0o700); err != nil {
 			return fmt.Errorf("tighten directory %q: %w", dir, err)
 		}
@@ -112,6 +114,7 @@ func checkLeafSafety(path string, info os.FileInfo) error {
 	if !ok {
 		return nil
 	}
+	// #nosec G115 -- POSIX uids fit in uint32; stdlib does this same conversion.
 	if uid := uint32(os.Getuid()); stat.Uid != uid {
 		return fmt.Errorf("directory %q is owned by uid %d, not by the current user (uid %d); refusing to write private files into a directory owned by another user", path, stat.Uid, uid)
 	}
@@ -134,6 +137,7 @@ func checkAncestorSafety(path string, info os.FileInfo) error {
 	if !ok {
 		return nil
 	}
+	// #nosec G115 -- POSIX uids fit in uint32; stdlib does this same conversion.
 	uid := uint32(os.Getuid())
 	if stat.Uid != uid && stat.Uid != 0 {
 		return fmt.Errorf("ancestor directory %q is owned by uid %d, not the current user (uid %d) or root; refusing to trust an ancestor owned by another unprivileged user", path, stat.Uid, uid)
@@ -158,7 +162,8 @@ func safelyRemoveExistingSocket(path string) error {
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if ok {
-		if uid := uint32(os.Getuid()); stat.Uid != uid {
+		// #nosec G115 -- POSIX uids fit in uint32; stdlib does this same conversion.
+	if uid := uint32(os.Getuid()); stat.Uid != uid {
 			return fmt.Errorf("refusing to remove socket %q owned by uid %d, not the current user (uid %d)", path, stat.Uid, uid)
 		}
 	}

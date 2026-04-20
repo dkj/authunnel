@@ -641,8 +641,8 @@ func checkACMECacheDir(dir string) error {
 	if err != nil {
 		return fmt.Errorf("ACME cache directory is not writable: %w", err)
 	}
-	f.Close()
-	os.Remove(f.Name())
+	_ = f.Close()
+	_ = os.Remove(f.Name())
 	return nil
 }
 

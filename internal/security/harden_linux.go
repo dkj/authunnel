@@ -3,6 +3,7 @@
 package security
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 	"unsafe"
@@ -34,15 +35,43 @@ func Harden() error {
 
 	// Drop the bounding capability set on all threads so capabilities cannot be
 	// regained by executing a binary with file capabilities.
+	// We iterate up to 63 so kernels newer than this build still drop every
+	// cap they know about without us hard-coding CAP_LAST_CAP. Two errors are
+	// tolerated:
+	//
+	//   - EINVAL: the cap number is beyond CAP_LAST_CAP on the running kernel.
+	//     This is the kernel's documented way of telling us we have run off
+	//     the end of its cap table.
+	//
+	//   - EPERM: the process does not hold CAP_SETPCAP, which is the normal
+	//     situation for any unprivileged invocation (authunnel run as a
+	//     regular user) and for a binary granted only a single file cap such
+	//     as `setcap cap_net_bind_service=ep`. In both cases Harden() has
+	//     already applied PR_SET_NO_NEW_PRIVS above, which is what actually
+	//     defeats privilege escalation via exec of a file-capability binary;
+	//     the bounding-set drop is belt-and-braces on top of that. Failing
+	//     the whole of Harden() here would break normal non-root start-up
+	//     without strengthening the guarantee no_new_privs has already made.
+	//
+	// Any other error (a thread-specific AllThreadsSyscall6 failure, a future
+	// kernel regression, ...) is surfaced as a real hardening failure so we
+	// never silently return success with the bounding set only partly dropped.
 	for cap := uintptr(0); cap <= 63; cap++ {
-		// Ignore errors: EINVAL is expected for numbers beyond CAP_LAST_CAP.
-		allThreadsPrctl(unix.PR_CAPBSET_DROP, cap, 0, 0, 0) //nolint:errcheck
+		err := allThreadsPrctl(unix.PR_CAPBSET_DROP, cap, 0, 0, 0)
+		if err == nil || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EPERM) {
+			continue
+		}
+		return fmt.Errorf("PR_CAPBSET_DROP %d: %w", cap, err)
 	}
 
 	// Zero all capability sets (effective, permitted, inheritable) on every thread.
 	var hdr unix.CapUserHeader
 	hdr.Version = unix.LINUX_CAPABILITY_VERSION_3
 	var data [2]unix.CapUserData // version 3 uses two entries; zero value = no capabilities
+	// #nosec G103 -- capset(2) is a raw syscall whose ABI requires pointers to
+	// the header and data structs passed as uintptrs. unsafe.Pointer conversion
+	// is mandatory; there is no safe wrapper in golang.org/x/sys/unix that
+	// supports the AllThreadsSyscall variant we need here.
 	_, _, errno := syscall.AllThreadsSyscall(
 		syscall.SYS_CAPSET,
 		uintptr(unsafe.Pointer(&hdr)),
