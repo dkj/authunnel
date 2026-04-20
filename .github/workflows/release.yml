@@ -25,6 +25,9 @@ jobs:
       - name: Build release binaries
         run: make release-build
 
+      - name: Generate SBOMs
+        run: make sbom
+
       - name: Generate checksums
         run: |
           cd dist
