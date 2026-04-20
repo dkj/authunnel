@@ -1,5 +1,6 @@
-DIST    := dist
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+DIST               := dist
+VERSION            := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+CYCLONEDX_VERSION  := v1.10.0
 LDFLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
 
 .PHONY: build
@@ -51,6 +52,23 @@ govulncheck:
 .PHONY: gosec
 gosec:
 	go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
+
+.PHONY: sbom
+sbom:
+	@mkdir -p $(DIST)
+	go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@$(CYCLONEDX_VERSION)
+	@_gobin=$$(go env GOBIN); CDXGOMOD=$${_gobin:-$$(go env GOPATH)/bin}/cyclonedx-gomod; \
+	OUTDIR=$$(pwd)/$(DIST); \
+	MODDIR=$$(dirname $$(git rev-parse --git-common-dir)); \
+	for OS in darwin linux; do \
+	  for ARCH in amd64 arm64; do \
+	    (cd $$MODDIR && GOOS=$$OS GOARCH=$$ARCH $$CDXGOMOD app -licenses -json -output $$OUTDIR/sbom-server-$$OS-$$ARCH.cdx.json -main ./server); \
+	    (cd $$MODDIR && GOOS=$$OS GOARCH=$$ARCH $$CDXGOMOD app -licenses -json -output $$OUTDIR/sbom-client-$$OS-$$ARCH.cdx.json -main ./client); \
+	  done; \
+	done; \
+	for ARCH in amd64 arm64; do \
+	  (cd $$MODDIR && GOOS=windows GOARCH=$$ARCH $$CDXGOMOD app -licenses -json -output $$OUTDIR/sbom-client-windows-$$ARCH.cdx.json -main ./client); \
+	done
 
 .PHONY: lint
 lint: vet staticcheck govulncheck gosec
