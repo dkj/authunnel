@@ -219,6 +219,16 @@ func (s *managedOIDCTokenSource) saveCache(cache tokenCache) error {
 	if err := ensurePrivateDir(filepath.Dir(s.cachePath)); err != nil {
 		return fmt.Errorf("prepare cache directory: %w", err)
 	}
+	// #nosec G117 -- this is an accepted tradeoff, not a false positive.
+	// authunnel persists access and refresh tokens as plaintext JSON so that
+	// subsequent client invocations can reuse them without a fresh browser
+	// login. Confidentiality relies entirely on POSIX filesystem permissions:
+	// the file is written 0o600 via atomic rename into a directory that
+	// ensurePrivateDir has validated as 0o700, owned by the current user,
+	// with every ancestor safe against peer rename(2). This does NOT defend
+	// against root on the host, offline access to an unencrypted disk image,
+	// or a backup of the config directory. See the "Token cache at rest"
+	// section of the README for the explicit threat model.
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal OIDC token cache: %w", err)
@@ -230,11 +240,11 @@ func (s *managedOIDCTokenSource) saveCache(cache tokenCache) error {
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 	if err := tmpFile.Chmod(0o600); err != nil {
-		tmpFile.Close()
+		_ = tmpFile.Close()
 		return fmt.Errorf("chmod temp cache file: %w", err)
 	}
 	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
+		_ = tmpFile.Close()
 		return fmt.Errorf("write temp cache file: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
@@ -290,6 +300,11 @@ func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.
 
 	resultCh := make(chan callbackResult, 1)
 	server := &http.Server{
+		// Defence in depth: even though this server is only bound to a
+		// 127.0.0.1 loopback listener during an interactive OIDC login, a
+		// ReadHeaderTimeout defeats a local attacker who could otherwise keep
+		// the listener occupied by dribbling headers forever.
+		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			result := callbackResult{}
 			query := r.URL.Query()

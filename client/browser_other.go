@@ -23,6 +23,10 @@ func defaultBrowserOpener(ctx context.Context, url string) error {
 
 	commandCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	// #nosec G204 -- `name` is picked from a fixed two-element set above; `url`
+	// is passed as argv (no shell), so there is no command injection surface.
+	// The url itself is the OIDC auth URL constructed from the configured IDP;
+	// trusting the IDP is an inherent assumption of the OIDC flow.
 	if err := exec.CommandContext(commandCtx, name, url).Run(); err != nil {
 		return fmt.Errorf("launch %s: %w", name, err)
 	}

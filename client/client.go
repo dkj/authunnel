@@ -521,7 +521,7 @@ func handleControlMessages(ctx context.Context, conn *wsconn.MultiplexConn, sour
 				}
 				_ = json.Unmarshal(msg.Data, &payload)
 				log.Printf("server disconnecting: %s", payload.Reason)
-				conn.Close()
+				_ = conn.Close()
 				return
 			}
 		}
@@ -580,10 +580,12 @@ func buildSOCKS5ConnectRequest(targetHost string, targetPort int) ([]byte, error
 		if len(targetHost) == 0 || len(targetHost) > 255 {
 			return nil, fmt.Errorf("target host length must be between 1 and 255")
 		}
+		// #nosec G115 -- length is range-checked on the preceding line.
 		request = append(request, socksAtypDomain, byte(len(targetHost)))
 		request = append(request, []byte(targetHost)...)
 	}
 
+	// #nosec G115 -- targetPort is range-checked at the top of this function.
 	request = append(request, byte(targetPort>>8), byte(targetPort))
 	return request, nil
 }
