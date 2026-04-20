@@ -20,7 +20,7 @@ jobs:
 
       # Install the Go version declared in the repository module for consistent CI behavior.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
