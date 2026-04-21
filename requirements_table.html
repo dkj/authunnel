@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Remote Access Requirements</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  :root {
+    --bg: #f7f7f5;
+    --surface: #ffffff;
+    --border: #ddd;
+    --text: #1a1a1a;
+    --text-muted: #666;
+    --header-bg: #1e2a3a;
+    --header-text: #e8ecf0;
+    --group-bg: #eef2f7;
+    --y-bg: #d4edda;
+    --y-text: #155724;
+    --n-bg: #f8d7da;
+    --n-text: #721c24;
+    --partial-bg: #fff3cd;
+    --partial-text: #856404;
+    --must-bg: #fde8e8;
+    --must-text: #8b0000;
+    --should-bg: #fef9e7;
+    --should-text: #7d6608;
+    --could-bg: #e8f5e9;
+    --could-text: #1b5e20;
+    --noop-bg: #f3f3f3;
+    --noop-text: #555;
+    --accent: #2563eb;
+    --row-alt: #fafaf8;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'IBM Plex Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    font-size: 13px;
+  }
+
+  h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--header-bg);
+    margin-bottom: 6px;
+    letter-spacing: -0.3px;
+  }
+
+  .subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 20px;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .legend-pill {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .table-wrapper {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.07);
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 1100px;
+    background: var(--surface);
+  }
+
+  thead tr {
+    background: var(--header-bg);
+    color: var(--header-text);
+  }
+
+  thead th {
+    padding: 10px 10px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    white-space: nowrap;
+    border-right: 1px solid rgba(255,255,255,0.1);
+    text-align: left;
+  }
+
+  tbody tr:nth-child(even) { background: var(--row-alt); }
+  tbody tr:hover { background: #eef3ff; transition: background 0.15s; }
+
+  td {
+    padding: 7px 10px;
+    border-right: 1px solid #eee;
+    border-bottom: 1px solid #eee;
+    vertical-align: top;
+    line-height: 1.45;
+  }
+
+  td:last-child, th:last-child { border-right: none; }
+
+  .user-story { max-width: 480px; font-size: 12px; line-height: 1.5; }
+  .strikethrough { text-decoration: line-through; color: var(--text-muted); }
+
+  .pill {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .must   { background: var(--must-bg);   color: var(--must-text); }
+  .should { background: var(--should-bg); color: var(--should-text); }
+  .could  { background: var(--could-bg);  color: var(--could-text); }
+  .noop   { background: var(--noop-bg);   color: var(--noop-text); }
+  .blank  { color: #ccc; font-size: 11px; }
+
+  .yn {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .y  { background: var(--y-bg);       color: var(--y-text); }
+  .n  { background: var(--n-bg);       color: var(--n-text); }
+  .partial { background: var(--partial-bg); color: var(--partial-text); font-size: 10px; }
+
+  .group-tag {
+    display: inline-block;
+    padding: 2px 8px;
+    background: #e8eef8;
+    color: #2563eb;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .section-divider td {
+    background: #f0f4fa;
+    font-size: 11px;
+    font-weight: 600;
+    color: #2563eb;
+    letter-spacing: 0.5px;
+    padding: 5px 10px;
+    border-bottom: 2px solid #c8d8f0;
+  }
+</style>
+</head>
+<body>
+
+<h1>Remote Access Solution — Requirements & User Stories</h1>
+<p class="subtitle">Criteria ratings across IMT, IGS, and End User perspectives, with vendor evaluation (Teleport / Global Protect / Citrix)</p>
+
+<div class="legend">
+  <div class="legend-item"><span class="pill must">Must</span> Mandatory requirement</div>
+  <div class="legend-item"><span class="pill should">Should</span> High priority</div>
+  <div class="legend-item"><span class="pill could">Could</span> Nice to have</div>
+  <div class="legend-item"><span class="pill noop">No Opinion</span> No view held</div>
+  <div class="legend-item"><span class="yn y">Y</span> Supported</div>
+  <div class="legend-item"><span class="yn n">N</span> Not supported</div>
+  <div class="legend-item"><span class="yn partial">Y (partial)</span> Partially supported</div>
+</div>
+
+<div class="table-wrapper">
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>IMT<br>Criteria</th>
+      <th>IGS<br>Criteria</th>
+      <th>End User<br>Criteria</th>
+      <th>Requestor</th>
+      <th>Grouping</th>
+      <th>User Story</th>
+      <th>Teleport</th>
+      <th>Global<br>Protect</th>
+      <th>Citrix<br>(retiring)</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <!-- ACCESS / DEVICE -->
+    <tr class="section-divider"><td colspan="10">DEVICE &amp; ACCESS METHOD</td></tr>
+
+    <tr>
+      <td>1</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">alternative access method</span></td>
+      <td class="user-story">A method of getting onto the network should not have access to my 2FA mobile.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (future yubikey)</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">non-sanger computer</span></td>
+      <td class="user-story">Provide a method of Access via my personal iPad which can't easily have a sensible VPN.</td>
+      <td><span class="yn partial">Y (through browser)</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">non-sanger computer</span></td>
+      <td class="user-story">The solution needs to be able to support Sanger desktops and laptops.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td></td>
+      <td><span class="group-tag">non-sanger computer</span></td>
+      <td class="user-story">The solution needs to be able to support non-Sanger/personal desktops and laptops.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (change required)</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td class="user-story">Needs to support tablet and mobile devices access internal websites e.g. testing touchscreen.</td>
+      <td><span class="yn partial">Y (through browser)</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (through browser)</span></td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td class="user-story">Needs to support tablet and mobile devices to connect to SSH.</td>
+      <td><span class="yn partial">Y (through browser)</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (through browser)</span></td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td class="user-story">Needs to support Sanger-provided tablet and mobile devices to access internal websites e.g. testing touchscreen.</td>
+      <td><span class="yn partial">Y (through browser)</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (through browser)</span></td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td class="user-story">Needs to support the different operating systems.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>18</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td><span class="group-tag">non-sanger computer</span></td>
+      <td class="user-story">A method of getting onto the network should not have access to a/my Sanger computer.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>10 (img2)</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">client</span></td>
+      <td class="user-story">Does not restrict access to Sanger owned devices.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y with change</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+
+    <!-- AUTHENTICATION / MFA -->
+    <tr class="section-divider"><td colspan="10">AUTHENTICATION &amp; MFA</td></tr>
+
+    <tr>
+      <td>9</td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">authentication</span></td>
+      <td class="user-story strikethrough">The solution needs to have a secure login process password-free access using SSH keys or similar.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>10</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">authentication</span></td>
+      <td class="user-story">Provide MFA to Sanger users.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+    <tr>
+      <td>11</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">authentication</span></td>
+      <td class="user-story">Provide MFA to non-Sanger users.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+    <tr>
+      <td>12</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">authentication</span></td>
+      <td class="user-story">Deliver MFA in multiple methods.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+    <tr>
+      <td>13</td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">authentication</span></td>
+      <td class="user-story strikethrough">Use hardware tokens (e.g. Yubi-keys) if provided by Sanger at no cost to me with replacements able to be sent within a reasonable timeframe and cost.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-11</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">licensing/cost/client</span></td>
+      <td class="user-story">MFA provides other alternatives than a custom app on my smartphone or device to connect.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img3-5</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Authentication</span></td>
+      <td class="user-story strikethrough">An authentication refresh time similar to Slack (2 weeks): A configurable refresh time on authentication similar to the current SSH solution.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-11</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Solution integrates with built-in OS biometrics e.g. Windows Hello or Apple Touch ID to remove the need for an app.</td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+    <tr>
+      <td>img3-1</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">As a collaborator I sometimes come into Sanger at short notice and need access immediately and for a short time.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-3</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Solution needs to have a universal MFA mechanism that could work on multiple devices simultaneously.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-4</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Solution needs to have a universal MFA mechanism with an open protocol.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+
+    <!-- CONNECTIVITY -->
+    <tr class="section-divider"><td colspan="10">CONNECTIVITY</td></tr>
+
+    <tr>
+      <td>14</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">connectivity</span></td>
+      <td class="user-story">Provide a persistent connection that doesn't require me to sign in every day. When I create a session, I expect it to persist for a reasonable period of time (to be defined) or until I terminate the session.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>15</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">connectivity</span></td>
+      <td class="user-story">The solution should offer multiple connection methods if one e.g. port is blocked. Consider access restrictions imposed from client networks.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-2</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">bandwidth</span></td>
+      <td class="user-story">The user should use a well-known port that is able to get through arbitrary firewalls without special access requirements.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-5</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>IDS</td>
+      <td><span class="group-tag">client</span></td>
+      <td class="user-story">The ability to connect to Sanger when also connected to another network e.g. external company.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-6</td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">connectivity</span></td>
+      <td class="user-story">Use the Sanger network as a jumping-off point to Sanger-managed AWS and similar external cloud environments.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-7</td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">connectivity</span></td>
+      <td class="user-story">Connect to laboratory instruments which have onboard servers (using SSH/SSH tunnelling).</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-last</td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td class="user-story">In order to reduce complexity I want to be able to use the same SSH connection whether onsite or off-site (e.g. for command line and IDE).</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+
+    <!-- AUTHORISATION / RBAC -->
+    <tr class="section-divider"><td colspan="10">AUTHORISATION &amp; ACCESS CONTROL</td></tr>
+
+    <tr>
+      <td>16</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">authorisation</span></td>
+      <td class="user-story strikethrough">Ability to implement RBAC to machines in order to restrict access to services to the authorised people accessed via the system.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>17</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">authorisation</span></td>
+      <td class="user-story">Ability to implement RBAC to administrative functions.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-16</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Support and enforce limitations on the connecting user to the user and/or hosts they can access internally from the gateway system.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-14</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">The solution must not require the creation of Sanger domain accounts for third party/visitors to reduce administration and licensing considerations with the use of a Sanger account.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y with change</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-24</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Sanger accounts must integrate with existing JML procedures. Access must be immediately denied when Sanger account is locked.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-25</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Third Party accounts must have an expiry date, be regularly reviewed, and be disabled after a period of inactivity.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+
+    <!-- BANDWIDTH / CLIENT -->
+    <tr class="section-divider"><td colspan="10">BANDWIDTH &amp; CLIENT</td></tr>
+
+    <tr>
+      <td>19</td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">bandwidth</span></td>
+      <td class="user-story strikethrough">Provide a lower bandwidth method of access for when internet access from my connection or Sanger's is unreliable or congested.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>20</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">client</span></td>
+      <td class="user-story">Provide access to the compute clusters and Flexible Compute Infrastructure's command line. It should allow onward connectivity to SSH-enabled hosts reachable from the Sanger network.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>21</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">licensing/cost/client</span></td>
+      <td class="user-story">Allow connection with an open source, open-standard client that doesn't require me to install software on my computer. The solution needs to support open standards protocol.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>22</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">bandwidth</span></td>
+      <td class="user-story strikethrough">Provide a way for users to specify what traffic goes through their computer. Provide a way to exclude specific traffic from my computer that does not need to go via Sanger's networks (e.g. Slack, Zoom, web browsing).</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>23</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">non-sanger computer</span></td>
+      <td class="user-story">I want to be able to browse in an authenticated way Sanger websites such as Confluence and Fred when not on-site, preferably without the overhead of another virtual desktop. The solution needs to allow connectivity to internally-based websites via http/https.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>24</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">client</span></td>
+      <td class="user-story">Allow X forwarding from compute clusters and/or Flexible Compute environments so interactive jobs can show R plots etc. X11 forwarding — support the ability to forward a remote application displayed to a local device.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>25</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">client</span></td>
+      <td class="user-story">As a developer working on systems internal to Sanger, I need a way to connect to arbitrary ports on those services for administrator or testing purposes (e.g. databases, staging websites).</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-1</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>IDS</td>
+      <td><span class="group-tag">client</span></td>
+      <td class="user-story">The solution should support accessing remote file systems (e.g. SSHFS/FUSE). Ability to connect to file systems that can then be reached locally on the client, to upload and download data/information.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-4</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>IDS</td>
+      <td><span class="group-tag">client</span></td>
+      <td class="user-story">The solution should provide iLO/IPMI et al access for authorised users; either via SSH or web methods.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-8</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td></td>
+      <td class="user-story">The solution should allow seamless use with local developer tools e.g. VSCode remote development option, cssh, dsh, emacs (Tramp).</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-8</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Supports the use of SOCKS proxy for internal websites.</td>
+      <td></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+
+    <!-- FILE TRANSFER -->
+    <tr class="section-divider"><td colspan="10">FILE TRANSFER</td></tr>
+
+    <tr>
+      <td>img2-12</td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">File Transfer</span></td>
+      <td class="user-story">Allow the use of scp file transfers or synchronise file states e.g. rsync, git pull.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-13</td>
+      <td></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">File Transfer</span></td>
+      <td class="user-story">As a researcher with data on the Cloud, I want a way to safely transfer data to and from the cloud to my Sanger account.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+
+    <!-- SECURITY & GOVERNANCE -->
+    <tr class="section-divider"><td colspan="10">SECURITY &amp; GOVERNANCE</td></tr>
+
+    <tr>
+      <td>30</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td class="user-story strikethrough">As a Principal Investigator who has signed data access agreements I want to know that the security around the application will protect my data and not expose it to those I have not explicitly granted it.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-19</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>IGS</td>
+      <td><span class="group-tag">Security and Governance</span></td>
+      <td class="user-story">EdDSA keys over modern curves (Ed25519) is preferred over ECDSA using NIST P-curves; which are preferred over RSA signatures; which is preferred over DSA signatures.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-20</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td>IGS</td>
+      <td><span class="group-tag">Security and Governance</span></td>
+      <td class="user-story">RSA keys need to have a modulus of at least 2048 bits but 3072 or 4096 are better because strictly speaking 2048 bits provides only ~112 "bits of security" while the recommendation is 128.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-21</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td>IGS</td>
+      <td><span class="group-tag">Security and Governance</span></td>
+      <td class="user-story">All keys must use SHA2 and not use SHA1.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-22</td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td><span class="group-tag">Security and Governance</span></td>
+      <td class="user-story">All encryption must follow best practice for configuration.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-23</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td>SD</td>
+      <td><span class="group-tag">Security and Governance</span></td>
+      <td class="user-story">Have a way of providing logins to end users not physically able to get to Sanger Morgan Service Desk (e.g. off-site, another country, another institute).</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-24</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td>SD</td>
+      <td><span class="group-tag">Security and Governance</span></td>
+      <td class="user-story">Be able to revoke access to the gateway for a user upon request from a member of Information Governance and Security team via the ticket system.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-16</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td>IGS</td>
+      <td><span class="group-tag">IDS</span></td>
+      <td class="user-story">The use of the SSH protocol is common in the industry and will aid with user adoption and training.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-17</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">IGS</span></td>
+      <td class="user-story">As a security administrator I want to be able to integrate with the SIEM system.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-29</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td>IGS</td>
+      <td><span class="group-tag">Security and Governance</span></td>
+      <td class="user-story">SSH System Hardening Framework for SSH implemented according to DevSe.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img3-15</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">We have a need for the capture and visibility of actions taken by non-Sanger personnel (third-party entities) when performing maintenance of on-campus systems for compliance, troubleshooting and security purposes, or third parties accessing highly secure, confidential services. Provide a mechanism to exclude sensitive or confidential information from logs.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-19</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">The solution provides the functionality of having user sessions and traffic securely isolated from each so a bad actor cannot compromise the whole SSH service if a compromise occurred.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-20</td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Capability to log to a Security Information and Event Management (SIEM) Solution for the purposes of audit data and service health logging, e.g. who logged in, what device, what time, what they then connected onto.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img3-26</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS/IGS</td>
+      <td></td>
+      <td class="user-story">The solution, if it logs sessions, should not capture passwords or tokens where possible.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+
+    <!-- DISASTER RECOVERY -->
+    <tr class="section-divider"><td colspan="10">DISASTER RECOVERY &amp; HIGH AVAILABILITY</td></tr>
+
+    <tr>
+      <td>img2-9</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>IDS</td>
+      <td><span class="group-tag">Disaster Recovery</span></td>
+      <td class="user-story">As part of Sanger's disaster recovery plan: solutions ability to connect to Sanger remote sites when there is a site outage with a seamless failover. The service needs to be unaffected by an outage or temporary loss of the data centre.</td>
+      <td><span class="yn partial">Y (with change)</span></td>
+      <td><span class="yn n">N</span></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-10</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">alternative access method</span></td>
+      <td class="user-story">A second method of getting onto the network should the VPN fail or become unstable for me (e.g. working at a conference and VPN doesn't work but SSH does and Service Desk are in a different time zone so support is delayed/unavailable).</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-18</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td></td>
+      <td><span class="group-tag">Disaster Recovery</span></td>
+      <td class="user-story">Access methods for when some 2FA is not available.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-30</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td>IGS</td>
+      <td><span class="group-tag">Disaster Recovery</span></td>
+      <td class="user-story">Backup of the configuration and deployment of the service so that it can be replaced in a reasonable time frame.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-12</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td>Customer</td>
+      <td></td>
+      <td class="user-story">Stateful High Availability: The solution should be able to tolerate component failure without affecting service to the end user, although state of existing connections will not be lost.</td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+    <tr>
+      <td>img3-13</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Stateless High Availability: The solution should be able to tolerate component failure without affecting service to the end user, although state of existing connections may be lost.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+
+    <!-- USABILITY / OPERATIONS -->
+    <tr class="section-divider"><td colspan="10">USABILITY &amp; OPERATIONS</td></tr>
+
+    <tr>
+      <td>26</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">As a Linux technical specialist, I want to use the command interface that is familiar to me. I require a solution that would provide command line access to Sanger resources.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>28</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td></td>
+      <td class="user-story">Provide access to the Sanger infrastructure outside of a VPN as I work with/for other institutes and they require a VPN to access their systems and I am not able to run multiple VPN's simultaneously.</td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+    <tr>
+      <td>29</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">As a person I want documentation to know whether SSH or similar access vs Sanger VPN best meets my needs e.g. how to access internal websites, run notebooks interactively on the cluster using the gateway. Provide appropriate documentation on the best and most appropriate use of the tool vs other remote access solutions at Sanger.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-6</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">The solution should be usable by people who do not have access to an IT department or similar level of support.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-7</td>
+      <td></td>
+      <td><span class="pill must">Must</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">What is an appropriate security standard for a collaborative online environment and does the solution fit it?</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-25</td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Have a way of reporting user activity: Logins / Length of login / Systems accessed.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-32</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Ideal case is to have a key on the remote access device that can be used instead of a password so that no additional authentication is required, along with an open MFA solution is required.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-33</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill noop">No Opinion</span></td>
+      <td>IDS/IMT</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Agreed regular maintenance period when the system can be at risk or offline for patching, maintenance or other essential works.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img2-34</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">As an end user I want a default resilient, consistently named landing point for my SSH connections so that I don't have to choose or find out a host to connect to, and is updated automatically if it changes. This should be the default but able to be over-ridden if the user wants to use a specific host as a jumping-off point.</td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img2-35</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">There should be a way for an end user with limited technical knowledge to set up the access method.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-0</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>Customer</td>
+      <td><span class="group-tag">Usability</span></td>
+      <td class="user-story">Requesting / gaining access should be self-service.</td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N</span></td>
+    </tr>
+
+    <!-- SESSION MANAGEMENT -->
+    <tr class="section-divider"><td colspan="10">SESSION MANAGEMENT &amp; OPERATIONS</td></tr>
+
+    <tr>
+      <td>img3-17</td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill should">Should</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Authorised gateway administrators should be able to session share and join sessions for the purposes of support reasons.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-18</td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Session sharing can be initiated by the end user.</td>
+      <td></td>
+      <td></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>img3-21</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Provide ease of patching and upgrades. Ideally offering in-place patching, upgrades, using native installation packages rather than custom scripts.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-22</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">Provide ease of patching and upgrades. Ideally non-disruptive.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+    <tr>
+      <td>img3-23</td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill must">Must</span></td>
+      <td><span class="pill could">Could</span></td>
+      <td>IDS/IMT</td>
+      <td></td>
+      <td class="user-story">The solution provides additional functionality for integrating with databases, RDP using session logging.</td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
+    </tr>
+
+  </tbody>
+</table>
+</div>
+
+<p style="margin-top:16px;font-size:11px;color:#999;">
+  Note: Row IDs prefixed "img2-" and "img3-" indicate rows from screenshots 2 and 3 respectively. Strikethrough rows were struck through in the original spreadsheet. Some cells were blank or illegible in the source images.
+</p>
+
+</body>
+</html>
