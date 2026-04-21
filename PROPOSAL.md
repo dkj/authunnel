@@ -6,7 +6,7 @@ Remote access to internal SSH services is a common need across the institute. Th
 
 - **Teleport** integrates with Okta SSO and works well, but escalating licence fees are a growing concern for what is mostly used as an "SSH to an internal host" use case.
 - **VPN** is often effective for staff on Sanger laptops. However, it is not available to those working from non-Sanger machines, and it grants broader network access than some use cases require.
-- **The legacy bastion** (ssh-gateway) was decommissioned several years ago due to a lack of resource to maintain it and no integration with SSO. _(Is this correct?)_
+- **The legacy bastion** (ssh-gateway) was decommissioned several years ago due to a lack of resource to maintain it and no integration with SSO.
 
 Authunnel is a lightweight, purpose-built tool that fills these gaps. It tunnels SSH connections over an Okta-authenticated WebSocket, using infrastructure the institute already operates. Initially, it can complement existing access methods rather than necessarily replacing them.
 
