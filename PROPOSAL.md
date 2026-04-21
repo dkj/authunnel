@@ -27,7 +27,7 @@ Authunnel is an authenticated tunnel for reaching internal SSH services. Users r
 5. **Scoped access at multiple levels.** Access can be restricted at several independent layers, each enforced by a different part of the infrastructure:
    - **Destination allowlist:** The `--allow` option restricts which destinations authenticated users can reach, using host glob patterns and CIDR rules (e.g. `*.internal:22`, `10.0.0.0/8:22`). Starting the server without either `--allow` rules or an explicit `--allow-open-egress` flag is rejected — the egress posture is never silently permissive.
    - **Admission limits:** Per-user and global caps on concurrent tunnels, plus per-user open-rate limits, bound the impact of credential abuse or misbehaving clients.
-   - **Network layer:** VMware or OpenStack security groups on the server VM control both inbound access (only from the Ivanti VIP) and outbound access. The outbound allowlist must include the Okta OIDC endpoints (for discovery and JWKS), the centralised logging endpoints (ELK / Splunk), and the permitted internal SSH destinations — and nothing else.
+   - **Network layer:** VMware or OpenStack security groups on the server VM control both inbound access (only from the Ivanti VIP) and outbound access. The outbound allowlist must include the Okta OIDC endpoints (for discovery and JWKS), the centralised logging endpoints (ELK / Splunk), the permitted internal SSH destinations, DNS resolvers (for hostname resolution), NTP (UDP 123; needed for accurate JWT time-claim validation — `iat`, `nbf`, `exp`), and — depending on how the VM is initialised — DHCP (UDP 67/68) at boot. Nothing else.
 
    This is useful for granting access to specific services only, or for limiting exposure to the broader network.
 
@@ -58,7 +58,7 @@ ssh internal-host
 **Components:**
 
 - **Ivanti Traffic Manager** — TLS termination at `st.sanger.ac.uk:443`, forwarding to the backend VM on port 8080. Configured to accept HTTPS only — any plain HTTP listener should either be absent or redirect to HTTPS; it must never accept plaintext client traffic. Requires WebSocket upgrade pass-through and setting `X-Forwarded-Proto` and `X-Forwarded-Host` headers on forwarded requests.
-- **Server VM** (VMware or OpenStack) — a single small Linux VM running the authunnel-server binary, managed by systemd. No database, no disk state beyond the binary and a configuration file. Security groups restrict inbound access (only from the Ivanti VIP) and outbound access (only to Okta OIDC endpoints, centralised logging endpoints, and the permitted internal SSH destinations).
+- **Server VM** (VMware or OpenStack) — a single small Linux VM running the authunnel-server binary, managed by systemd. No database, no disk state beyond the binary and a configuration file. Security groups restrict inbound access (only from the Ivanti VIP) and outbound access (only to Okta OIDC endpoints, centralised logging endpoints, the permitted internal SSH destinations, and the infrastructure services the host needs to function: DNS resolvers, NTP, and DHCP if required at boot).
 - **Okta** — one public OIDC client registration (for the CLI tool) and one audience/resource entry (for token scoping to `authunnel-server`).
 - **DNS** — `st.sanger.ac.uk` pointing at the Ivanti VIP.
 
@@ -94,7 +94,7 @@ Host *.internal.sanger.ac.uk
 | Ivanti VIP + TLS cert for `st.sanger.ac.uk`, configured to accept HTTPS only (no plain HTTP listener, or 80→443 redirect at most) | Network / Ivanti team | Standard config |
 | WebSocket upgrade pass-through on Ivanti | Network / Ivanti team | Standard config |
 | DNS entry for `st.sanger.ac.uk` | Network team | ~5 min |
-| Security groups (inbound from Ivanti, outbound to Okta, logging endpoints, and permitted hosts) | Infrastructure / Network team | Standard config |
+| Security groups (inbound from Ivanti; outbound to Okta, logging endpoints, permitted SSH hosts, DNS, NTP, and DHCP if needed at boot) | Infrastructure / Network team | Standard config |
 | Deploy binary + systemd unit | Infrastructure & Authunnel maintainer | ~1 hour |
 | Log shipping from server VM (Filebeat or Splunk UF) | Logging / observability team | Standard config (see below) |
 | Ivanti access/TLS log shipping to the same logging system | Network / Ivanti team + Logging team | Standard config; ideally configure Ivanti to emit a `Traceparent` header so server logs and Ivanti logs can be joined by `trace_id` |
