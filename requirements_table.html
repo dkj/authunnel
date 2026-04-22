@@ -173,7 +173,7 @@
 <body>
 
 <h1>Remote Access Solution — Requirements & User Stories</h1>
-<p class="subtitle">Criteria ratings across IMT, IGS, and End User perspectives, with vendor evaluation (Teleport / Global Protect / Citrix)</p>
+<p class="subtitle">Criteria ratings across IMT, IGS, and End User perspectives, with vendor evaluation (Teleport / Global Protect / Citrix / Authunnel)</p>
 
 <div class="legend">
   <div class="legend-item"><span class="pill must">Must</span> Mandatory requirement</div>
@@ -199,12 +199,13 @@
       <th>Teleport</th>
       <th>Global<br>Protect</th>
       <th>Citrix<br>(retiring)</th>
+      <th>Authunnel</th>
     </tr>
   </thead>
   <tbody>
 
     <!-- ACCESS / DEVICE -->
-    <tr class="section-divider"><td colspan="10">DEVICE &amp; ACCESS METHOD</td></tr>
+    <tr class="section-divider"><td colspan="11">DEVICE &amp; ACCESS METHOD</td></tr>
 
     <tr>
       <td>1</td>
@@ -217,6 +218,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn partial">Y (future yubikey)</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
     <tr>
       <td>2</td>
@@ -229,6 +231,7 @@
       <td><span class="yn partial">Y (through browser)</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N (no iPad/iOS client)</span></td>
     </tr>
     <tr>
       <td>3</td>
@@ -238,6 +241,7 @@
       <td>Customer</td>
       <td><span class="group-tag">non-sanger computer</span></td>
       <td class="user-story">The solution needs to be able to support Sanger desktops and laptops.</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -253,6 +257,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn partial">Y (change required)</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
     <tr>
       <td>5</td>
@@ -265,6 +270,7 @@
       <td><span class="yn partial">Y (through browser)</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn partial">Y (through browser)</span></td>
+      <td><span class="yn n">N (no tablet/mobile client)</span></td>
     </tr>
     <tr>
       <td>6</td>
@@ -277,6 +283,7 @@
       <td><span class="yn partial">Y (through browser)</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn partial">Y (through browser)</span></td>
+      <td><span class="yn n">N (no tablet/mobile client)</span></td>
     </tr>
     <tr>
       <td>7</td>
@@ -289,6 +296,7 @@
       <td><span class="yn partial">Y (through browser)</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn partial">Y (through browser)</span></td>
+      <td><span class="yn n">N (no tablet/mobile client)</span></td>
     </tr>
     <tr>
       <td>8</td>
@@ -298,6 +306,7 @@
       <td></td>
       <td></td>
       <td class="user-story">Needs to support the different operating systems.</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -313,6 +322,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
     <tr>
       <td>10 (img2)</td>
@@ -325,10 +335,11 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn partial">Y with change</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
 
     <!-- AUTHENTICATION / MFA -->
-    <tr class="section-divider"><td colspan="10">AUTHENTICATION &amp; MFA</td></tr>
+    <tr class="section-divider"><td colspan="11">AUTHENTICATION &amp; MFA</td></tr>
 
     <tr>
       <td>9</td>
@@ -341,6 +352,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td></td>
     </tr>
     <tr>
       <td>10</td>
@@ -353,6 +365,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (via Okta)</span></td>
     </tr>
     <tr>
       <td>11</td>
@@ -365,6 +378,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (via Okta)</span></td>
     </tr>
     <tr>
       <td>12</td>
@@ -377,6 +391,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (via Okta)</span></td>
     </tr>
     <tr>
       <td>13</td>
@@ -386,6 +401,7 @@
       <td>Customer</td>
       <td><span class="group-tag">authentication</span></td>
       <td class="user-story strikethrough">Use hardware tokens (e.g. Yubi-keys) if provided by Sanger at no cost to me with replacements able to be sent within a reasonable timeframe and cost.</td>
+      <td></td>
       <td></td>
       <td></td>
       <td></td>
@@ -401,6 +417,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (via Okta WebAuthn/hardware keys)</span></td>
     </tr>
     <tr>
       <td>img3-5</td>
@@ -413,6 +430,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td></td>
     </tr>
     <tr>
       <td>img3-11</td>
@@ -425,6 +443,7 @@
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (via Okta WebAuthn/passkeys)</span></td>
     </tr>
     <tr>
       <td>img3-1</td>
@@ -434,6 +453,7 @@
       <td>Customer</td>
       <td><span class="group-tag">Usability</span></td>
       <td class="user-story">As a collaborator I sometimes come into Sanger at short notice and need access immediately and for a short time.</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -449,6 +469,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (via Okta)</span></td>
     </tr>
     <tr>
       <td>img3-4</td>
@@ -461,10 +482,11 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (OIDC/WebAuthn)</span></td>
     </tr>
 
     <!-- CONNECTIVITY -->
-    <tr class="section-divider"><td colspan="10">CONNECTIVITY</td></tr>
+    <tr class="section-divider"><td colspan="11">CONNECTIVITY</td></tr>
 
     <tr>
       <td>14</td>
@@ -474,6 +496,7 @@
       <td>Customer</td>
       <td><span class="group-tag">connectivity</span></td>
       <td class="user-story">Provide a persistent connection that doesn't require me to sign in every day. When I create a session, I expect it to persist for a reasonable period of time (to be defined) or until I terminate the session.</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -489,6 +512,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N (HTTPS/443 only)</span></td>
     </tr>
     <tr>
       <td>img2-2</td>
@@ -501,6 +525,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (HTTPS/443)</span></td>
     </tr>
     <tr>
       <td>img2-5</td>
@@ -513,6 +538,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (app-layer, not VPN)</span></td>
     </tr>
     <tr>
       <td>img3-6</td>
@@ -522,6 +548,7 @@
       <td>Customer</td>
       <td><span class="group-tag">connectivity</span></td>
       <td class="user-story">Use the Sanger network as a jumping-off point to Sanger-managed AWS and similar external cloud environments.</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -537,6 +564,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
     <tr>
       <td>img2-last</td>
@@ -549,10 +577,11 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
 
     <!-- AUTHORISATION / RBAC -->
-    <tr class="section-divider"><td colspan="10">AUTHORISATION &amp; ACCESS CONTROL</td></tr>
+    <tr class="section-divider"><td colspan="11">AUTHORISATION &amp; ACCESS CONTROL</td></tr>
 
     <tr>
       <td>16</td>
@@ -565,6 +594,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td></td>
     </tr>
     <tr>
       <td>17</td>
@@ -577,6 +607,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (via Okta groups + allow rules)</span></td>
     </tr>
     <tr>
       <td>img3-16</td>
@@ -589,6 +620,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (allow rules server-wide; admission per-user)</span></td>
     </tr>
     <tr>
       <td>img3-14</td>
@@ -601,6 +633,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn partial">Y with change</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (via Okta external identities)</span></td>
     </tr>
     <tr>
       <td>img3-24</td>
@@ -613,6 +646,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (token expiry closes tunnel promptly)</span></td>
     </tr>
     <tr>
       <td>img3-25</td>
@@ -625,10 +659,11 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (via Okta policy)</span></td>
     </tr>
 
     <!-- BANDWIDTH / CLIENT -->
-    <tr class="section-divider"><td colspan="10">BANDWIDTH &amp; CLIENT</td></tr>
+    <tr class="section-divider"><td colspan="11">BANDWIDTH &amp; CLIENT</td></tr>
 
     <tr>
       <td>19</td>
@@ -638,6 +673,7 @@
       <td>Customer</td>
       <td><span class="group-tag">bandwidth</span></td>
       <td class="user-story strikethrough">Provide a lower bandwidth method of access for when internet access from my connection or Sanger's is unreliable or congested.</td>
+      <td></td>
       <td></td>
       <td></td>
       <td></td>
@@ -653,6 +689,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
     <tr>
       <td>21</td>
@@ -665,6 +702,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (open source, open standards; client install required)</span></td>
     </tr>
     <tr>
       <td>22</td>
@@ -677,6 +715,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td></td>
     </tr>
     <tr>
       <td>23</td>
@@ -689,6 +728,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (SOCKS5 mode supports it; initial deploy may be SSH:22 only)</span></td>
     </tr>
     <tr>
       <td>24</td>
@@ -701,6 +741,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (SSH X11 forwarding unaffected)</span></td>
     </tr>
     <tr>
       <td>25</td>
@@ -713,6 +754,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (with appropriate allow rules)</span></td>
     </tr>
     <tr>
       <td>img2-1</td>
@@ -725,6 +767,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (SSHFS over SSH tunnel)</span></td>
     </tr>
     <tr>
       <td>img2-4</td>
@@ -737,6 +780,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (SSH or web via SOCKS5)</span></td>
     </tr>
     <tr>
       <td>img2-8</td>
@@ -749,6 +793,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (ProxyCommand-compatible)</span></td>
     </tr>
     <tr>
       <td>img3-8</td>
@@ -761,10 +806,11 @@
       <td></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (native SOCKS5 mode)</span></td>
     </tr>
 
     <!-- FILE TRANSFER -->
-    <tr class="section-divider"><td colspan="10">FILE TRANSFER</td></tr>
+    <tr class="section-divider"><td colspan="11">FILE TRANSFER</td></tr>
 
     <tr>
       <td>img2-12</td>
@@ -777,6 +823,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (scp/rsync/git over SSH)</span></td>
     </tr>
     <tr>
       <td>img2-13</td>
@@ -789,10 +836,11 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
 
     <!-- SECURITY & GOVERNANCE -->
-    <tr class="section-divider"><td colspan="10">SECURITY &amp; GOVERNANCE</td></tr>
+    <tr class="section-divider"><td colspan="11">SECURITY &amp; GOVERNANCE</td></tr>
 
     <tr>
       <td>30</td>
@@ -802,6 +850,7 @@
       <td></td>
       <td></td>
       <td class="user-story strikethrough">As a Principal Investigator who has signed data access agreements I want to know that the security around the application will protect my data and not expose it to those I have not explicitly granted it.</td>
+      <td></td>
       <td></td>
       <td></td>
       <td></td>
@@ -817,6 +866,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (SSH-layer choice, unaffected)</span></td>
     </tr>
     <tr>
       <td>img2-20</td>
@@ -829,6 +879,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (SSH-layer choice, unaffected)</span></td>
     </tr>
     <tr>
       <td>img2-21</td>
@@ -841,6 +892,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (Okta JWT uses SHA-256)</span></td>
     </tr>
     <tr>
       <td>img2-22</td>
@@ -850,6 +902,7 @@
       <td></td>
       <td><span class="group-tag">Security and Governance</span></td>
       <td class="user-story">All encryption must follow best practice for configuration.</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -865,6 +918,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
     <tr>
       <td>img2-24</td>
@@ -877,6 +931,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (via Okta; token expiry enforces)</span></td>
     </tr>
     <tr>
       <td>img2-16</td>
@@ -889,6 +944,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (SSH over authunnel)</span></td>
     </tr>
     <tr>
       <td>img2-17</td>
@@ -901,6 +957,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td></td>
+      <td><span class="yn partial">Y (structured JSON logs → ELK/Splunk)</span></td>
     </tr>
     <tr>
       <td>img2-29</td>
@@ -913,6 +970,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (SSH hosts unchanged)</span></td>
     </tr>
     <tr>
       <td>img3-15</td>
@@ -925,6 +983,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (tunnel metadata logged; no session recording)</span></td>
     </tr>
     <tr>
       <td>img3-19</td>
@@ -937,6 +996,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (per-tunnel isolation)</span></td>
     </tr>
     <tr>
       <td>img3-20</td>
@@ -946,6 +1006,7 @@
       <td>IDS/IMT</td>
       <td></td>
       <td class="user-story">Capability to log to a Security Information and Event Management (SIEM) Solution for the purposes of audit data and service health logging, e.g. who logged in, what device, what time, what they then connected onto.</td>
+      <td></td>
       <td></td>
       <td></td>
       <td></td>
@@ -961,10 +1022,11 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (no bearer tokens in logs)</span></td>
     </tr>
 
     <!-- DISASTER RECOVERY -->
-    <tr class="section-divider"><td colspan="10">DISASTER RECOVERY &amp; HIGH AVAILABILITY</td></tr>
+    <tr class="section-divider"><td colspan="11">DISASTER RECOVERY &amp; HIGH AVAILABILITY</td></tr>
 
     <tr>
       <td>img2-9</td>
@@ -977,6 +1039,7 @@
       <td><span class="yn partial">Y (with change)</span></td>
       <td><span class="yn n">N</span></td>
       <td></td>
+      <td><span class="yn partial">Y (stateless HA possible across sites)</span></td>
     </tr>
     <tr>
       <td>img2-10</td>
@@ -989,6 +1052,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (alternative to VPN by design)</span></td>
     </tr>
     <tr>
       <td>img2-18</td>
@@ -1001,6 +1065,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td><span class="yn partial">Y (via Okta backup factors)</span></td>
     </tr>
     <tr>
       <td>img2-30</td>
@@ -1013,6 +1078,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (config is flags + binary)</span></td>
     </tr>
     <tr>
       <td>img3-12</td>
@@ -1022,6 +1088,7 @@
       <td>Customer</td>
       <td></td>
       <td class="user-story">Stateful High Availability: The solution should be able to tolerate component failure without affecting service to the end user, although state of existing connections will not be lost.</td>
+      <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
@@ -1037,10 +1104,11 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn y">Y</span></td>
     </tr>
 
     <!-- USABILITY / OPERATIONS -->
-    <tr class="section-divider"><td colspan="10">USABILITY &amp; OPERATIONS</td></tr>
+    <tr class="section-divider"><td colspan="11">USABILITY &amp; OPERATIONS</td></tr>
 
     <tr>
       <td>26</td>
@@ -1053,6 +1121,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (uses native ssh via ProxyCommand)</span></td>
     </tr>
     <tr>
       <td>28</td>
@@ -1065,6 +1134,7 @@
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn partial">Y (app-layer; can coexist with other VPNs)</span></td>
     </tr>
     <tr>
       <td>29</td>
@@ -1077,6 +1147,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (documentation task)</span></td>
     </tr>
     <tr>
       <td>img2-6</td>
@@ -1089,6 +1160,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (with documentation)</span></td>
     </tr>
     <tr>
       <td>img2-7</td>
@@ -1098,6 +1170,7 @@
       <td>Customer</td>
       <td><span class="group-tag">Usability</span></td>
       <td class="user-story">What is an appropriate security standard for a collaborative online environment and does the solution fit it?</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -1113,6 +1186,7 @@
       <td></td>
       <td></td>
       <td></td>
+      <td></td>
     </tr>
     <tr>
       <td>img2-32</td>
@@ -1125,6 +1199,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (SSH key on device + Okta MFA)</span></td>
     </tr>
     <tr>
       <td>img2-33</td>
@@ -1134,6 +1209,7 @@
       <td>IDS/IMT</td>
       <td><span class="group-tag">Usability</span></td>
       <td class="user-story">Agreed regular maintenance period when the system can be at risk or offline for patching, maintenance or other essential works.</td>
+      <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
@@ -1149,6 +1225,7 @@
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
       <td></td>
+      <td><span class="yn n">N</span></td>
     </tr>
     <tr>
       <td>img2-35</td>
@@ -1161,6 +1238,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (with documentation)</span></td>
     </tr>
     <tr>
       <td>img3-0</td>
@@ -1173,10 +1251,11 @@
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
       <td><span class="yn n">N</span></td>
+      <td><span class="yn n">N (Okta enrolment still managed)</span></td>
     </tr>
 
     <!-- SESSION MANAGEMENT -->
-    <tr class="section-divider"><td colspan="10">SESSION MANAGEMENT &amp; OPERATIONS</td></tr>
+    <tr class="section-divider"><td colspan="11">SESSION MANAGEMENT &amp; OPERATIONS</td></tr>
 
     <tr>
       <td>img3-17</td>
@@ -1189,6 +1268,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn n">N</span></td>
     </tr>
     <tr>
       <td>img3-18</td>
@@ -1198,6 +1278,7 @@
       <td>IDS/IMT</td>
       <td></td>
       <td class="user-story">Session sharing can be initiated by the end user.</td>
+      <td></td>
       <td></td>
       <td></td>
       <td></td>
@@ -1213,6 +1294,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (single binary; native packaging optional work)</span></td>
     </tr>
     <tr>
       <td>img3-22</td>
@@ -1225,6 +1307,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (stateless rolling restart)</span></td>
     </tr>
     <tr>
       <td>img3-23</td>
@@ -1237,6 +1320,7 @@
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
       <td><span class="yn y">Y</span></td>
+      <td><span class="yn partial">Y (tunnelling Y; no session recording)</span></td>
     </tr>
 
   </tbody>
