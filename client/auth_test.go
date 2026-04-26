@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -633,6 +635,92 @@ func TestAcquireFileLockCanBeReacquiredAfterHolderProcessExits(t *testing.T) {
 		t.Fatalf("acquire lock after helper exit: %v", err)
 	}
 	release()
+}
+
+func TestAcquireFileLockReturnsContextErrorWhileLockHeld(t *testing.T) {
+	lockPath := filepathForTest(t, "tokens.lock")
+
+	// This test is about Authunnel's lock-acquisition loop, not the OS flock
+	// primitive itself. The helper process holds the lock so the parent sees
+	// EWOULDBLOCK/EAGAIN from LOCK_NB, exercises the 100 ms retry path, and
+	// then proves the ctx.Done() branch can interrupt a contended acquisition.
+	helperCtx, stopHelper := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopHelper()
+	cmd := exec.CommandContext(helperCtx, os.Args[0], "-test.run=TestAcquireFileLockHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"AUTHUNNEL_LOCK_HELPER=1",
+		"AUTHUNNEL_LOCK_PATH="+lockPath,
+		"AUTHUNNEL_LOCK_HOLD_MS=2000",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("open helper stdout pipe: %v", err)
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper process: %v", err)
+	}
+	var waitErr error
+	waitDone := make(chan struct{})
+	go func() {
+		waitErr = cmd.Wait()
+		close(waitDone)
+	}()
+	t.Cleanup(func() {
+		stopHelper()
+		select {
+		case <-waitDone:
+		case <-time.After(time.Second):
+			_ = cmd.Process.Kill()
+			select {
+			case <-waitDone:
+			case <-time.After(time.Second):
+			}
+		}
+	})
+
+	lockedCh := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			if scanner.Text() == "locked" {
+				lockedCh <- nil
+				return
+			}
+			lockedCh <- fmt.Errorf("unexpected helper stdout line %q", scanner.Text())
+			return
+		}
+		if err := scanner.Err(); err != nil {
+			lockedCh <- err
+			return
+		}
+		lockedCh <- io.EOF
+	}()
+
+	select {
+	case err := <-lockedCh:
+		if err != nil {
+			t.Fatalf("helper did not report lock acquisition: %v", err)
+		}
+	case <-waitDone:
+		t.Fatalf("helper exited before reporting lock acquisition: %v", waitErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for helper lock acquisition")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	release, err := acquireFileLock(ctx, lockPath)
+	if release != nil {
+		release()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("acquireFileLock under contention error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("acquireFileLock returned too slowly after context timeout: %s", elapsed)
+	}
 }
 
 func TestAcquireFileLockHelperProcess(t *testing.T) {
