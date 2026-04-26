@@ -308,6 +308,33 @@ func manageTunnelLongevity(
 ) {
 	originalSubject := claims.Subject
 
+	// All peer-visible control frames go through a buffered channel drained
+	// by a dedicated writer goroutine. This keeps the deadline-critical
+	// select below independent of peer reads: even if the writer parks on a
+	// blocked write or contended writeMu, the select still observes its
+	// expiry and max-duration timers and cancels the tunnel on time.
+	// SendControlTimeout uses an independent context, so the courtesy
+	// disconnect frame queued after cancel() can still reach the peer rather
+	// than failing against the already-cancelled tunnel context. Note that
+	// the timeout bounds the underlying ws.Write, not writeMu acquisition,
+	// so a stuck binary writer can still delay individual control frames —
+	// enforcement is unaffected because cancellation has already happened.
+	// Drop-on-full is safe — every frame is best-effort by design.
+	out := make(chan wsconn.ControlMessage, 16)
+	defer close(out)
+	go func() {
+		for msg := range out {
+			_ = conn.SendControlTimeout(2*time.Second, msg)
+		}
+	}()
+	enqueue := func(msg wsconn.ControlMessage) {
+		select {
+		case out <- msg:
+		default:
+			logger.Warn("control_send_dropped", slog.String("type", msg.Type))
+		}
+	}
+
 	// Token-expiry deadline (resettable via refresh). The connection deadline
 	// is token exp + grace, giving clients time to obtain a new token from
 	// providers that cache access tokens (e.g. Auth0).
@@ -350,7 +377,7 @@ func manageTunnelLongevity(
 
 		case <-tokenWarnTimer.C:
 			logger.Info("token_expiry_warning_sent", slog.Time("expires_at", connDeadline))
-			_ = conn.SendControl(wsconn.ControlMessage{
+			enqueue(wsconn.ControlMessage{
 				Type: "expiry_warning",
 				Data: mustMarshal(map[string]string{
 					"reason":     "token",
@@ -361,13 +388,16 @@ func manageTunnelLongevity(
 		case <-tokenDeadlineTimer.C:
 			logger.Info("tunnel_closing_token_expired")
 			cancel()
-			sendBestEffortDisconnect(conn, "token_expired")
+			enqueue(wsconn.ControlMessage{
+				Type: "disconnect",
+				Data: mustMarshal(map[string]string{"reason": "token_expired"}),
+			})
 			return
 
 		case <-maxWarnTimer.C:
 			maxDeadline := tunnelStart.Add(cfg.MaxDuration)
 			logger.Info("max_duration_warning_sent", slog.Time("expires_at", maxDeadline))
-			_ = conn.SendControl(wsconn.ControlMessage{
+			enqueue(wsconn.ControlMessage{
 				Type: "expiry_warning",
 				Data: mustMarshal(map[string]string{
 					"reason":     "max_duration",
@@ -378,7 +408,10 @@ func manageTunnelLongevity(
 		case <-maxDeadlineTimer.C:
 			logger.Info("tunnel_closing_max_duration")
 			cancel()
-			sendBestEffortDisconnect(conn, "max_duration_reached")
+			enqueue(wsconn.ControlMessage{
+				Type: "disconnect",
+				Data: mustMarshal(map[string]string{"reason": "max_duration_reached"}),
+			})
 			return
 
 		case msg, ok := <-conn.ControlChan():
@@ -392,14 +425,14 @@ func manageTunnelLongevity(
 				AccessToken string `json:"access_token"`
 			}
 			if err := json.Unmarshal(msg.Data, &payload); err != nil || payload.AccessToken == "" {
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "invalid_payload"}),
 				})
 				continue
 			}
 			if !cfg.ImplementsExpiry {
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "token_expiry_not_enforced"}),
 				})
@@ -408,7 +441,7 @@ func manageTunnelLongevity(
 			newClaims, err := validator.ValidateAccessToken(ctx, payload.AccessToken)
 			if err != nil {
 				logger.Warn("token_refresh_rejected", slog.String("error", err.Error()))
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "validation_failed"}),
 				})
@@ -425,7 +458,7 @@ func manageTunnelLongevity(
 			// the configured deadline beyond exp + grace.
 			if err := checkTokenUsableBy(newClaims, connDeadline); err != nil {
 				logger.Warn("token_refresh_rejected_not_yet_valid", slog.String("error", err.Error()))
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "not_yet_valid"}),
 				})
@@ -436,7 +469,7 @@ func manageTunnelLongevity(
 					slog.String("original", originalSubject),
 					slog.String("received", newClaims.Subject),
 				)
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "subject_mismatch"}),
 				})
@@ -449,7 +482,7 @@ func manageTunnelLongevity(
 					slog.Time("current", tokenExpiry),
 					slog.Time("received", newExpiry),
 				)
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "expiry_reduced"}),
 				})
@@ -474,7 +507,7 @@ func manageTunnelLongevity(
 					tokenWarnTimer = time.NewTimer(remaining / 2)
 				}
 				logger.Info("token_refresh_accepted_unchanged", slog.Time("expiry", connDeadline))
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_accepted",
 					Data: mustMarshal(map[string]string{"expires_at": connDeadline.Format(time.RFC3339)}),
 				})
@@ -498,23 +531,12 @@ func manageTunnelLongevity(
 			}
 			tokenDeadlineTimer = time.NewTimer(remaining)
 			logger.Info("token_refresh_accepted", slog.Time("new_expiry", connDeadline))
-			_ = conn.SendControl(wsconn.ControlMessage{
+			enqueue(wsconn.ControlMessage{
 				Type: "token_accepted",
 				Data: mustMarshal(map[string]string{"expires_at": connDeadline.Format(time.RFC3339)}),
 			})
 		}
 	}
-}
-
-// sendBestEffortDisconnect attempts to send a disconnect control message with
-// a short timeout. It is called after the tunnel context has been cancelled, so
-// the write may fail — this is intentional. Cancellation is the authoritative
-// teardown mechanism; the disconnect frame is a courtesy to the client.
-func sendBestEffortDisconnect(conn *wsconn.MultiplexConn, reason string) {
-	_ = conn.SendControlTimeout(2*time.Second, wsconn.ControlMessage{
-		Type: "disconnect",
-		Data: mustMarshal(map[string]string{"reason": reason}),
-	})
 }
 
 // newTimerUntil returns a timer that fires warningBefore a deadline. If the
