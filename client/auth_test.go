@@ -611,32 +611,21 @@ func TestAcquireFileLockAllowsReuseOfExistingLockFile(t *testing.T) {
 
 func TestAcquireFileLockCanBeReacquiredAfterHolderProcessExits(t *testing.T) {
 	lockPath := filepathForTest(t, "tokens.lock")
-	cmd := exec.Command(os.Args[0], "-test.run=TestAcquireFileLockHelperProcess$")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestAcquireFileLockHelperProcess$")
 	cmd.Env = append(os.Environ(),
 		"AUTHUNNEL_LOCK_HELPER=1",
 		"AUTHUNNEL_LOCK_PATH="+lockPath,
 		"AUTHUNNEL_LOCK_HOLD_MS=100",
 	)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stdout
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start helper process: %v", err)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run helper process: %v\noutput:\n%s", err, string(output))
 	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
-
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(stdout.String(), "locked\n") {
-		if time.Now().After(deadline) {
-			t.Fatalf("helper did not report lock acquisition: %s", stdout.String())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("wait for helper process: %v\noutput:\n%s", err, stdout.String())
+	if !strings.Contains(string(output), "locked\n") {
+		t.Fatalf("helper did not report lock acquisition: %s", string(output))
 	}
 
 	release, err := acquireFileLock(context.Background(), lockPath)
