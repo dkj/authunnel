@@ -185,31 +185,26 @@ type HandlerOptions struct {
 }
 
 // NewHandler installs the small HTTP surface used by the server:
-//   - "/" (exact) for a simple liveness response; unknown paths return 404.
-//   - "/protected" and the "/protected/" subtree for token-validation smoke
-//     testing. Authentication is enforced before any path-matching is
-//     reported, so any unauthenticated request under /protected/ returns 401.
-//   - "/protected/tunnel" for the authenticated websocket-to-SOCKS bridge.
-//     This pattern is more specific than the "/protected/" subtree and so
-//     takes precedence for that exact path.
+//   - "GET /{$}" — unauthenticated liveness response. The "{$}" terminator
+//     keeps "/" from acting as a catch-all subtree so unmatched paths
+//     return 404 instead of falling through here.
+//   - "GET /protected" and "GET /protected/" (subtree) — bearer-token smoke
+//     test. Subpaths other than /protected/tunnel return 404 after auth.
+//   - "GET /protected/tunnel" — authenticated websocket-to-SOCKS bridge.
+//     More specific than the /protected/ subtree and so takes precedence.
 //
-// When Longevity is configured in the handler options, each tunnel is managed
-// by a background goroutine that enforces connection lifetime limits and
-// handles token refresh requests from the client over the control channel.
+// Patterns are GET-only; Go's ServeMux automatically routes HEAD requests
+// to the GET handler, and the mux returns 405 with an Allow header for
+// other methods. When Longevity is configured the tunnel is managed by a
+// background goroutine that enforces connection lifetime limits and
+// handles token refresh requests over the control channel.
 func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOptions) *http.ServeMux {
 	var opt HandlerOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
 	mux := http.NewServeMux()
-	// "/{$}" matches only the exact root path. Without the {$} terminator
-	// "/" would be a subtree pattern that also catches every otherwise
-	// unmatched request, which previously caused /protected/ (trailing
-	// slash) to fall through to this unauthenticated handler.
-	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
-		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
-			return
-		}
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -217,24 +212,16 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		_, _ = w.Write([]byte("OK " + time.Now().String()))
 	})
 
-	// protectedSmokeTest serves the smoke-test endpoint. It is registered
-	// under both "/protected" (exact) and "/protected/" (subtree) so that
-	// trailing-slash and subpath variants cannot bypass authentication by
-	// falling through to the root handler. Subpath requests that pass auth
-	// return 404 — only /protected and /protected/ emit the smoke-test body.
+	// protectedSmokeTest is registered under both /protected (exact) and
+	// /protected/ (subtree) so the trailing-slash variant cannot fall
+	// through to the root handler. Subpaths other than /protected/tunnel
+	// (which has its own more-specific registration) return 404 after auth.
 	protectedSmokeTest := func(w http.ResponseWriter, r *http.Request) {
-		// Authenticate first so unauthenticated callers cannot probe
-		// path or method details: any request under /protected/ that
-		// lacks a valid bearer token returns 401, regardless of method
-		// or subpath.
 		if _, ok := validateRequestToken(w, r, validator); !ok {
 			return
 		}
 		if r.URL.Path != "/protected" && r.URL.Path != "/protected/" {
 			http.NotFound(w, r)
-			return
-		}
-		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 			return
 		}
 		if r.Method == http.MethodHead {
@@ -243,13 +230,19 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		}
 		_, _ = w.Write([]byte("Protected OK " + time.Now().String()))
 	}
-	mux.HandleFunc("/protected", protectedSmokeTest)
-	mux.HandleFunc("/protected/", protectedSmokeTest)
+	mux.HandleFunc("GET /protected", protectedSmokeTest)
+	mux.HandleFunc("GET /protected/", protectedSmokeTest)
 
-	mux.HandleFunc("/protected/tunnel", func(w http.ResponseWriter, r *http.Request) {
-		// Authenticate before checking websocket headers so unauthenticated
-		// probes get a uniform 401 rather than a 426 that confirms this is
-		// a websocket endpoint.
+	mux.HandleFunc("GET /protected/tunnel", func(w http.ResponseWriter, r *http.Request) {
+		// The "GET /protected/tunnel" pattern auto-routes HEAD to this
+		// handler. HEAD has no meaningful semantics on a websocket-upgrade
+		// endpoint and would otherwise pass through token validation and
+		// admission before failing in websocket.Accept; reject it up front.
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		claims, ok := validateRequestToken(w, r, validator)
 		if !ok {
 			return
@@ -601,13 +594,6 @@ func mustMarshal(v any) json.RawMessage {
 // trustForwardedProto enables X-Forwarded-Proto and X-Forwarded-Host for
 // scheme and host inference; see HandlerOptions.TrustForwardedProto.
 func checkWebSocketRequest(w http.ResponseWriter, r *http.Request, trustForwardedProto bool) bool {
-	if r.Method != http.MethodGet {
-		loggerFromContext(r.Context()).Warn("websocket_rejected",
-			slog.String("reason", "method_not_allowed"),
-		)
-		http.Error(w, "websocket upgrade requires GET", http.StatusMethodNotAllowed)
-		return false
-	}
 	if !headerContainsToken(r.Header, "Connection", "upgrade") || !headerContainsToken(r.Header, "Upgrade", "websocket") {
 		loggerFromContext(r.Context()).Warn("websocket_rejected",
 			slog.String("reason", "upgrade_headers_missing"),
@@ -772,17 +758,6 @@ func defaultPortForScheme(scheme string) string {
 	default:
 		return ""
 	}
-}
-
-func allowMethods(w http.ResponseWriter, r *http.Request, allowed ...string) bool {
-	for _, method := range allowed {
-		if r.Method == method {
-			return true
-		}
-	}
-	w.Header().Set("Allow", strings.Join(allowed, ", "))
-	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	return false
 }
 
 func clearHijackedConnDeadlines(w http.ResponseWriter) http.ResponseWriter {

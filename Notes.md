@@ -315,9 +315,12 @@ At runtime the server validates:
 
 For manual debugging, either decode the JWT locally to inspect `aud`, or hit
 `/protected` with the bearer token and expect a `200 OK` only when the token is
-valid for the configured audience. Every path under `/protected/` (including
-`/protected/`, `/protected/foo`, and `/protected/tunnel`) requires the bearer
-token; only `/` is unauthenticated.
+valid for the configured audience. `GET` under `/protected/` requires the
+bearer token, as does the auto-routed `HEAD` on the smoke-test paths
+(`/protected` and `/protected/`). `HEAD /protected/tunnel` is rejected with
+`405` before auth (HEAD has no meaning on a websocket endpoint), and other
+methods receive `405` from the router before the auth handler runs. `/` is
+unauthenticated.
 
 ### Managed OIDC client notes
 

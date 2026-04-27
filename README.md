@@ -37,7 +37,7 @@ The target workflow is:
 
 1. Reads OIDC issuer, audience, listen address, TLS mode, and connection longevity configuration from flags or environment.
 2. Performs OIDC discovery once at startup, solely to locate the issuer's JWKS endpoint.
-3. Accepts HTTP requests at `/protected/tunnel`, verifies the bearer token's signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission), then checks the WebSocket upgrade headers. Authentication runs first so unauthenticated callers cannot distinguish this endpoint from any other under `/protected/`.
+3. Accepts `GET /protected/tunnel`, verifies the bearer token's signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission), then checks the WebSocket upgrade headers. Unauthenticated `GET` requests under `/protected/` receive `401`; other HTTP methods receive `405` from the router.
 4. Applies admission controls (concurrent-tunnel caps and per-user rate limits) when configured, rejecting over-limit requests with `429`/`503` and a `Retry-After` header.
 5. Upgrades the connection to WebSocket.
 6. Hands each upgraded connection to the SOCKS5 server implementation.
