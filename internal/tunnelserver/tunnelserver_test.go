@@ -3,6 +3,7 @@ package tunnelserver
 import (
 	"bufio"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -10,6 +11,73 @@ import (
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
+
+func TestRouteAuthBoundaries(t *testing.T) {
+	validator := &mockValidator{tokens: map[string]*oidc.AccessTokenClaims{
+		"good": {TokenClaims: oidc.TokenClaims{Subject: "alice"}},
+	}}
+	mux := NewHandler(validator, NewObservedSOCKSServer(nil, nil, 0))
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		auth       string
+		wsHeaders  bool
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "root_get_unauth_ok", method: http.MethodGet, path: "/", wantStatus: http.StatusOK, wantBody: "OK "},
+		{name: "root_post_method_not_allowed", method: http.MethodPost, path: "/", wantStatus: http.StatusMethodNotAllowed},
+		{name: "unknown_path_404", method: http.MethodGet, path: "/healthz-not-real", wantStatus: http.StatusNotFound},
+		{name: "protected_unauth_401", method: http.MethodGet, path: "/protected", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_authed_ok", method: http.MethodGet, path: "/protected", auth: "Bearer good", wantStatus: http.StatusOK, wantBody: "Protected OK "},
+		// Regression: /protected/ used to fall through to the unauthenticated
+		// "/" catch-all and return 200 OK with no token.
+		{name: "protected_slash_unauth_401", method: http.MethodGet, path: "/protected/", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_slash_authed_ok", method: http.MethodGet, path: "/protected/", auth: "Bearer good", wantStatus: http.StatusOK, wantBody: "Protected OK "},
+		{name: "protected_subpath_unauth_401", method: http.MethodGet, path: "/protected/foo", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_subpath_authed_404", method: http.MethodGet, path: "/protected/foo", auth: "Bearer good", wantStatus: http.StatusNotFound},
+		{name: "protected_bad_token_403", method: http.MethodGet, path: "/protected", auth: "Bearer nope", wantStatus: http.StatusForbidden},
+		// Method check must not run before auth — unauthenticated callers
+		// must not be able to probe which methods a /protected/* path
+		// supports. They get 401 regardless of method.
+		{name: "protected_post_unauth_401", method: http.MethodPost, path: "/protected", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_slash_post_unauth_401", method: http.MethodPost, path: "/protected/", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_subpath_post_unauth_401", method: http.MethodPost, path: "/protected/foo", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_post_authed_405", method: http.MethodPost, path: "/protected", auth: "Bearer good", wantStatus: http.StatusMethodNotAllowed},
+		{name: "protected_subpath_post_authed_404", method: http.MethodPost, path: "/protected/foo", auth: "Bearer good", wantStatus: http.StatusNotFound},
+		// /protected/tunnel must not reveal it is a websocket endpoint to
+		// unauthenticated callers — auth runs before the WS-header check.
+		{name: "tunnel_unauth_no_ws_headers_401", method: http.MethodGet, path: "/protected/tunnel", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "tunnel_unauth_with_ws_headers_401", method: http.MethodGet, path: "/protected/tunnel", wsHeaders: true, wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "https://example.test"+tc.path, nil)
+			if tc.auth != "" {
+				req.Header.Set("Authorization", tc.auth)
+			}
+			if tc.wsHeaders {
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-WebSocket-Version", "13")
+				req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req.Header.Set("Origin", "https://example.test")
+			}
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %q)", rr.Code, tc.wantStatus, rr.Body.String())
+			}
+			if tc.wantBody != "" && !strings.Contains(rr.Body.String(), tc.wantBody) {
+				t.Fatalf("body %q does not contain %q", rr.Body.String(), tc.wantBody)
+			}
+		})
+	}
+}
 
 func TestValidateStandardClaims(t *testing.T) {
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)

@@ -315,7 +315,9 @@ At runtime the server validates:
 
 For manual debugging, either decode the JWT locally to inspect `aud`, or hit
 `/protected` with the bearer token and expect a `200 OK` only when the token is
-valid for the configured audience.
+valid for the configured audience. Every path under `/protected/` (including
+`/protected/`, `/protected/foo`, and `/protected/tunnel`) requires the bearer
+token; only `/` is unauthenticated.
 
 ### Managed OIDC client notes
 

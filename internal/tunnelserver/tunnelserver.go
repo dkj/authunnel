@@ -185,9 +185,13 @@ type HandlerOptions struct {
 }
 
 // NewHandler installs the small HTTP surface used by the server:
-//   - "/" for a simple liveness response
-//   - "/protected" for token-validation smoke testing
-//   - "/protected/tunnel" for the authenticated websocket-to-SOCKS bridge
+//   - "/" (exact) for a simple liveness response; unknown paths return 404.
+//   - "/protected" and the "/protected/" subtree for token-validation smoke
+//     testing. Authentication is enforced before any path-matching is
+//     reported, so any unauthenticated request under /protected/ returns 401.
+//   - "/protected/tunnel" for the authenticated websocket-to-SOCKS bridge.
+//     This pattern is more specific than the "/protected/" subtree and so
+//     takes precedence for that exact path.
 //
 // When Longevity is configured in the handler options, each tunnel is managed
 // by a background goroutine that enforces connection lifetime limits and
@@ -198,7 +202,11 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		opt = opts[0]
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// "/{$}" matches only the exact root path. Without the {$} terminator
+	// "/" would be a subtree pattern that also catches every otherwise
+	// unmatched request, which previously caused /protected/ (trailing
+	// slash) to fall through to this unauthenticated handler.
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 			return
 		}
@@ -209,11 +217,24 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		_, _ = w.Write([]byte("OK " + time.Now().String()))
 	})
 
-	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
-		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+	// protectedSmokeTest serves the smoke-test endpoint. It is registered
+	// under both "/protected" (exact) and "/protected/" (subtree) so that
+	// trailing-slash and subpath variants cannot bypass authentication by
+	// falling through to the root handler. Subpath requests that pass auth
+	// return 404 — only /protected and /protected/ emit the smoke-test body.
+	protectedSmokeTest := func(w http.ResponseWriter, r *http.Request) {
+		// Authenticate first so unauthenticated callers cannot probe
+		// path or method details: any request under /protected/ that
+		// lacks a valid bearer token returns 401, regardless of method
+		// or subpath.
+		if _, ok := validateRequestToken(w, r, validator); !ok {
 			return
 		}
-		if _, ok := validateRequestToken(w, r, validator); !ok {
+		if r.URL.Path != "/protected" && r.URL.Path != "/protected/" {
+			http.NotFound(w, r)
+			return
+		}
+		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 			return
 		}
 		if r.Method == http.MethodHead {
@@ -221,14 +242,19 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 			return
 		}
 		_, _ = w.Write([]byte("Protected OK " + time.Now().String()))
-	})
+	}
+	mux.HandleFunc("/protected", protectedSmokeTest)
+	mux.HandleFunc("/protected/", protectedSmokeTest)
 
 	mux.HandleFunc("/protected/tunnel", func(w http.ResponseWriter, r *http.Request) {
-		if !checkWebSocketRequest(w, r, opt.TrustForwardedProto) {
-			return
-		}
+		// Authenticate before checking websocket headers so unauthenticated
+		// probes get a uniform 401 rather than a 426 that confirms this is
+		// a websocket endpoint.
 		claims, ok := validateRequestToken(w, r, validator)
 		if !ok {
+			return
+		}
+		if !checkWebSocketRequest(w, r, opt.TrustForwardedProto) {
 			return
 		}
 		decision, release, retryAfter := opt.Admission.Admit(claims.Subject)
