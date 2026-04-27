@@ -37,6 +37,10 @@ clean:
 test:
 	go test ./...
 
+.PHONY: race
+race:
+	go test -race ./...
+
 .PHONY: vet
 vet:
 	go vet ./...

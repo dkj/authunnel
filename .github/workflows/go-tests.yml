@@ -27,4 +27,9 @@ jobs:
 
       # Run the full Go test suite for all packages in this repository.
       - name: Run test suite
-        run: go test ./...
+        run: make test
+
+      # Run the same tests with Go's race detector. This is dynamic testing,
+      # not static analysis, so it lives with the normal test workflow.
+      - name: Run race test suite
+        run: make race

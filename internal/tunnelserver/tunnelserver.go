@@ -185,23 +185,26 @@ type HandlerOptions struct {
 }
 
 // NewHandler installs the small HTTP surface used by the server:
-//   - "/" for a simple liveness response
-//   - "/protected" for token-validation smoke testing
-//   - "/protected/tunnel" for the authenticated websocket-to-SOCKS bridge
+//   - "GET /{$}" — unauthenticated liveness response. The "{$}" terminator
+//     keeps "/" from acting as a catch-all subtree so unmatched paths
+//     return 404 instead of falling through here.
+//   - "GET /protected" and "GET /protected/" (subtree) — bearer-token smoke
+//     test. Subpaths other than /protected/tunnel return 404 after auth.
+//   - "GET /protected/tunnel" — authenticated websocket-to-SOCKS bridge.
+//     More specific than the /protected/ subtree and so takes precedence.
 //
-// When Longevity is configured in the handler options, each tunnel is managed
-// by a background goroutine that enforces connection lifetime limits and
-// handles token refresh requests from the client over the control channel.
+// Patterns are GET-only; Go's ServeMux automatically routes HEAD requests
+// to the GET handler, and the mux returns 405 with an Allow header for
+// other methods. When Longevity is configured the tunnel is managed by a
+// background goroutine that enforces connection lifetime limits and
+// handles token refresh requests over the control channel.
 func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOptions) *http.ServeMux {
 	var opt HandlerOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
-			return
-		}
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -209,11 +212,16 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		_, _ = w.Write([]byte("OK " + time.Now().String()))
 	})
 
-	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
-		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+	// protectedSmokeTest is registered under both /protected (exact) and
+	// /protected/ (subtree) so the trailing-slash variant cannot fall
+	// through to the root handler. Subpaths other than /protected/tunnel
+	// (which has its own more-specific registration) return 404 after auth.
+	protectedSmokeTest := func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := validateRequestToken(w, r, validator); !ok {
 			return
 		}
-		if _, ok := validateRequestToken(w, r, validator); !ok {
+		if r.URL.Path != "/protected" && r.URL.Path != "/protected/" {
+			http.NotFound(w, r)
 			return
 		}
 		if r.Method == http.MethodHead {
@@ -221,14 +229,25 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 			return
 		}
 		_, _ = w.Write([]byte("Protected OK " + time.Now().String()))
-	})
+	}
+	mux.HandleFunc("GET /protected", protectedSmokeTest)
+	mux.HandleFunc("GET /protected/", protectedSmokeTest)
 
-	mux.HandleFunc("/protected/tunnel", func(w http.ResponseWriter, r *http.Request) {
-		if !checkWebSocketRequest(w, r, opt.TrustForwardedProto) {
+	mux.HandleFunc("GET /protected/tunnel", func(w http.ResponseWriter, r *http.Request) {
+		// The "GET /protected/tunnel" pattern auto-routes HEAD to this
+		// handler. HEAD has no meaningful semantics on a websocket-upgrade
+		// endpoint and would otherwise pass through token validation and
+		// admission before failing in websocket.Accept; reject it up front.
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		claims, ok := validateRequestToken(w, r, validator)
 		if !ok {
+			return
+		}
+		if !checkWebSocketRequest(w, r, opt.TrustForwardedProto) {
 			return
 		}
 		decision, release, retryAfter := opt.Admission.Admit(claims.Subject)
@@ -308,6 +327,33 @@ func manageTunnelLongevity(
 ) {
 	originalSubject := claims.Subject
 
+	// All peer-visible control frames go through a buffered channel drained
+	// by a dedicated writer goroutine. This keeps the deadline-critical
+	// select below independent of peer reads: even if the writer parks on a
+	// blocked write or contended writeMu, the select still observes its
+	// expiry and max-duration timers and cancels the tunnel on time.
+	// SendControlTimeout uses an independent context, so the courtesy
+	// disconnect frame queued after cancel() can still reach the peer rather
+	// than failing against the already-cancelled tunnel context. Note that
+	// the timeout bounds the underlying ws.Write, not writeMu acquisition,
+	// so a stuck binary writer can still delay individual control frames —
+	// enforcement is unaffected because cancellation has already happened.
+	// Drop-on-full is safe — every frame is best-effort by design.
+	out := make(chan wsconn.ControlMessage, 16)
+	defer close(out)
+	go func() {
+		for msg := range out {
+			_ = conn.SendControlTimeout(2*time.Second, msg)
+		}
+	}()
+	enqueue := func(msg wsconn.ControlMessage) {
+		select {
+		case out <- msg:
+		default:
+			logger.Warn("control_send_dropped", slog.String("type", msg.Type))
+		}
+	}
+
 	// Token-expiry deadline (resettable via refresh). The connection deadline
 	// is token exp + grace, giving clients time to obtain a new token from
 	// providers that cache access tokens (e.g. Auth0).
@@ -350,7 +396,7 @@ func manageTunnelLongevity(
 
 		case <-tokenWarnTimer.C:
 			logger.Info("token_expiry_warning_sent", slog.Time("expires_at", connDeadline))
-			_ = conn.SendControl(wsconn.ControlMessage{
+			enqueue(wsconn.ControlMessage{
 				Type: "expiry_warning",
 				Data: mustMarshal(map[string]string{
 					"reason":     "token",
@@ -361,13 +407,16 @@ func manageTunnelLongevity(
 		case <-tokenDeadlineTimer.C:
 			logger.Info("tunnel_closing_token_expired")
 			cancel()
-			sendBestEffortDisconnect(conn, "token_expired")
+			enqueue(wsconn.ControlMessage{
+				Type: "disconnect",
+				Data: mustMarshal(map[string]string{"reason": "token_expired"}),
+			})
 			return
 
 		case <-maxWarnTimer.C:
 			maxDeadline := tunnelStart.Add(cfg.MaxDuration)
 			logger.Info("max_duration_warning_sent", slog.Time("expires_at", maxDeadline))
-			_ = conn.SendControl(wsconn.ControlMessage{
+			enqueue(wsconn.ControlMessage{
 				Type: "expiry_warning",
 				Data: mustMarshal(map[string]string{
 					"reason":     "max_duration",
@@ -378,7 +427,10 @@ func manageTunnelLongevity(
 		case <-maxDeadlineTimer.C:
 			logger.Info("tunnel_closing_max_duration")
 			cancel()
-			sendBestEffortDisconnect(conn, "max_duration_reached")
+			enqueue(wsconn.ControlMessage{
+				Type: "disconnect",
+				Data: mustMarshal(map[string]string{"reason": "max_duration_reached"}),
+			})
 			return
 
 		case msg, ok := <-conn.ControlChan():
@@ -392,14 +444,14 @@ func manageTunnelLongevity(
 				AccessToken string `json:"access_token"`
 			}
 			if err := json.Unmarshal(msg.Data, &payload); err != nil || payload.AccessToken == "" {
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "invalid_payload"}),
 				})
 				continue
 			}
 			if !cfg.ImplementsExpiry {
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "token_expiry_not_enforced"}),
 				})
@@ -408,7 +460,7 @@ func manageTunnelLongevity(
 			newClaims, err := validator.ValidateAccessToken(ctx, payload.AccessToken)
 			if err != nil {
 				logger.Warn("token_refresh_rejected", slog.String("error", err.Error()))
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "validation_failed"}),
 				})
@@ -425,7 +477,7 @@ func manageTunnelLongevity(
 			// the configured deadline beyond exp + grace.
 			if err := checkTokenUsableBy(newClaims, connDeadline); err != nil {
 				logger.Warn("token_refresh_rejected_not_yet_valid", slog.String("error", err.Error()))
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "not_yet_valid"}),
 				})
@@ -436,7 +488,7 @@ func manageTunnelLongevity(
 					slog.String("original", originalSubject),
 					slog.String("received", newClaims.Subject),
 				)
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "subject_mismatch"}),
 				})
@@ -449,7 +501,7 @@ func manageTunnelLongevity(
 					slog.Time("current", tokenExpiry),
 					slog.Time("received", newExpiry),
 				)
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_rejected",
 					Data: mustMarshal(map[string]string{"reason": "expiry_reduced"}),
 				})
@@ -474,7 +526,7 @@ func manageTunnelLongevity(
 					tokenWarnTimer = time.NewTimer(remaining / 2)
 				}
 				logger.Info("token_refresh_accepted_unchanged", slog.Time("expiry", connDeadline))
-				_ = conn.SendControl(wsconn.ControlMessage{
+				enqueue(wsconn.ControlMessage{
 					Type: "token_accepted",
 					Data: mustMarshal(map[string]string{"expires_at": connDeadline.Format(time.RFC3339)}),
 				})
@@ -498,23 +550,12 @@ func manageTunnelLongevity(
 			}
 			tokenDeadlineTimer = time.NewTimer(remaining)
 			logger.Info("token_refresh_accepted", slog.Time("new_expiry", connDeadline))
-			_ = conn.SendControl(wsconn.ControlMessage{
+			enqueue(wsconn.ControlMessage{
 				Type: "token_accepted",
 				Data: mustMarshal(map[string]string{"expires_at": connDeadline.Format(time.RFC3339)}),
 			})
 		}
 	}
-}
-
-// sendBestEffortDisconnect attempts to send a disconnect control message with
-// a short timeout. It is called after the tunnel context has been cancelled, so
-// the write may fail — this is intentional. Cancellation is the authoritative
-// teardown mechanism; the disconnect frame is a courtesy to the client.
-func sendBestEffortDisconnect(conn *wsconn.MultiplexConn, reason string) {
-	_ = conn.SendControlTimeout(2*time.Second, wsconn.ControlMessage{
-		Type: "disconnect",
-		Data: mustMarshal(map[string]string{"reason": reason}),
-	})
 }
 
 // newTimerUntil returns a timer that fires warningBefore a deadline. If the
@@ -553,13 +594,6 @@ func mustMarshal(v any) json.RawMessage {
 // trustForwardedProto enables X-Forwarded-Proto and X-Forwarded-Host for
 // scheme and host inference; see HandlerOptions.TrustForwardedProto.
 func checkWebSocketRequest(w http.ResponseWriter, r *http.Request, trustForwardedProto bool) bool {
-	if r.Method != http.MethodGet {
-		loggerFromContext(r.Context()).Warn("websocket_rejected",
-			slog.String("reason", "method_not_allowed"),
-		)
-		http.Error(w, "websocket upgrade requires GET", http.StatusMethodNotAllowed)
-		return false
-	}
 	if !headerContainsToken(r.Header, "Connection", "upgrade") || !headerContainsToken(r.Header, "Upgrade", "websocket") {
 		loggerFromContext(r.Context()).Warn("websocket_rejected",
 			slog.String("reason", "upgrade_headers_missing"),
@@ -724,17 +758,6 @@ func defaultPortForScheme(scheme string) string {
 	default:
 		return ""
 	}
-}
-
-func allowMethods(w http.ResponseWriter, r *http.Request, allowed ...string) bool {
-	for _, method := range allowed {
-		if r.Method == method {
-			return true
-		}
-	}
-	w.Header().Set("Allow", strings.Join(allowed, ", "))
-	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	return false
 }
 
 func clearHijackedConnDeadlines(w http.ResponseWriter) http.ResponseWriter {

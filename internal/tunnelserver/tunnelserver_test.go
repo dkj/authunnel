@@ -3,6 +3,7 @@ package tunnelserver
 import (
 	"bufio"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -10,6 +11,90 @@ import (
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
+
+func TestRouteAuthBoundaries(t *testing.T) {
+	validator := &mockValidator{tokens: map[string]*oidc.AccessTokenClaims{
+		"good": {TokenClaims: oidc.TokenClaims{Subject: "alice"}},
+	}}
+	mux := NewHandler(validator, NewObservedSOCKSServer(nil, nil, 0))
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		auth       string
+		wsHeaders  bool
+		wantStatus int
+		wantBody   string
+		wantAllow  string
+	}{
+		{name: "root_get_unauth_ok", method: http.MethodGet, path: "/", wantStatus: http.StatusOK, wantBody: "OK "},
+		{name: "root_head_unauth_ok", method: http.MethodHead, path: "/", wantStatus: http.StatusOK},
+		// Method enforcement on "/" is now handled by the ServeMux pattern
+		// (GET /{$} and HEAD /{$}); the mux populates Allow itself.
+		{name: "root_post_method_not_allowed", method: http.MethodPost, path: "/", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
+		{name: "unknown_path_404", method: http.MethodGet, path: "/healthz-not-real", wantStatus: http.StatusNotFound},
+		{name: "protected_unauth_401", method: http.MethodGet, path: "/protected", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_authed_ok", method: http.MethodGet, path: "/protected", auth: "Bearer good", wantStatus: http.StatusOK, wantBody: "Protected OK "},
+		// Regression: /protected/ used to fall through to the unauthenticated
+		// "/" catch-all and return 200 OK with no token.
+		{name: "protected_slash_unauth_401", method: http.MethodGet, path: "/protected/", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_slash_authed_ok", method: http.MethodGet, path: "/protected/", auth: "Bearer good", wantStatus: http.StatusOK, wantBody: "Protected OK "},
+		{name: "protected_subpath_unauth_401", method: http.MethodGet, path: "/protected/foo", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "protected_subpath_authed_404", method: http.MethodGet, path: "/protected/foo", auth: "Bearer good", wantStatus: http.StatusNotFound},
+		{name: "protected_bad_token_403", method: http.MethodGet, path: "/protected", auth: "Bearer nope", wantStatus: http.StatusForbidden},
+		// POST under /protected* is rejected by the mux's method matcher
+		// before the auth handler runs, so unauthenticated callers see 405
+		// rather than 401. The methods supported on these paths are not
+		// secret (smoke-test endpoint, documented in README/Notes.md), so
+		// disclosing GET/HEAD via Allow is acceptable.
+		{name: "protected_post_unauth_405", method: http.MethodPost, path: "/protected", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
+		{name: "protected_slash_post_unauth_405", method: http.MethodPost, path: "/protected/", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
+		{name: "protected_subpath_post_unauth_405", method: http.MethodPost, path: "/protected/foo", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
+		{name: "protected_post_authed_405", method: http.MethodPost, path: "/protected", auth: "Bearer good", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
+		{name: "protected_subpath_post_authed_405", method: http.MethodPost, path: "/protected/foo", auth: "Bearer good", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
+		// /protected/tunnel only accepts GET; the WS-header check runs
+		// after auth so unauthenticated GETs (with or without WS headers)
+		// see 401 rather than a 426 that confirms a websocket endpoint.
+		{name: "tunnel_unauth_no_ws_headers_401", method: http.MethodGet, path: "/protected/tunnel", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		{name: "tunnel_unauth_with_ws_headers_401", method: http.MethodGet, path: "/protected/tunnel", wsHeaders: true, wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
+		// HEAD auto-routes to the GET handler; the inline guard rejects
+		// it before token validation or admission run. Same response with
+		// or without auth and WS headers.
+		{name: "tunnel_head_unauth_405", method: http.MethodHead, path: "/protected/tunnel", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET"},
+		{name: "tunnel_head_authed_with_ws_headers_405", method: http.MethodHead, path: "/protected/tunnel", auth: "Bearer good", wsHeaders: true, wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "https://example.test"+tc.path, nil)
+			if tc.auth != "" {
+				req.Header.Set("Authorization", tc.auth)
+			}
+			if tc.wsHeaders {
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-WebSocket-Version", "13")
+				req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req.Header.Set("Origin", "https://example.test")
+			}
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %q)", rr.Code, tc.wantStatus, rr.Body.String())
+			}
+			if tc.wantBody != "" && !strings.Contains(rr.Body.String(), tc.wantBody) {
+				t.Fatalf("body %q does not contain %q", rr.Body.String(), tc.wantBody)
+			}
+			if tc.wantAllow != "" {
+				if got := rr.Header().Get("Allow"); got != tc.wantAllow {
+					t.Fatalf("Allow header = %q, want %q", got, tc.wantAllow)
+				}
+			}
+		})
+	}
+}
 
 func TestValidateStandardClaims(t *testing.T) {
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
