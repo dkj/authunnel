@@ -19,6 +19,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"authunnel/internal/safefs"
 	"authunnel/internal/security"
 	"authunnel/internal/wsconn"
 )
@@ -289,7 +290,7 @@ func runUnixSocketMode(ctx context.Context, cfg clientConfig, source authTokenSo
 		return err
 	}
 
-	if err := safelyRemoveExistingSocket(cfg.UnixSocketPath); err != nil {
+	if err := safefs.SafelyRemoveExistingSocket(cfg.UnixSocketPath); err != nil {
 		return err
 	}
 
@@ -297,7 +298,7 @@ func runUnixSocketMode(ctx context.Context, cfg clientConfig, source authTokenSo
 	// umask 0o077 ensures the socket inode is created with owner-only
 	// permissions in the first place, closing the window in which another
 	// local user could have connected between bind and the follow-up Chmod.
-	if err := withUmask(0o077, func() error {
+	if err := safefs.WithUmask(0o077, func() error {
 		listener, listenErr := net.Listen("unix", cfg.UnixSocketPath)
 		if listenErr != nil {
 			return listenErr
@@ -332,12 +333,12 @@ func runUnixSocketMode(ctx context.Context, cfg clientConfig, source authTokenSo
 
 func ensureUnixSocketDir(unixSocketPath string) error {
 	// A bare filename resolves to "." — the current working directory.
-	// ensurePrivateDir canonicalises via filepath.Abs + EvalSymlinks before
+	// EnsurePrivateDir canonicalises via filepath.Abs + EvalSymlinks before
 	// validating, so the cwd is subject to the same ancestor/ownership
 	// rules as any explicit path. We intentionally do not exempt it: binding
 	// a socket under a shared cwd (e.g. /tmp) is exactly the attack we're
 	// defending against.
-	return ensurePrivateDir(filepath.Dir(unixSocketPath))
+	return safefs.EnsurePrivateDir(filepath.Dir(unixSocketPath))
 }
 
 func tightenUnixSocketPermissions(unixSocketPath string) error {

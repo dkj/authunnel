@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"authunnel/internal/safefs"
+
 	"golang.org/x/sys/windows"
 )
 
@@ -17,7 +19,7 @@ import (
 // never deleted; the OS releases the lock when the owning process exits, which
 // avoids both age-based lock stealing and stale lock files after crashes.
 func acquireFileLock(ctx context.Context, lockPath string) (func(), error) {
-	if err := ensurePrivateDir(filepath.Dir(lockPath)); err != nil {
+	if err := safefs.EnsurePrivateDir(filepath.Dir(lockPath)); err != nil {
 		return nil, fmt.Errorf("prepare lock directory: %w", err)
 	}
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)

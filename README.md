@@ -128,6 +128,24 @@ export TLS_KEY_FILE='/etc/authunnel/tls/server.key'
 cd server && CGO_ENABLED=0 go run . --allow '*.internal:22'
 ```
 
+The server validates the TLS key file at startup on POSIX. The resolved
+target must:
+
+- be a regular file with no group or world permission bits (`mode &
+  0o077 == 0`, e.g. `0600` or `0400`),
+- be owned by the current user or by root — any other unprivileged owner
+  could read the key, so accepting that ownership would defeat the
+  "unreadable by others" contract,
+- live under a parent chain that is itself safe against `rename(2)`.
+
+Symlinks are followed so canonical certbot paths such as
+`/etc/letsencrypt/live/<domain>/privkey.pem` work out of the box; both
+the un-resolved and resolved parent chains are checked for ancestor
+safety. As a final step the server opens the key once to confirm it can
+actually read it, so an ACL or group-membership mismatch surfaces at
+startup rather than mid-handshake. Any failure logs `tls_key_file_unsafe`
+and exits. The cert file is public material and is not validated.
+
 **ACME / Let's Encrypt** (default `:443`; server must be reachable on port 443):
 
 ```bash
@@ -139,7 +157,7 @@ export ACME_CACHE_DIR='/var/cache/authunnel/acme'
 cd server && CGO_ENABLED=0 go run . --allow '*.internal:22'
 ```
 
-Certificates are obtained and renewed automatically using the TLS-ALPN-01 challenge. The cache directory must be writable by the server process and should persist across restarts to avoid hitting Let's Encrypt rate limits.
+Certificates are obtained and renewed automatically using the TLS-ALPN-01 challenge. The cache directory must be writable by the server process and should persist across restarts to avoid hitting Let's Encrypt rate limits. autocert writes Let's Encrypt private keys into this directory, so on POSIX the server applies the same ancestor + leaf checks used for the OIDC cache: the directory is created `0o700` if missing, and an existing one is rejected if it is group/world writable, owned by another unprivileged user, or sits beneath a permissive ancestor.
 
 **Plaintext HTTP** (default `:8080`; for use behind a TLS-terminating reverse proxy):
 
@@ -320,6 +338,15 @@ Managed OIDC mode writes the cached access token and refresh token to
 POSIX filesystem permissions alone: the cache file is created `0600` via
 atomic rename, inside a `0700` directory whose ancestors have been
 validated against peer `rename(2)` as described above.
+
+The client also re-validates an existing cache file before reading it, so
+a `tokens.json` left over from another tool with `0o644` (or any
+group/world bit), with a foreign owner, or replaced by a symlink is
+rejected with a `validate OIDC token cache:` startup error rather than
+silently honoured. The fix is one of `chmod 600
+~/.config/authunnel/tokens.json` (POSIX) or deleting the file and
+re-authenticating; the validator deliberately does not auto-chmod, so
+the audit signal is preserved.
 
 This design matches the pattern used by most OIDC CLIs, but operators
 should be explicit about what it does and does not defend against:
