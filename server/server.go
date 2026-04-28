@@ -21,6 +21,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/time/rate"
 
+	"authunnel/internal/safefs"
 	"authunnel/internal/security"
 	"authunnel/internal/tunnelserver"
 )
@@ -170,6 +171,14 @@ func main() {
 	if len(cfg.ACMEDomains) > 0 {
 		if err := checkACMECacheDir(cfg.ACMECacheDir); err != nil {
 			logger.Error("acme_cache_dir_error", slog.String("path", cfg.ACMECacheDir), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	} else if !cfg.PlaintextBehindProxy {
+		// File-based TLS path: refuse to start if the key file would be
+		// readable by another local user. Cert files are public material and
+		// are not validated.
+		if err := safefs.EnsureUnreadableByOthers(cfg.TLSKeyPath); err != nil {
+			logger.Error("tls_key_file_unsafe", slog.String("path", cfg.TLSKeyPath), slog.String("error", err.Error()))
 			os.Exit(1)
 		}
 	}
@@ -634,9 +643,18 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 }
 
 func checkACMECacheDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create ACME cache directory: %w", err)
+	// autocert.DirCache writes Let's Encrypt private keys into this directory.
+	// The same POSIX ancestor + leaf-mode rules that protect the OIDC token
+	// cache directory apply here verbatim. EnsurePrivateDir creates the
+	// directory 0o700 if missing and validates an existing one without
+	// silently relaxing or tightening it.
+	if err := safefs.EnsurePrivateDir(dir); err != nil {
+		return err
 	}
+	// Safety alone does not prove writability: a current-owned 0o500 directory
+	// passes EnsurePrivateDir but autocert would later fail to persist
+	// certificates during issuance or renewal. Probe with a temp file so the
+	// failure surfaces at startup instead of mid-handshake.
 	f, err := os.CreateTemp(dir, ".acme-probe-*")
 	if err != nil {
 		return fmt.Errorf("ACME cache directory is not writable: %w", err)

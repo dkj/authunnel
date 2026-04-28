@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"authunnel/internal/safefs"
+
 	oidcclient "github.com/zitadel/oidc/v3/pkg/client"
 	"golang.org/x/oauth2"
 )
@@ -135,7 +137,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := ensurePrivateDir(filepath.Dir(s.cachePath)); err != nil {
+	if err := safefs.EnsurePrivateDir(filepath.Dir(s.cachePath)); err != nil {
 		return "", fmt.Errorf("prepare cache directory: %w", err)
 	}
 
@@ -199,6 +201,12 @@ func (s *managedOIDCTokenSource) oauthConfig(ctx context.Context, redirectURL st
 
 func (s *managedOIDCTokenSource) loadCache() (tokenCache, error) {
 	cache := tokenCache{}
+	if err := safefs.EnsurePrivateFile(s.cachePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cache, nil
+		}
+		return cache, fmt.Errorf("validate OIDC token cache: %w", err)
+	}
 	data, err := os.ReadFile(s.cachePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -216,7 +224,7 @@ func (s *managedOIDCTokenSource) loadCache() (tokenCache, error) {
 }
 
 func (s *managedOIDCTokenSource) saveCache(cache tokenCache) error {
-	if err := ensurePrivateDir(filepath.Dir(s.cachePath)); err != nil {
+	if err := safefs.EnsurePrivateDir(filepath.Dir(s.cachePath)); err != nil {
 		return fmt.Errorf("prepare cache directory: %w", err)
 	}
 	// #nosec G117 -- this is an accepted tradeoff, not a false positive.
@@ -429,4 +437,3 @@ func randomToken() (string, error) {
 	}
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
-
