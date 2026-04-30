@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"authunnel/internal/authhttp"
 	"authunnel/internal/safefs"
 
 	oidcclient "github.com/zitadel/oidc/v3/pkg/client"
@@ -88,7 +89,12 @@ func newAuthTokenSource(cfg clientConfig) (authTokenSource, error) {
 	case authModeOIDC:
 		client := cfg.AuthHTTPClient
 		if client == nil {
-			client = http.DefaultClient
+			// Bounded default mirrors the server-side validator HTTP
+			// client: discovery, refresh, and code exchange all serve
+			// small static responses, so a stalled IdP is the only thing
+			// these long timeouts would protect. Tests inject their own
+			// client through cfg.AuthHTTPClient.
+			client = authhttp.NewBoundedClient()
 		}
 		output := cfg.Stderr
 		if output == nil {
