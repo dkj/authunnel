@@ -5,11 +5,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"authunnel/internal/authhttp"
+
+	"golang.org/x/oauth2"
 )
 
 // TestNewAuthTokenSourceDefaultsToBoundedClient verifies that callers who do
@@ -118,6 +121,46 @@ func TestManagedOIDCTokenSourceDiscoveryTimesOut(t *testing.T) {
 	}
 }
 
+// TestManagedOIDCTokenSourceCodeExchangeTimesOut skips discovery by seeding
+// provider metadata, then completes the local browser callback and points the
+// authorization-code exchange at a token endpoint that accepts but never
+// replies. This covers the post-discovery token endpoint path.
+func TestManagedOIDCTokenSourceCodeExchangeTimesOut(t *testing.T) {
+	tokenEndpoint, cleanup := blockingTCP(t)
+	defer cleanup()
+
+	client := &http.Client{Timeout: 750 * time.Millisecond}
+	source := &managedOIDCTokenSource{
+		issuer:     "https://issuer.example",
+		clientID:   "authunnel-cli",
+		scopes:     normalizeScopes("openid offline_access"),
+		cachePath:  filepathForTest(t, "tokens.json"),
+		httpClient: client,
+		output:     io.Discard,
+		discovery: oauth2.Endpoint{
+			AuthURL:   "https://issuer.example/auth",
+			TokenURL:  tokenEndpoint + "/token",
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+		openBrowser: completeTimeoutTestCallback,
+		now:         time.Now,
+	}
+
+	start := time.Now()
+	_, err := source.interactiveToken(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected code exchange against blocking token endpoint to fail")
+	}
+	if !strings.Contains(err.Error(), "exchange authorization code") {
+		t.Fatalf("expected exchange error, got %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("interactiveToken took %v, expected to abort within client timeout", elapsed)
+	}
+}
+
 // TestBoundedClientCarriesTimeout sanity-checks the production constructor.
 // Operators rely on the constructor delivering a non-zero overall timeout;
 // regressing this constant would silently disable the protection.
@@ -128,5 +171,43 @@ func TestBoundedClientCarriesTimeout(t *testing.T) {
 	}
 	if c.Transport == nil {
 		t.Fatal("bounded client must carry a non-nil Transport")
+	}
+}
+
+func completeTimeoutTestCallback(ctx context.Context, authURL string) error {
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		return err
+	}
+	query := parsed.Query()
+	callbackURL, err := url.Parse(query.Get("redirect_uri"))
+	if err != nil {
+		return err
+	}
+	values := callbackURL.Query()
+	values.Set("code", "auth-code-1")
+	values.Set("state", query.Get("state"))
+	callbackURL.RawQuery = values.Encode()
+
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, callbackURL.String(), nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
