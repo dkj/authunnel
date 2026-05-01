@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"authunnel/internal/safefs"
 )
 
 // acquireFileLock coordinates concurrent client processes that share the same
@@ -17,11 +19,11 @@ import (
 // the kernel releases the lock when the owning process exits, which avoids both
 // age-based lock stealing and stale lock files after crashes.
 func acquireFileLock(ctx context.Context, lockPath string) (func(), error) {
-	if err := ensurePrivateDir(filepath.Dir(lockPath)); err != nil {
+	if err := safefs.EnsurePrivateDir(filepath.Dir(lockPath)); err != nil {
 		return nil, fmt.Errorf("prepare lock directory: %w", err)
 	}
 	// #nosec G304 -- lockPath is derived from the client's own config, not
-	// from per-request user input. ensurePrivateDir above proves the parent
+	// from per-request user input. EnsurePrivateDir above proves the parent
 	// directory cannot be renamed or replaced by another local user; it does
 	// NOT prove lockPath itself is not a symlink. Inside a validated private
 	// directory only the current user (or root) could have planted such a

@@ -36,6 +36,19 @@ type TokenValidator interface {
 // problems it can be promoted to a flag later.
 const tokenClockSkew = 30 * time.Second
 
+// maxBearerTokenBytes caps the bearer credential we are willing to feed into
+// the JWT verifier. Realistic access tokens sit well under 8 KiB even with
+// many roles or group claims; rejecting larger payloads up front keeps an
+// unauthenticated caller from amplifying parse and JWKS work.
+// maxAuthorizationHeaderBytes leaves a small allowance for "Bearer " plus
+// future scheme variants, while staying well below the lowered server
+// MaxHeaderBytes so this stays the active bound rather than the HTTP
+// framing layer's silent 431.
+const (
+	maxBearerTokenBytes         = 8 * 1024
+	maxAuthorizationHeaderBytes = maxBearerTokenBytes + 64
+)
+
 // JWTTokenValidator validates bearer access tokens against issuer discovery and
 // the issuer's JWKS, then applies an explicit audience check for the protected
 // resource.
@@ -182,6 +195,17 @@ type HandlerOptions struct {
 	// policy before the WebSocket upgrade. A nil value disables admission
 	// checks entirely.
 	Admission *Admitter
+
+	// PreAuth enforces a per-source-IP rate limit on every authenticated
+	// route (/protected, /protected/, any /protected/*, and
+	// /protected/tunnel) before the bearer token is parsed. A nil value
+	// (the default) disables the gate entirely.
+	// PreAuthTrustForwardedFor controls whether the limiter keys on the
+	// leftmost X-Forwarded-For entry; only enable it in deployments where
+	// an upstream proxy is known to populate the header reliably (the same
+	// trust property used for X-Forwarded-Host).
+	PreAuth                  *PreAuthLimiter
+	PreAuthTrustForwardedFor bool
 }
 
 // NewHandler installs the small HTTP surface used by the server:
@@ -212,11 +236,31 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		_, _ = w.Write([]byte("OK " + time.Now().String()))
 	})
 
+	// applyPreAuthGate runs the per-IP pre-auth limiter (when configured)
+	// before any token parsing or path-aware logic. Every protected route
+	// shares the same gate so an attacker cannot bypass it by aiming bursts
+	// at /protected/anything; the limiter's job is to bound pre-validator
+	// cost across the whole authenticated surface.
+	applyPreAuthGate := func(w http.ResponseWriter, r *http.Request) bool {
+		if opt.PreAuth == nil {
+			return true
+		}
+		key := preAuthClientKey(r, opt.PreAuthTrustForwardedFor)
+		if ok, retryAfter := opt.PreAuth.Allow(key); !ok {
+			WritePreAuthDenied(w, r, key, retryAfter)
+			return false
+		}
+		return true
+	}
+
 	// protectedSmokeTest is registered under both /protected (exact) and
 	// /protected/ (subtree) so the trailing-slash variant cannot fall
 	// through to the root handler. Subpaths other than /protected/tunnel
 	// (which has its own more-specific registration) return 404 after auth.
 	protectedSmokeTest := func(w http.ResponseWriter, r *http.Request) {
+		if !applyPreAuthGate(w, r) {
+			return
+		}
 		if _, ok := validateRequestToken(w, r, validator); !ok {
 			return
 		}
@@ -241,6 +285,9 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !applyPreAuthGate(w, r) {
 			return
 		}
 		claims, ok := validateRequestToken(w, r, validator)
@@ -357,8 +404,8 @@ func manageTunnelLongevity(
 	// Token-expiry deadline (resettable via refresh). The connection deadline
 	// is token exp + grace, giving clients time to obtain a new token from
 	// providers that cache access tokens (e.g. Auth0).
-	var tokenExpiry time.Time    // raw exp claim from the current token
-	var connDeadline time.Time   // tokenExpiry + grace — the actual enforcement point
+	var tokenExpiry time.Time  // raw exp claim from the current token
+	var connDeadline time.Time // tokenExpiry + grace — the actual enforcement point
 	var tokenWarnTimer, tokenDeadlineTimer *time.Timer
 	if cfg.ImplementsExpiry {
 		tokenExpiry = claims.GetExpiration()
@@ -645,6 +692,14 @@ func validateRequestToken(w http.ResponseWriter, r *http.Request, validator Toke
 		http.Error(w, "auth header missing", http.StatusUnauthorized)
 		return nil, false
 	}
+	// Bound the bytes that flow into the JWT verifier before any parsing. The
+	// header check protects against a long non-Bearer scheme; the token check
+	// protects against an oversized Bearer body. Both reuse the existing
+	// fixed message so callers cannot probe the new boundary by message shape.
+	if len(auth) > maxAuthorizationHeaderBytes {
+		http.Error(w, "invalid header", http.StatusUnauthorized)
+		return nil, false
+	}
 	if !strings.HasPrefix(auth, oidc.PrefixBearer) {
 		http.Error(w, "invalid header", http.StatusUnauthorized)
 		return nil, false
@@ -655,6 +710,10 @@ func validateRequestToken(w http.ResponseWriter, r *http.Request, validator Toke
 	}
 
 	token := strings.TrimPrefix(auth, oidc.PrefixBearer)
+	if len(token) > maxBearerTokenBytes {
+		http.Error(w, "invalid header", http.StatusUnauthorized)
+		return nil, false
+	}
 	claims, err := validator.ValidateAccessToken(r.Context(), token)
 	if err != nil {
 		// Do not reflect verifier details (signature, issuer/audience mismatch,

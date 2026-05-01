@@ -21,6 +21,8 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/time/rate"
 
+	"authunnel/internal/authhttp"
+	"authunnel/internal/safefs"
 	"authunnel/internal/security"
 	"authunnel/internal/tunnelserver"
 )
@@ -32,6 +34,18 @@ var version = "dev"
 // auto-derived burst (ceil(rate)) fits comfortably in int.
 const maxTunnelOpenRate = 10_000
 const maxExpiryGrace = time.Hour
+
+// startupAuthTimeout bounds OIDC discovery during server startup. It sits
+// above the per-call HTTP timeout in authhttp.NewBoundedClient so the
+// underlying HTTP transport is the closer error source, while staying well
+// under any plausible operator patience for a stalled issuer.
+const startupAuthTimeout = 30 * time.Second
+
+// httpServerMaxHeaderBytes lowers the request-header memory cap from Go's
+// 1 MB default. The new bound sits comfortably above the bearer-token cap
+// (8 KiB) plus standard WebSocket upgrade headers, but cuts the worst-case
+// anonymous-request memory cost by about 64x.
+const httpServerMaxHeaderBytes = 16 * 1024
 
 type serverConfig struct {
 	Issuer        string
@@ -66,6 +80,13 @@ type serverConfig struct {
 	TunnelOpenRate       float64       // per-subject rate (tunnels/sec); 0 = disabled, max 10000
 	TunnelOpenBurst      int           // per-subject token-bucket burst; defaults to ceil(rate) when rate>0, max 10000
 	DialTimeout          time.Duration // per-outbound-dial timeout; default 10s
+
+	// Pre-auth IP rate limit for every authenticated route (/protected,
+	// /protected/, any /protected/*, and /protected/tunnel). Off by
+	// default; opt in by setting PreAuthRate. Burst defaults to ceil(rate)
+	// when unset.
+	PreAuthRate  float64
+	PreAuthBurst int
 }
 
 func serverUsage(w io.Writer) {
@@ -126,6 +147,16 @@ Admission and resource limits:
   --dial-timeout <duration>  Per-outbound-dial timeout (env: DIAL_TIMEOUT, default: 10s). Zero disables the
                              timeout and lets authenticated users tie up goroutines on blackholed destinations;
                              not recommended.
+  --preauth-rate <rate>      Per-source-IP rate limit applied before token parsing on every authenticated
+                             route (/protected, /protected/, any /protected/*, and /protected/tunnel),
+                             requests/second as a float (env: PREAUTH_RATE, default: 0 = disabled, max: 10000).
+                             Behind a properly configured edge load balancer that already rate-limits
+                             anonymous traffic this can stay off; enable it for direct exposure where
+                             oversized headers, junk JWTs, or unknown-kid bursts would otherwise reach the
+                             validator. When --plaintext-behind-reverse-proxy is set, the limiter keys on the
+                             leftmost X-Forwarded-For entry, falling back to the TCP peer address; otherwise
+                             it always keys on the TCP peer.
+  --preauth-burst <n>        Burst size for --preauth-rate (env: PREAUTH_BURST, default: ceil(rate), max: 10000)
 
 Other:
 
@@ -172,9 +203,20 @@ func main() {
 			logger.Error("acme_cache_dir_error", slog.String("path", cfg.ACMECacheDir), slog.String("error", err.Error()))
 			os.Exit(1)
 		}
+	} else if !cfg.PlaintextBehindProxy {
+		// File-based TLS path: refuse to start if the key file would be
+		// readable by another local user. Cert files are public material and
+		// are not validated.
+		if err := safefs.EnsureUnreadableByOthers(cfg.TLSKeyPath); err != nil {
+			logger.Error("tls_key_file_unsafe", slog.String("path", cfg.TLSKeyPath), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
 	}
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), cfg.Issuer, cfg.TokenAudience, http.DefaultClient)
+	authHTTPClient := authhttp.NewBoundedClient()
+	discoveryCtx, cancelDiscovery := context.WithTimeout(context.Background(), startupAuthTimeout)
+	validator, err := tunnelserver.NewJWTTokenValidator(discoveryCtx, cfg.Issuer, cfg.TokenAudience, authHTTPClient)
+	cancelDiscovery()
 	if err != nil {
 		logger.Error("create token validator", slog.String("error", err.Error()))
 		os.Exit(1)
@@ -186,6 +228,10 @@ func main() {
 		PerUserRate:  rate.Limit(cfg.TunnelOpenRate),
 		PerUserBurst: cfg.TunnelOpenBurst,
 	})
+	preAuth := tunnelserver.NewPreAuthLimiter(tunnelserver.PreAuthConfig{
+		Rate:  rate.Limit(cfg.PreAuthRate),
+		Burst: cfg.PreAuthBurst,
+	})
 	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules, cfg.DialTimeout),
 		tunnelserver.HandlerOptions{
 			TrustForwardedProto: cfg.PlaintextBehindProxy,
@@ -195,7 +241,9 @@ func main() {
 				ExpiryWarning:    cfg.ExpiryWarning,
 				ExpiryGrace:      cfg.ExpiryGrace,
 			},
-			Admission: admitter,
+			Admission:                admitter,
+			PreAuth:                  preAuth,
+			PreAuthTrustForwardedFor: cfg.PlaintextBehindProxy,
 		})
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -204,6 +252,7 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    httpServerMaxHeaderBytes,
 	}
 	// Bind first so CAP_NET_BIND_SERVICE (needed for port < 1024) is used
 	// before capabilities are dropped.
@@ -357,6 +406,26 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		}
 		cfg.DialTimeout = d
 	}
+	if v := getenv("PREAUTH_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("PREAUTH_RATE: %w", err)
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > maxTunnelOpenRate {
+			return cfg, fmt.Errorf("PREAUTH_RATE: must be a non-negative finite number not exceeding %d", maxTunnelOpenRate)
+		}
+		cfg.PreAuthRate = f
+	}
+	if v := getenv("PREAUTH_BURST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("PREAUTH_BURST: %w", err)
+		}
+		if n < 0 || n > maxTunnelOpenRate {
+			return cfg, fmt.Errorf("PREAUTH_BURST: must be between 0 and %d", maxTunnelOpenRate)
+		}
+		cfg.PreAuthBurst = n
+	}
 
 	envLogLevel := getenv("LOG_LEVEL")
 	envAllowRules := getenv("ALLOW_RULES")
@@ -501,6 +570,28 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		cfg.DialTimeout = d
 		return nil
 	})
+	fs.Func("preauth-rate", "Per-source-IP rate limit on every authenticated route (/protected, /protected/, any /protected/*, and /protected/tunnel) before token parsing, requests/second; 0 = disabled, max 10000", func(value string) error {
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > maxTunnelOpenRate {
+			return fmt.Errorf("must be a non-negative finite number not exceeding %d", maxTunnelOpenRate)
+		}
+		cfg.PreAuthRate = f
+		return nil
+	})
+	fs.Func("preauth-burst", "Burst size for --preauth-rate; defaults to ceil(rate) when rate > 0, max 10000", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if n < 0 || n > maxTunnelOpenRate {
+			return fmt.Errorf("must be between 0 and %d", maxTunnelOpenRate)
+		}
+		cfg.PreAuthBurst = n
+		return nil
+	})
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			serverUsage(os.Stdout)
@@ -615,6 +706,20 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		cfg.TunnelOpenBurst = burst
 	}
 
+	// Pre-auth rate-limit sub-validation, mirroring the per-subject limiter
+	// above: burst defaults to ceil(rate) when rate is positive, and a burst
+	// without a positive rate is rejected as ambiguous.
+	if cfg.PreAuthBurst > 0 && cfg.PreAuthRate == 0 {
+		return cfg, errors.New("--preauth-burst requires --preauth-rate to be set")
+	}
+	if cfg.PreAuthRate > 0 && cfg.PreAuthBurst == 0 {
+		burst := int(math.Ceil(cfg.PreAuthRate))
+		if burst < 1 {
+			burst = 1
+		}
+		cfg.PreAuthBurst = burst
+	}
+
 	// Per-mode sub-validation.
 	switch {
 	case tlsFilesMode:
@@ -634,9 +739,18 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 }
 
 func checkACMECacheDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create ACME cache directory: %w", err)
+	// autocert.DirCache writes Let's Encrypt private keys into this directory.
+	// The same POSIX ancestor + leaf-mode rules that protect the OIDC token
+	// cache directory apply here verbatim. EnsurePrivateDir creates the
+	// directory 0o700 if missing and validates an existing one without
+	// silently relaxing or tightening it.
+	if err := safefs.EnsurePrivateDir(dir); err != nil {
+		return err
 	}
+	// Safety alone does not prove writability: a current-owned 0o500 directory
+	// passes EnsurePrivateDir but autocert would later fail to persist
+	// certificates during issuance or renewal. Probe with a temp file so the
+	// failure surfaces at startup instead of mid-handshake.
 	f, err := os.CreateTemp(dir, ".acme-probe-*")
 	if err != nil {
 		return fmt.Errorf("ACME cache directory is not writable: %w", err)

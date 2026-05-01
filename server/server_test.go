@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -2366,5 +2368,64 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("echo read timed out — tunnel did not survive past original deadline with grace+refresh")
+	}
+}
+
+func TestCheckACMECacheDirCreatesMissingDirectoryWithOwnerOnlyMode(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "acme")
+	if err := checkACMECacheDir(dir); err != nil {
+		t.Fatalf("checkACMECacheDir failed: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("ACME dir created with %#o, want 0o700", got)
+	}
+}
+
+func TestCheckACMECacheDirRejectsExistingGroupWritableDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "acme")
+	if err := os.MkdirAll(dir, 0o770); err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	err := checkACMECacheDir(dir)
+	if err == nil || !strings.Contains(err.Error(), "group/world writable") {
+		t.Fatalf("expected group/world writable rejection, got %v", err)
+	}
+}
+
+func TestCheckACMECacheDirAcceptsExistingSafeDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "acme")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
+	if err := checkACMECacheDir(dir); err != nil {
+		t.Fatalf("0o700 ACME dir should be accepted: %v", err)
+	}
+}
+
+func TestCheckACMECacheDirRejectsSafeButUnwritableDirectory(t *testing.T) {
+	// A 0o500 dir is current-user-owned and not group/world writable, so the
+	// safety check accepts it. autocert would later fail to persist
+	// certificates; surface that at startup with the temp-file write probe.
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses POSIX permission checks; cannot exercise unwritable rejection")
+	}
+	dir := filepath.Join(t.TempDir(), "acme")
+	if err := os.MkdirAll(dir, 0o500); err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	err := checkACMECacheDir(dir)
+	if err == nil || !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("expected writability rejection, got %v", err)
 	}
 }
