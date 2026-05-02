@@ -68,6 +68,14 @@ type serverConfig struct {
 	// default posture is restrictive; operators who genuinely want full egress
 	// have to say so.
 	AllowOpenEgress bool
+	// IPBlockRanges is the resolved-IP deny-list applied after the allowlist.
+	// Default-populated to tunnelserver.DefaultIPBlocklist() when neither
+	// --ip-block nor --no-ip-block is set. Independent of the egress posture:
+	// works the same in restrictive and open modes.
+	IPBlockRanges tunnelserver.IPBlocklist
+	// NoIPBlock disables the resolved-IP guard entirely. Mutually exclusive
+	// with --ip-block / IP_BLOCK.
+	NoIPBlock bool
 	// Connection longevity
 	MaxConnectionDuration   time.Duration // hard max tunnel lifetime; 0 = unlimited
 	NoConnectionTokenExpiry bool          // when true, tunnel lifetime is NOT tied to access token expiry
@@ -105,6 +113,15 @@ Flags and their environment variable equivalents:
   --allow-open-egress        Explicit opt-in for running with no allowlist; authenticated clients may CONNECT to any
                              destination the server process can reach (env: ALLOW_OPEN_EGRESS=true). Mutually exclusive
                              with --allow. Use only when the risk of arbitrary egress is acceptable for the deployment.
+  --ip-block <range>         Resolved-IP deny-list applied after --allow (repeatable; env: IP_BLOCK comma-separated).
+                             Accepts CIDR (127.0.0.0/8), bare IP (127.0.0.1), or bracketed IPv6 ([::1] / [fe80::/10]).
+                             When neither --ip-block nor --no-ip-block is set, defaults to a built-in protected set:
+                             loopback, IPv4/IPv6 link-local (incl. 169.254.169.254 IMDS), unspecified, and multicast.
+                             RFC1918, CGNAT, and IPv6 ULA are NOT in the default set. Applies in both restrictive
+                             and --allow-open-egress modes; deny wins over --allow.
+  --no-ip-block              Disable the resolved-IP guard entirely (env: NO_IP_BLOCK=true). Mutually exclusive with
+                             --ip-block. Use only when the deployment legitimately needs to reach addresses in the
+                             default protected set and a tighter --ip-block list is not sufficient.
 
 TLS mode (choose exactly one):
 
@@ -197,6 +214,13 @@ func main() {
 			slog.Int("rules", len(cfg.AllowRules)),
 		)
 	}
+	if cfg.NoIPBlock {
+		logger.Warn("ip_block_disabled",
+			slog.String("hint", "--no-ip-block is set; resolved-IP guard is off and authenticated clients may reach loopback, link-local, or metadata-service destinations subject only to the allowlist"),
+		)
+	} else {
+		logger.Info("ip_block_active", slog.Int("ranges", len(cfg.IPBlockRanges)))
+	}
 
 	if len(cfg.ACMEDomains) > 0 {
 		if err := checkACMECacheDir(cfg.ACMECacheDir); err != nil {
@@ -232,7 +256,7 @@ func main() {
 		Rate:  rate.Limit(cfg.PreAuthRate),
 		Burst: cfg.PreAuthBurst,
 	})
-	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules, cfg.DialTimeout),
+	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules, cfg.IPBlockRanges, cfg.DialTimeout),
 		tunnelserver.HandlerOptions{
 			TrustForwardedProto: cfg.PlaintextBehindProxy,
 			Longevity: tunnelserver.LongevityConfig{
@@ -319,6 +343,9 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 	if getenv("ALLOW_OPEN_EGRESS") == "true" {
 		cfg.AllowOpenEgress = true
+	}
+	if getenv("NO_IP_BLOCK") == "true" {
+		cfg.NoIPBlock = true
 	}
 	if v := getenv("MAX_CONNECTION_DURATION"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -429,6 +456,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 
 	envLogLevel := getenv("LOG_LEVEL")
 	envAllowRules := getenv("ALLOW_RULES")
+	envIPBlock := getenv("IP_BLOCK")
 	envACMEDomains := getenv("ACME_DOMAINS")
 	logLevelFlagSet := false
 	listenAddrFlagSet := false
@@ -457,6 +485,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		"Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
 	fs.BoolVar(&cfg.AllowOpenEgress, "allow-open-egress", cfg.AllowOpenEgress,
 		"Explicit opt-in for running without an allowlist; mutually exclusive with --allow")
+	fs.BoolVar(&cfg.NoIPBlock, "no-ip-block", cfg.NoIPBlock,
+		"Disable the resolved-IP guard entirely; mutually exclusive with --ip-block (env: NO_IP_BLOCK=true)")
 	fs.Func("listen-addr", "Listen address", func(value string) error {
 		cfg.ListenAddr = value
 		listenAddrFlagSet = true
@@ -471,6 +501,8 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	})
 	fs.Var(&tunnelserver.AllowlistFlag{Rules: &cfg.AllowRules}, "allow",
 		"Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated). Rule: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi. IPv6 requires bracketed notation e.g. [::1]:22. At least one rule is required unless --allow-open-egress is set.")
+	fs.Var(&tunnelserver.IPBlocklistFlag{Ranges: &cfg.IPBlockRanges}, "ip-block",
+		"Resolved-IP deny-list applied after --allow (repeatable; env: IP_BLOCK comma-separated). Accepts CIDR, bare IP, or bracketed IPv6. Defaults to loopback, IPv4/IPv6 link-local (incl. IMDS), unspecified, and multicast when unset. Mutually exclusive with --no-ip-block.")
 	fs.Func("log-level", "Structured log level: debug, info, warn, or error", func(value string) error {
 		level, err := parseServerLogLevel(value)
 		if err != nil {
@@ -618,6 +650,15 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		// fs.Parse) are additive on top.
 		cfg.AllowRules = append(envRules, cfg.AllowRules...)
 	}
+	if envIPBlock != "" {
+		envRanges, err := tunnelserver.ParseIPBlocklistFromCSV(envIPBlock)
+		if err != nil {
+			return cfg, fmt.Errorf("IP_BLOCK: %w", err)
+		}
+		// Env ranges form the baseline; --ip-block flags (already appended
+		// during fs.Parse) are additive on top.
+		cfg.IPBlockRanges = append(envRanges, cfg.IPBlockRanges...)
+	}
 	if envACMEDomains != "" {
 		// Env domains form the baseline; --acme-domain flags are additive on top.
 		// Filter empty entries so that ACME_DOMAINS=example.com, (trailing comma)
@@ -688,6 +729,17 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		return cfg, errors.New("at least one --allow rule is required, or pass --allow-open-egress (ALLOW_OPEN_EGRESS=true) to explicitly opt into open mode")
 	case len(cfg.AllowRules) > 0 && cfg.AllowOpenEgress:
 		return cfg, errors.New("--allow-open-egress is mutually exclusive with --allow/ALLOW_RULES; pick one egress posture")
+	}
+
+	// IP block posture: default-on with the protected ranges. --no-ip-block
+	// is the loud opt-out; --ip-block lets operators replace the default set
+	// with a custom one. The two are mutually exclusive so the operator's
+	// intent is unambiguous on startup.
+	switch {
+	case len(cfg.IPBlockRanges) > 0 && cfg.NoIPBlock:
+		return cfg, errors.New("--no-ip-block is mutually exclusive with --ip-block/IP_BLOCK; pick one ip-block posture")
+	case len(cfg.IPBlockRanges) == 0 && !cfg.NoIPBlock:
+		cfg.IPBlockRanges = tunnelserver.DefaultIPBlocklist()
 	}
 
 	// Admission sub-validation. Burst defaults to ceil(rate) when rate is

@@ -271,7 +271,7 @@ func TestHandler_RejectsWhenGlobalCapExceeded(t *testing.T) {
 	_, releaseFirst, _ := admitter.Admit("placeholder")
 	t.Cleanup(releaseFirst)
 
-	mux := NewHandler(validator, NewObservedSOCKSServer(nil, nil, 0), HandlerOptions{
+	mux := NewHandler(validator, NewObservedSOCKSServer(nil, nil, nil, 0), HandlerOptions{
 		Admission: admitter,
 	})
 

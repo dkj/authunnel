@@ -165,7 +165,7 @@ func TestHandlerPreAuthGatesAllProtectedPaths(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			clk := newPreAuthTestClock(time.Unix(1_700_000_000, 0))
 			limiter := newPreAuthLimiterWithClock(PreAuthConfig{Rate: 1, Burst: 1}, clk.Now)
-			mux := NewHandler(panicValidator{t: t}, NewObservedSOCKSServer(nil, nil, 0), HandlerOptions{
+			mux := NewHandler(panicValidator{t: t}, NewObservedSOCKSServer(nil, nil, nil, 0), HandlerOptions{
 				PreAuth: limiter,
 			})
 
@@ -196,7 +196,7 @@ func TestHandlerPreAuthDeniedBeforeValidator(t *testing.T) {
 	clk := newPreAuthTestClock(time.Unix(1_700_000_000, 0))
 	limiter := newPreAuthLimiterWithClock(PreAuthConfig{Rate: 1, Burst: 1}, clk.Now)
 
-	mux := NewHandler(panicValidator{t: t}, NewObservedSOCKSServer(nil, nil, 0), HandlerOptions{
+	mux := NewHandler(panicValidator{t: t}, NewObservedSOCKSServer(nil, nil, nil, 0), HandlerOptions{
 		PreAuth: limiter,
 	})
 
