@@ -221,6 +221,11 @@ func main() {
 	} else {
 		logger.Info("ip_block_active", slog.Int("ranges", len(cfg.IPBlockRanges)))
 	}
+	if cfg.NoConnectionTokenExpiry && cfg.MaxConnectionDuration == 0 {
+		logger.Warn("connection_lifetime_unbounded",
+			slog.String("hint", "--no-connection-token-expiry is set and --max-connection-duration is 0; authenticated tunnels have no enforced lifetime cap and will only close on transport failure or client disconnect"),
+		)
+	}
 
 	if len(cfg.ACMEDomains) > 0 {
 		if err := checkACMECacheDir(cfg.ACMECacheDir); err != nil {
