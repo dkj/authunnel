@@ -1020,3 +1020,45 @@ func TestExpiryGraceWarningRelativeToDeadline(t *testing.T) {
 		t.Fatalf("expected expiry_warning, got %s", msg.Type)
 	}
 }
+
+// TestExpiryCancellationFiresWhenPeerStopsReading proves that a peer that
+// stops reading control frames cannot prevent token-expiry cancellation from
+// firing. Peer-visible writes happen in a separate writer goroutine, so the
+// deadline-critical select in manageTunnelLongevity must observe its
+// tokenDeadlineTimer regardless of writer back-pressure.
+func TestExpiryCancellationFiresWhenPeerStopsReading(t *testing.T) {
+	serverConn, _ := wsPair(t)
+	// Deliberately do NOT drain the client side. Any control frame the
+	// writer goroutine attempts will park inside ws.Write once buffers
+	// fill, which used to also park the longevity select.
+
+	claims := makeClaims("user-1", time.Now().Add(50*time.Millisecond))
+	cfg := LongevityConfig{
+		ImplementsExpiry: true,
+		ExpiryWarning:    100 * time.Millisecond,
+		ExpiryGrace:      100 * time.Millisecond, // connDeadline ≈ now+150ms
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manageTunnelLongevity(ctx, cancel, serverConn, &mockValidator{}, claims, cfg, time.Now(), slog.Default())
+	}()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx not cancelled within 2s — peer-blocked write stalled enforcement")
+	}
+
+	// The longevity goroutine should return promptly after enqueueing the
+	// disconnect frame; it no longer waits on a peer-visible write.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manageTunnelLongevity did not return promptly after cancellation")
+	}
+}

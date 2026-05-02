@@ -38,6 +38,7 @@ type SOCKSServer interface {
 type observedSOCKSServer struct {
 	stdLogger   *log.Logger
 	allowRules  Allowlist
+	ipBlock     IPBlocklist
 	dialTimeout time.Duration
 }
 
@@ -53,15 +54,20 @@ type socksConnectDetails struct {
 }
 
 // NewObservedSOCKSServer constructs a SOCKS5 server wrapper that logs
-// CONNECT events and enforces the operator-configured allowlist. dialTimeout
-// caps the time each outbound TCP dial may block; a zero value disables the
-// per-dial timeout and should only be used in tests — in production
-// unbounded dials let authenticated users tie up goroutines and fds on
-// blackholed destinations.
-func NewObservedSOCKSServer(stdLogger *log.Logger, rules Allowlist, dialTimeout time.Duration) SOCKSServer {
+// CONNECT events and enforces the operator-configured allowlist plus the
+// resolved-IP blocklist. ipBlock is checked after the allowlist; deny wins.
+// A nil/empty ipBlock disables the resolved-IP guard and matches the
+// --no-ip-block posture.
+//
+// dialTimeout caps the time each outbound TCP dial may block; a zero value
+// disables the per-dial timeout and should only be used in tests — in
+// production unbounded dials let authenticated users tie up goroutines and
+// fds on blackholed destinations.
+func NewObservedSOCKSServer(stdLogger *log.Logger, rules Allowlist, ipBlock IPBlocklist, dialTimeout time.Duration) SOCKSServer {
 	return &observedSOCKSServer{
 		stdLogger:   stdLogger,
 		allowRules:  rules,
+		ipBlock:     ipBlock,
 		dialTimeout: dialTimeout,
 	}
 }
@@ -220,7 +226,7 @@ func (s *observedSOCKSServer) ServeConn(conn net.Conn) error {
 
 	server, err := socks5.New(&socks5.Config{
 		Logger: s.stdLogger,
-		Rules:  observedSOCKSRuleSet{logger: logger, allowRules: s.allowRules},
+		Rules:  observedSOCKSRuleSet{logger: logger, allowRules: s.allowRules, ipBlock: s.ipBlock},
 		Dial:   observedSOCKSDial(logger, s.dialTimeout),
 	})
 	if err != nil {
@@ -232,6 +238,7 @@ func (s *observedSOCKSServer) ServeConn(conn net.Conn) error {
 type observedSOCKSRuleSet struct {
 	logger     *slog.Logger
 	allowRules Allowlist
+	ipBlock    IPBlocklist
 }
 
 func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (context.Context, bool) {
@@ -264,9 +271,29 @@ func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (c
 	// Pass the raw FQDN and IP separately so CIDR rules and hostname-glob rules
 	// are evaluated independently — details.TargetHost collapses the two.
 	if !r.allowRules.Permits(req.DestAddr.FQDN, req.DestAddr.IP, req.DestAddr.Port) {
+		// `event` is the structured-query key used elsewhere (admission,
+		// pre-auth); set it alongside the slog `msg` so operators can filter
+		// on a single attribute regardless of the originating log call.
 		logger.Warn("socks_connect_denied",
+			slog.String("event", "socks_connect_denied"),
 			slog.String("target_host", details.TargetHost),
 			slog.Int("target_port", details.TargetPort),
+		)
+		return ctx, false
+	}
+	// Independent defence-in-depth check: deny resolved destinations in the
+	// operator-configured (or default) IP blocklist regardless of how the
+	// allowlist matched. This guards against hostname rules being steered to
+	// loopback / link-local / IMDS / multicast via DNS, and applies equally
+	// in restrictive and --allow-open-egress modes. Override is loud and
+	// explicit: --no-ip-block, or a tuned --ip-block list.
+	if blocked, reason := r.ipBlock.Blocks(req.DestAddr.IP); blocked {
+		logger.Warn("socks_connect_denied_ip_blocked",
+			slog.String("event", "socks_connect_denied_ip_blocked"),
+			slog.String("target_host", details.TargetHost),
+			slog.Int("target_port", details.TargetPort),
+			slog.String("resolved_ip", req.DestAddr.IP.String()),
+			slog.String("reason", reason),
 		)
 		return ctx, false
 	}

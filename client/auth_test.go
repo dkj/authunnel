@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -48,8 +50,11 @@ func TestParseClientConfigVersionFlag(t *testing.T) {
 	}
 }
 
-func TestParseClientConfigAccessTokenFlag(t *testing.T) {
-	cfg, err := parseClientConfig([]string{"--access-token", "tok123", "--tunnel-url", "https://tunnel.example/protected/tunnel"}, func(string) string { return "" })
+func TestParseClientConfigAccessTokenFromEnv(t *testing.T) {
+	cfg, err := parseClientConfig(
+		[]string{"--tunnel-url", "https://tunnel.example/protected/tunnel"},
+		envOnly("ACCESS_TOKEN", "tok123"),
+	)
 	if err != nil {
 		t.Fatalf("parseClientConfig failed: %v", err)
 	}
@@ -62,15 +67,27 @@ func TestParseClientConfigAccessTokenFlag(t *testing.T) {
 }
 
 func TestParseClientConfigAcceptsTunnelURLFlag(t *testing.T) {
-	cfg, err := parseClientConfig([]string{
-		"--access-token", "tok123",
-		"--tunnel-url", "https://example.com/protected/tunnel",
-	}, func(string) string { return "" })
+	cfg, err := parseClientConfig(
+		[]string{"--tunnel-url", "https://example.com/protected/tunnel"},
+		envOnly("ACCESS_TOKEN", "tok123"),
+	)
 	if err != nil {
 		t.Fatalf("parseClientConfig failed: %v", err)
 	}
 	if cfg.TunnelURL != "https://example.com/protected/tunnel" {
 		t.Fatalf("unexpected TunnelURL: got %q", cfg.TunnelURL)
+	}
+}
+
+// envOnly returns a getenv that resolves a single key. Used by parser tests
+// that exercise ACCESS_TOKEN-via-environment paths now that --access-token
+// has been removed.
+func envOnly(key, value string) func(string) string {
+	return func(k string) string {
+		if k == key {
+			return value
+		}
+		return ""
 	}
 }
 
@@ -129,13 +146,12 @@ func TestParseClientConfigRejectsManualAuthWithManagedOIDCFlags(t *testing.T) {
 }
 
 func TestParseClientConfigRejectsAccessTokenWithOIDCCacheOrNoBrowser(t *testing.T) {
-	for _, extra := range [][]string{
+	for _, args := range [][]string{
 		{"--oidc-cache", "/tmp/tokens.json"},
 		{"--oidc-no-browser"},
 		{"--oidc-scopes", "openid"},
 	} {
-		args := append([]string{"--access-token", "tok"}, extra...)
-		_, err := parseClientConfig(args, func(string) string { return "" })
+		_, err := parseClientConfig(args, envOnly("ACCESS_TOKEN", "tok"))
 		if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
 			t.Errorf("parseClientConfig(%v) expected conflict error, got %v", args, err)
 		}
@@ -611,32 +627,21 @@ func TestAcquireFileLockAllowsReuseOfExistingLockFile(t *testing.T) {
 
 func TestAcquireFileLockCanBeReacquiredAfterHolderProcessExits(t *testing.T) {
 	lockPath := filepathForTest(t, "tokens.lock")
-	cmd := exec.Command(os.Args[0], "-test.run=TestAcquireFileLockHelperProcess$")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestAcquireFileLockHelperProcess$")
 	cmd.Env = append(os.Environ(),
 		"AUTHUNNEL_LOCK_HELPER=1",
 		"AUTHUNNEL_LOCK_PATH="+lockPath,
 		"AUTHUNNEL_LOCK_HOLD_MS=100",
 	)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stdout
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start helper process: %v", err)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run helper process: %v\noutput:\n%s", err, string(output))
 	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
-
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(stdout.String(), "locked\n") {
-		if time.Now().After(deadline) {
-			t.Fatalf("helper did not report lock acquisition: %s", stdout.String())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("wait for helper process: %v\noutput:\n%s", err, stdout.String())
+	if !strings.Contains(string(output), "locked\n") {
+		t.Fatalf("helper did not report lock acquisition: %s", string(output))
 	}
 
 	release, err := acquireFileLock(context.Background(), lockPath)
@@ -644,6 +649,92 @@ func TestAcquireFileLockCanBeReacquiredAfterHolderProcessExits(t *testing.T) {
 		t.Fatalf("acquire lock after helper exit: %v", err)
 	}
 	release()
+}
+
+func TestAcquireFileLockReturnsContextErrorWhileLockHeld(t *testing.T) {
+	lockPath := filepathForTest(t, "tokens.lock")
+
+	// This test is about Authunnel's lock-acquisition loop, not the OS flock
+	// primitive itself. The helper process holds the lock so the parent sees
+	// EWOULDBLOCK/EAGAIN from LOCK_NB, exercises the 100 ms retry path, and
+	// then proves the ctx.Done() branch can interrupt a contended acquisition.
+	helperCtx, stopHelper := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopHelper()
+	cmd := exec.CommandContext(helperCtx, os.Args[0], "-test.run=TestAcquireFileLockHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"AUTHUNNEL_LOCK_HELPER=1",
+		"AUTHUNNEL_LOCK_PATH="+lockPath,
+		"AUTHUNNEL_LOCK_HOLD_MS=2000",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("open helper stdout pipe: %v", err)
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper process: %v", err)
+	}
+	var waitErr error
+	waitDone := make(chan struct{})
+	go func() {
+		waitErr = cmd.Wait()
+		close(waitDone)
+	}()
+	t.Cleanup(func() {
+		stopHelper()
+		select {
+		case <-waitDone:
+		case <-time.After(time.Second):
+			_ = cmd.Process.Kill()
+			select {
+			case <-waitDone:
+			case <-time.After(time.Second):
+			}
+		}
+	})
+
+	lockedCh := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			if scanner.Text() == "locked" {
+				lockedCh <- nil
+				return
+			}
+			lockedCh <- fmt.Errorf("unexpected helper stdout line %q", scanner.Text())
+			return
+		}
+		if err := scanner.Err(); err != nil {
+			lockedCh <- err
+			return
+		}
+		lockedCh <- io.EOF
+	}()
+
+	select {
+	case err := <-lockedCh:
+		if err != nil {
+			t.Fatalf("helper did not report lock acquisition: %v", err)
+		}
+	case <-waitDone:
+		t.Fatalf("helper exited before reporting lock acquisition: %v", waitErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for helper lock acquisition")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	release, err := acquireFileLock(ctx, lockPath)
+	if release != nil {
+		release()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("acquireFileLock under contention error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("acquireFileLock returned too slowly after context timeout: %s", elapsed)
+	}
 }
 
 func TestAcquireFileLockHelperProcess(t *testing.T) {
@@ -911,4 +1002,21 @@ func newIPv4TLSTestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	server.StartTLS()
 	t.Cleanup(server.Close)
 	return server
+}
+
+// TestParseClientConfigRejectsAccessTokenFlag locks in the removal of the
+// --access-token command-line option. Bearer tokens passed as flags are
+// visible via process listings and shell history; ACCESS_TOKEN must be
+// supplied through the environment instead.
+func TestParseClientConfigRejectsAccessTokenFlag(t *testing.T) {
+	_, err := parseClientConfig(
+		[]string{"--access-token", "tok123", "--tunnel-url", "https://tunnel.example/protected/tunnel"},
+		func(string) string { return "" },
+	)
+	if err == nil {
+		t.Fatal("parseClientConfig accepted removed --access-token flag, want error")
+	}
+	if !strings.Contains(err.Error(), "access-token") {
+		t.Fatalf("error %q does not mention the removed flag", err.Error())
+	}
 }
