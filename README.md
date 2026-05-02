@@ -109,11 +109,17 @@ Before going to production, verify:
 
 ### Prerequisites
 
-- Go 1.26.2+
+- Released `authunnel-server` and `authunnel-client` binaries for your
+  platform. Go is only needed if you build from source or run the `go run`
+  examples below.
 - An OIDC provider that issues JWT access tokens carrying both a server audience (emitted as `aud`) and a non-empty `sub` — Authunnel pins each tunnel's refresh identity to `sub`, so tokens without one are rejected at admission. Most IdPs emit `sub` by default; on Keycloak 26+ the client's default scopes must cover it (the built-in `basic` scope, or an equivalent custom scope with an `oidc-sub-mapper` — see [`testenv/keycloak/authunnel-realm.json`](testenv/keycloak/authunnel-realm.json) for a working example)
 - A TLS certificate trusted by the client runtime (for TLS-files mode; not required for ACME or plaintext-behind-reverse-proxy modes)
 
 The **server** runs on Linux and macOS. The **client** runs on Linux, macOS, and Windows (10 1803 or later).
+
+The examples below use `go run` from a source checkout. When using released
+binaries, invoke `authunnel-server` or `authunnel-client` with the same flags
+and environment variables.
 
 ### Start server
 
@@ -468,6 +474,8 @@ Current fast coverage includes:
 - filesystem safety: unix socket directory permission checks (group/world-writable rejection, foreign-owner rejection), stale-socket cleanup refusal on non-socket paths, umask-tightened socket creation, token cache and lock directory safety
 
 ## Developer Notes
+
+Developers need Go 1.26.2+ to build and test Authunnel from source.
 
 The codebase is intentionally split so the moving parts of the auth and tunnel
 flows are easy to locate:
