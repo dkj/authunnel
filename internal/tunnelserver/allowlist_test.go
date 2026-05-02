@@ -69,19 +69,19 @@ func TestParseAllowRuleValid(t *testing.T) {
 
 func TestParseAllowRuleInvalid(t *testing.T) {
 	cases := []string{
-		"*.internal",       // no colon
-		"*.internal:0",     // port 0
-		"*.internal:65536", // port out of range
+		"*.internal",        // no colon
+		"*.internal:0",      // port 0
+		"*.internal:65536",  // port out of range
 		"*.internal:100-50", // lo > hi
-		"*.internal:abc",   // non-numeric port
-		"10.999.0.0/8:22",  // bad CIDR
-		"[bad:22",          // bad glob pattern (unmatched bracket)
-		":22",              // empty host
-		"[notanip]:22",     // brackets but not a valid IP or CIDR
-		"[]:22",            // empty brackets
-		"::1:22",           // unbracketed IPv6 — ambiguous whether :22 is port or address tail
-		"2001:db8::1",      // unbracketed IPv6, no port — LastIndex splits wrong
-		"2001:db8::1:443",  // unbracketed IPv6, port ambiguous — LastIndex splits wrong
+		"*.internal:abc",    // non-numeric port
+		"10.999.0.0/8:22",   // bad CIDR
+		"[bad:22",           // bad glob pattern (unmatched bracket)
+		":22",               // empty host
+		"[notanip]:22",      // brackets but not a valid IP or CIDR
+		"[]:22",             // empty brackets
+		"::1:22",            // unbracketed IPv6 — ambiguous whether :22 is port or address tail
+		"2001:db8::1",       // unbracketed IPv6, no port — LastIndex splits wrong
+		"2001:db8::1:443",   // unbracketed IPv6, port ambiguous — LastIndex splits wrong
 	}
 
 	for _, tc := range cases {
@@ -142,12 +142,12 @@ func TestAllowlistPermits(t *testing.T) {
 	ruleIPv6 := mustParseAllowRule(t, "[::1]:22")
 
 	cases := []struct {
-		name    string
-		al      Allowlist
-		fqdn    string
-		ip      net.IP
-		port    int
-		want    bool
+		name string
+		al   Allowlist
+		fqdn string
+		ip   net.IP
+		port int
+		want bool
 	}{
 		{
 			name: "empty allowlist permits all",

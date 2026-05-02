@@ -16,7 +16,7 @@ func TestRouteAuthBoundaries(t *testing.T) {
 	validator := &mockValidator{tokens: map[string]*oidc.AccessTokenClaims{
 		"good": {TokenClaims: oidc.TokenClaims{Subject: "alice"}},
 	}}
-	mux := NewHandler(validator, NewObservedSOCKSServer(nil, nil, 0))
+	mux := NewHandler(validator, NewObservedSOCKSServer(nil, nil, nil, 0))
 
 	tests := []struct {
 		name       string

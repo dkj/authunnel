@@ -79,6 +79,7 @@ The following are disabled or unlimited by default and must be explicitly config
 
 - **Egress allowlist** (`--allow`): limits the destinations authenticated clients may reach. Recommended for production; restricts the blast radius if a credential is compromised.
 - **Egress open mode** (`--allow-open-egress`): explicit opt-in to allow any destination reachable by the server process. Logged at warn level on startup. Mutually exclusive with `--allow`.
+- **Resolved-IP deny-list** (`--ip-block`, `--no-ip-block`): on by default with a built-in protected set — loopback, IPv4/IPv6 link-local (incl. cloud IMDS `169.254.169.254`), unspecified, and multicast. Applied independently of the egress posture: the deny-list runs after the allow check in both restrictive and open modes, so a hostname rule that resolves to a protected address is rejected regardless. RFC1918, CGNAT, and IPv6 ULA are not in the default set. `--ip-block` replaces the default with an operator-supplied list (CIDR, bare IP, or bracketed IPv6); `--no-ip-block` disables the guard entirely.
 - **Connection longevity** (`--max-connection-duration`, `--expiry-grace`, `--no-connection-token-expiry`): by default tunnel lifetime is tied to the access token's `exp`. These flags let operators tune for specific IdP behaviors or impose hard ceilings. Some IdPs (e.g. Auth0) cache access tokens; `--expiry-grace` extends the enforcement deadline beyond `exp` to give the client time to obtain a genuinely new token.
 - **Admission limits** (`--max-concurrent-tunnels`, `--max-tunnels-per-user`, `--tunnel-open-rate`, `--dial-timeout`): zero or default by default. Configure for production to bound resource use and prevent a single credential from monopolising tunnel capacity or tying up goroutines on blackholed destinations.
 - **Pre-auth IP rate limit** (`--preauth-rate`, `--preauth-burst`): off by default, matching the explicit-posture style of the egress flags. When enabled, runs before bearer-token parsing on every authenticated route (`/protected`, `/protected/`, any `/protected/*`, and `/protected/tunnel`) so a flood of anonymous or junk-JWT requests is rejected with `429` before any validator or JWKS work happens. Recommended for direct internet exposure; deployments behind a load balancer that already rate-limits anonymous traffic can leave it off.
@@ -97,6 +98,7 @@ Before going to production, verify:
 - [ ] Tunnel endpoint is `https://` or `wss://` — `--insecure-tunnel-url` is **not** set on the client.
 - [ ] Token-expiry enforcement is active — `--no-connection-token-expiry` is **not** set. By default, tunnels close when the access token expires and clients must refresh. Disabling this removes token expiry as a tunnel lifetime control; tunnels will still close at `--max-connection-duration` if set, but without that limit they persist until the client disconnects.
 - [ ] At least one `--allow` rule is configured. `--allow-open-egress` should only appear in deployments where arbitrary authenticated egress from the server host is explicitly acceptable.
+- [ ] The default `--ip-block` set is in effect (loopback, link-local incl. IMDS, unspecified, multicast), or any deviation via `--ip-block` / `--no-ip-block` is intentional and documented for the deployment.
 - [ ] A hard connection ceiling is set (`--max-connection-duration`) appropriate for your session-length policy.
 - [ ] Admission limits are sized for expected load: `--max-concurrent-tunnels`, `--max-tunnels-per-user`, and `--tunnel-open-rate` are set.
 - [ ] `--dial-timeout` is set (default `10s`). Setting it to `0` allows authenticated users to hold goroutines open on blackholed destinations indefinitely.
@@ -209,6 +211,8 @@ Useful server flags and environment variables:
 - `--plaintext-behind-reverse-proxy` or `PLAINTEXT_BEHIND_REVERSE_PROXY=true` — serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; `X-Forwarded-Proto` and `X-Forwarded-Host` are used for WebSocket origin checks
 - `--allow` or `ALLOW_RULES` (comma-separated in env) — restrict outbound connections to matching rules; repeatable. At least one rule is required unless `--allow-open-egress` is set
 - `--allow-open-egress` or `ALLOW_OPEN_EGRESS=true` — explicit opt-in for running with no allowlist; mutually exclusive with `--allow`. Use only when arbitrary authenticated egress from the server host is acceptable for the deployment
+- `--ip-block` or `IP_BLOCK` (comma-separated in env) — resolved-IP deny-list applied after `--allow`; repeatable. Accepts CIDR (`127.0.0.0/8`), bare IP (`127.0.0.1`), or bracketed IPv6 (`[::1]`, `[fe80::/10]`). When unset and `--no-ip-block` is not set, defaults to the built-in protected set (loopback, IPv4/IPv6 link-local incl. IMDS `169.254.169.254`, unspecified, multicast). Applies in both restrictive and open-egress modes; deny wins over `--allow`
+- `--no-ip-block` or `NO_IP_BLOCK=true` — disable the resolved-IP deny-list entirely; mutually exclusive with `--ip-block`. Use only when the deployment legitimately needs to reach default-protected addresses (e.g. tunnelling to a localhost service) and a tighter `--ip-block` list is not sufficient
 - `--insecure-oidc-issuer` or `INSECURE_OIDC_ISSUER=true` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
 - `--max-connection-duration` or `MAX_CONNECTION_DURATION` — hard maximum tunnel lifetime (e.g. `4h`, `30m`); default `0` (unlimited)
 - `--no-connection-token-expiry` or `NO_CONNECTION_TOKEN_EXPIRY=true` — do not tie tunnel lifetime to access token expiry; by default expiry IS enforced and clients can refresh tokens to extend
@@ -227,6 +231,22 @@ Admission rejections are emitted as structured `warn` log records with `event=tu
 Rule formats: `host-glob:port`, `host-glob:lo-hi`, `CIDR:port`, `CIDR:lo-hi`, `[IPv6]:port`, `[IPv6]:lo-hi`
 
 IPv6 addresses must use bracketed notation (`[addr]:port`). Unbracketed IPv6 is rejected at startup because the last-colon port split is otherwise ambiguous.
+
+A resolved-IP deny-list runs after the allow check, independently of the egress posture. By default it covers loopback (`127.0.0.0/8`, `::1`), IPv4 link-local (`169.254.0.0/16`, including IMDS `169.254.169.254`), IPv6 link-local (`fe80::/10`), unspecified (`0.0.0.0/8`, `::`), and multicast (`224.0.0.0/4`, `ff00::/8`). A request that the allow-list permits but whose resolved address falls in the deny-list is rejected with `event=socks_connect_denied_ip_blocked` and a `reason` field (`loopback`, `link_local_ipv4`, `link_local_ipv6`, `unspecified`, or `multicast`). RFC1918, CGNAT, and IPv6 ULA ranges are not in the default set.
+
+To replace the default deny-list, pass one or more `--ip-block` rules (or set `IP_BLOCK`):
+
+```bash
+# Block only IMDS; loopback becomes reachable subject to --allow
+authunnel-server --allow '127.0.0.1:5432' --ip-block '169.254.0.0/16'
+```
+
+To disable the guard entirely, pass `--no-ip-block`. This is the only way to reach default-protected addresses when a tighter `--ip-block` list is not sufficient (for example, when running with `--allow-open-egress` and a deliberate need to reach loopback):
+
+```bash
+authunnel-server --allow '127.0.0.1:5432' --no-ip-block
+authunnel-server --allow-open-egress --no-ip-block   # fully open posture
+```
 
 ```bash
 # Only allow SSH to *.internal and HTTPS to the 10.x network

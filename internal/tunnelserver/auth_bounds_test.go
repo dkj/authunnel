@@ -29,7 +29,7 @@ func (r rejectingValidator) ValidateAccessToken(_ context.Context, _ string) (*o
 }
 
 func TestValidateRequestTokenRejectsOversizedAuthorizationHeader(t *testing.T) {
-	mux := NewHandler(rejectingValidator{t: t}, NewObservedSOCKSServer(nil, nil, 0))
+	mux := NewHandler(rejectingValidator{t: t}, NewObservedSOCKSServer(nil, nil, nil, 0))
 
 	// Build a non-Bearer scheme that exceeds the header cap so the size
 	// check fires before the prefix mismatch path.
@@ -48,7 +48,7 @@ func TestValidateRequestTokenRejectsOversizedAuthorizationHeader(t *testing.T) {
 }
 
 func TestValidateRequestTokenRejectsOversizedBearerToken(t *testing.T) {
-	mux := NewHandler(rejectingValidator{t: t}, NewObservedSOCKSServer(nil, nil, 0))
+	mux := NewHandler(rejectingValidator{t: t}, NewObservedSOCKSServer(nil, nil, nil, 0))
 
 	token := strings.Repeat("a", maxBearerTokenBytes+1)
 	req := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
@@ -73,7 +73,7 @@ func TestValidateRequestTokenAcceptsTokenAtBoundary(t *testing.T) {
 	v := &mockValidator{tokens: map[string]*oidc.AccessTokenClaims{
 		token: {TokenClaims: oidc.TokenClaims{Subject: "alice", Expiration: oidc.FromTime(time.Now().Add(time.Hour))}},
 	}}
-	mux := NewHandler(v, NewObservedSOCKSServer(nil, nil, 0))
+	mux := NewHandler(v, NewObservedSOCKSServer(nil, nil, nil, 0))
 
 	req := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
 	req.Header.Set("Authorization", "Bearer "+token)

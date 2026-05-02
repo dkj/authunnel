@@ -232,6 +232,237 @@ func TestObservedSOCKSRuleSetDeniesConnectionNotMatchingAllowlist(t *testing.T) 
 	if got := entry["level"]; got != "WARN" {
 		t.Fatalf("expected warn level, got %#v", got)
 	}
+	// Operators query on the `event` attribute (matching the admission and
+	// pre-auth log shape); assert it's emitted alongside the slog msg so
+	// alerting on event=socks_connect_denied keeps working.
+	if got := entry["event"]; got != "socks_connect_denied" {
+		t.Fatalf("unexpected event: got %#v", got)
+	}
+}
+
+func TestObservedSOCKSRuleSetDeniesAllowedHostnameResolvingIntoBlocklist(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ruleset := observedSOCKSRuleSet{
+		logger:     logger,
+		allowRules: Allowlist{mustParseAllowRule(t, "*.internal:22")},
+		ipBlock:    DefaultIPBlocklist(),
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			FQDN: "db.internal",
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 22,
+		},
+	})
+	if ok {
+		t.Fatal("expected hostname match resolving to loopback to be denied by ip-block")
+	}
+
+	entry := parseLogEntryByMessage(t, logBuf.String(), "socks_connect_denied_ip_blocked")
+	if got := entry["reason"]; got != "loopback" {
+		t.Fatalf("unexpected reason: got %#v", got)
+	}
+	if got := entry["resolved_ip"]; got != "127.0.0.1" {
+		t.Fatalf("unexpected resolved_ip: got %#v", got)
+	}
+	if got := entry["target_host"]; got != "db.internal" {
+		t.Fatalf("unexpected target_host: got %#v", got)
+	}
+	if got := entry["target_port"]; got != float64(22) {
+		t.Fatalf("unexpected target_port: got %#v", got)
+	}
+	if got := entry["level"]; got != "WARN" {
+		t.Fatalf("expected warn level, got %#v", got)
+	}
+	if got := entry["event"]; got != "socks_connect_denied_ip_blocked" {
+		t.Fatalf("unexpected event: got %#v", got)
+	}
+}
+
+func TestObservedSOCKSRuleSetDeniesIMDSWhenAllowedByHostname(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ruleset := observedSOCKSRuleSet{
+		logger:     logger,
+		allowRules: Allowlist{mustParseAllowRule(t, "*.internal:80")},
+		ipBlock:    DefaultIPBlocklist(),
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			FQDN: "metadata.internal",
+			IP:   net.ParseIP("169.254.169.254"),
+			Port: 80,
+		},
+	})
+	if ok {
+		t.Fatal("expected hostname match resolving to IMDS to be denied")
+	}
+
+	entry := parseLogEntryByMessage(t, logBuf.String(), "socks_connect_denied_ip_blocked")
+	if got := entry["reason"]; got != "link_local_ipv4" {
+		t.Fatalf("unexpected reason: got %#v", got)
+	}
+	if got := entry["resolved_ip"]; got != "169.254.169.254" {
+		t.Fatalf("unexpected resolved_ip: got %#v", got)
+	}
+}
+
+func TestObservedSOCKSRuleSetAcceptsLoopbackWhenIPBlockEmpty(t *testing.T) {
+	// Models the --no-ip-block posture: ipBlock is nil, so the resolved-IP
+	// guard does not run and an --allow rule for loopback is honoured.
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ruleset := observedSOCKSRuleSet{
+		logger:     logger,
+		allowRules: Allowlist{mustParseAllowRule(t, "127.0.0.1:5432")},
+		ipBlock:    nil,
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 5432,
+		},
+	})
+	if !ok {
+		t.Fatal("expected --no-ip-block + explicit loopback rule to permit the connection")
+	}
+	if strings.Contains(logBuf.String(), "socks_connect_denied_ip_blocked") {
+		t.Fatalf("empty ip-block must not log a block denial, logs:\n%s", logBuf.String())
+	}
+}
+
+func TestObservedSOCKSRuleSetDeniesLoopbackEvenWithExplicitAllowRule(t *testing.T) {
+	// With the default ip-block in effect, an --allow 127.0.0.1:port rule
+	// alone is not enough — the operator must also use --no-ip-block (or a
+	// tuned --ip-block) to override the guard. This is the deliberate
+	// behaviour change vs the earlier auto-bypass design.
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ruleset := observedSOCKSRuleSet{
+		logger:     logger,
+		allowRules: Allowlist{mustParseAllowRule(t, "127.0.0.1:5432")},
+		ipBlock:    DefaultIPBlocklist(),
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 5432,
+		},
+	})
+	if ok {
+		t.Fatal("expected default ip-block to deny loopback even with an explicit --allow rule")
+	}
+	entry := parseLogEntryByMessage(t, logBuf.String(), "socks_connect_denied_ip_blocked")
+	if got := entry["reason"]; got != "loopback" {
+		t.Fatalf("unexpected reason: got %#v", got)
+	}
+}
+
+func TestObservedSOCKSRuleSetAcceptsHostnameMatchResolvingToRFC1918(t *testing.T) {
+	ruleset := observedSOCKSRuleSet{
+		logger:     slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		allowRules: Allowlist{mustParseAllowRule(t, "*.internal:22")},
+		ipBlock:    DefaultIPBlocklist(),
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			FQDN: "db.internal",
+			IP:   net.ParseIP("10.0.0.5"),
+			Port: 22,
+		},
+	})
+	if !ok {
+		t.Fatal("expected hostname match resolving to RFC1918 address to be allowed")
+	}
+}
+
+func TestObservedSOCKSRuleSetDeniesOpenEgressResolvingToIMDS(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ruleset := observedSOCKSRuleSet{
+		logger:     logger,
+		allowRules: Allowlist{}, // open-egress mode
+		ipBlock:    DefaultIPBlocklist(),
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			FQDN: "metadata.example",
+			IP:   net.ParseIP("169.254.169.254"),
+			Port: 80,
+		},
+	})
+	if ok {
+		t.Fatal("expected open-egress IMDS destination to be denied by default ip-block")
+	}
+
+	entry := parseLogEntryByMessage(t, logBuf.String(), "socks_connect_denied_ip_blocked")
+	if got := entry["reason"]; got != "link_local_ipv4" {
+		t.Fatalf("unexpected reason: got %#v", got)
+	}
+}
+
+func TestObservedSOCKSRuleSetAcceptsOpenEgressWithEmptyIPBlock(t *testing.T) {
+	// Models --allow-open-egress --no-ip-block: fully open posture.
+	ruleset := observedSOCKSRuleSet{
+		logger:     slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		allowRules: Allowlist{},
+		ipBlock:    nil,
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 5432,
+		},
+	})
+	if !ok {
+		t.Fatal("expected fully-open posture (--allow-open-egress --no-ip-block) to permit loopback")
+	}
+}
+
+func TestObservedSOCKSRuleSetAcceptsLoopbackWithCustomIPBlockExcludingIt(t *testing.T) {
+	// Operator passes --ip-block 169.254.0.0/16 only — loopback is no
+	// longer in the deny list, so an --allow rule for loopback works.
+	customBlock, err := ParseIPBlocklistFromCSV("169.254.0.0/16")
+	if err != nil {
+		t.Fatalf("ParseIPBlocklistFromCSV: %v", err)
+	}
+
+	ruleset := observedSOCKSRuleSet{
+		logger:     slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		allowRules: Allowlist{mustParseAllowRule(t, "127.0.0.1:5432")},
+		ipBlock:    customBlock,
+	}
+
+	_, ok := ruleset.Allow(context.Background(), &socks5.Request{
+		Command: socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 5432,
+		},
+	})
+	if !ok {
+		t.Fatal("expected loopback to be allowed when --ip-block omits it")
+	}
 }
 
 func TestObservedSOCKSRuleSetAllowsConnectionMatchingAllowlist(t *testing.T) {

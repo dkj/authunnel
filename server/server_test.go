@@ -63,6 +63,7 @@ func TestParseServerConfigReadsFlagsAndEnv(t *testing.T) {
 		ACMECacheDir:    "/var/cache/authunnel/acme",
 		LogLevel:        slog.LevelInfo,
 		AllowOpenEgress: true,
+		IPBlockRanges:   tunnelserver.DefaultIPBlocklist(),
 		ExpiryWarning:   3 * time.Minute,
 		DialTimeout:     10 * time.Second,
 	}
@@ -877,6 +878,178 @@ func TestParseServerConfigRejectsAllowRulesWithOpenEgress(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("expected 'mutually exclusive' error, got: %v", err)
+	}
+}
+
+// commonAllowGetenv satisfies the mandatory issuer/audience/TLS env vars so
+// the new --ip-block tests can focus on ip-block-specific behaviour without
+// re-stating the same boilerplate per case.
+func commonAllowGetenv(extra map[string]string) func(string) string {
+	return func(key string) string {
+		if v, ok := extra[key]; ok {
+			return v
+		}
+		switch key {
+		case "OIDC_ISSUER":
+			return "https://issuer.example"
+		case "TOKEN_AUDIENCE":
+			return "authunnel-server"
+		case "TLS_CERT_FILE":
+			return "/env/server.crt"
+		case "TLS_KEY_FILE":
+			return "/env/server.key"
+		}
+		return ""
+	}
+}
+
+// TestParseServerConfigDefaultsIPBlock asserts that when neither --ip-block
+// nor --no-ip-block is set, the configured blocklist is the documented
+// default protected set. This is the safe-by-default posture.
+func TestParseServerConfigDefaultsIPBlock(t *testing.T) {
+	cfg, err := parseServerConfig(
+		[]string{"--allow-open-egress"},
+		commonAllowGetenv(nil),
+	)
+	if err != nil {
+		t.Fatalf("parseServerConfig: %v", err)
+	}
+	want := tunnelserver.DefaultIPBlocklist()
+	if !reflect.DeepEqual(cfg.IPBlockRanges, want) {
+		t.Fatalf("expected default ip-block (len %d), got len %d (%v)", len(want), len(cfg.IPBlockRanges), cfg.IPBlockRanges)
+	}
+	if cfg.NoIPBlock {
+		t.Fatal("NoIPBlock should be false by default")
+	}
+}
+
+func TestParseServerConfigAcceptsIPBlockFlagReplacesDefault(t *testing.T) {
+	cfg, err := parseServerConfig(
+		[]string{"--allow-open-egress", "--ip-block", "169.254.0.0/16"},
+		commonAllowGetenv(nil),
+	)
+	if err != nil {
+		t.Fatalf("parseServerConfig: %v", err)
+	}
+	if len(cfg.IPBlockRanges) != 1 {
+		t.Fatalf("expected 1 ip-block entry (custom replaces default), got %d", len(cfg.IPBlockRanges))
+	}
+	// Custom range only covers 169.254/16, so loopback must NOT match.
+	if blocked, _ := cfg.IPBlockRanges.Blocks(net.ParseIP("127.0.0.1")); blocked {
+		t.Errorf("custom --ip-block 169.254.0.0/16 should not block loopback")
+	}
+	if blocked, reason := cfg.IPBlockRanges.Blocks(net.ParseIP("169.254.169.254")); !blocked {
+		t.Errorf("custom --ip-block 169.254.0.0/16 should block IMDS, blocked=%v reason=%q", blocked, reason)
+	}
+}
+
+func TestParseServerConfigAcceptsIPBlockFromEnv(t *testing.T) {
+	cfg, err := parseServerConfig(
+		[]string{"--allow-open-egress"},
+		commonAllowGetenv(map[string]string{"IP_BLOCK": "127.0.0.0/8, 169.254.0.0/16"}),
+	)
+	if err != nil {
+		t.Fatalf("parseServerConfig: %v", err)
+	}
+	if len(cfg.IPBlockRanges) != 2 {
+		t.Fatalf("expected 2 ip-block entries from env, got %d", len(cfg.IPBlockRanges))
+	}
+}
+
+func TestParseServerConfigCombinesIPBlockFlagAndEnv(t *testing.T) {
+	cfg, err := parseServerConfig(
+		[]string{"--allow-open-egress", "--ip-block", "224.0.0.0/4"},
+		commonAllowGetenv(map[string]string{"IP_BLOCK": "127.0.0.0/8"}),
+	)
+	if err != nil {
+		t.Fatalf("parseServerConfig: %v", err)
+	}
+	if len(cfg.IPBlockRanges) != 2 {
+		t.Fatalf("expected 2 ip-block entries (env + flag combined), got %d: %v", len(cfg.IPBlockRanges), cfg.IPBlockRanges)
+	}
+}
+
+func TestParseServerConfigAcceptsNoIPBlockFlag(t *testing.T) {
+	cfg, err := parseServerConfig(
+		[]string{"--allow-open-egress", "--no-ip-block"},
+		commonAllowGetenv(nil),
+	)
+	if err != nil {
+		t.Fatalf("parseServerConfig: %v", err)
+	}
+	if !cfg.NoIPBlock {
+		t.Fatal("NoIPBlock should be true when --no-ip-block is set")
+	}
+	if len(cfg.IPBlockRanges) != 0 {
+		t.Fatalf("expected empty ip-block when --no-ip-block is set, got %d entries", len(cfg.IPBlockRanges))
+	}
+}
+
+func TestParseServerConfigAcceptsNoIPBlockEnv(t *testing.T) {
+	cfg, err := parseServerConfig(
+		[]string{"--allow-open-egress"},
+		commonAllowGetenv(map[string]string{"NO_IP_BLOCK": "true"}),
+	)
+	if err != nil {
+		t.Fatalf("parseServerConfig: %v", err)
+	}
+	if !cfg.NoIPBlock {
+		t.Fatal("NoIPBlock should be true when NO_IP_BLOCK=true")
+	}
+	if len(cfg.IPBlockRanges) != 0 {
+		t.Fatalf("expected empty ip-block, got %d entries", len(cfg.IPBlockRanges))
+	}
+}
+
+// TestParseServerConfigRejectsIPBlockWithNoIPBlock keeps the operator's
+// intent unambiguous on startup: passing both is a configuration error
+// rather than a silent precedence rule.
+func TestParseServerConfigRejectsIPBlockWithNoIPBlock(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{"--allow-open-egress", "--ip-block", "127.0.0.0/8", "--no-ip-block"},
+		commonAllowGetenv(nil),
+	)
+	if err == nil {
+		t.Fatal("expected --ip-block with --no-ip-block to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected 'mutually exclusive' error, got: %v", err)
+	}
+}
+
+func TestParseServerConfigRejectsIPBlockEnvWithNoIPBlockFlag(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{"--allow-open-egress", "--no-ip-block"},
+		commonAllowGetenv(map[string]string{"IP_BLOCK": "127.0.0.0/8"}),
+	)
+	if err == nil {
+		t.Fatal("expected IP_BLOCK with --no-ip-block to be rejected")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected 'mutually exclusive' error, got: %v", err)
+	}
+}
+
+func TestParseServerConfigRejectsInvalidIPBlock(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{"--allow-open-egress", "--ip-block", "not-an-ip"},
+		commonAllowGetenv(nil),
+	)
+	if err == nil {
+		t.Fatal("expected invalid --ip-block value to be rejected")
+	}
+}
+
+func TestParseServerConfigRejectsInvalidIPBlockEnv(t *testing.T) {
+	_, err := parseServerConfig(
+		[]string{"--allow-open-egress"},
+		commonAllowGetenv(map[string]string{"IP_BLOCK": "127.0.0.0/8,not-an-ip"}),
+	)
+	if err == nil {
+		t.Fatal("expected invalid IP_BLOCK value to be rejected")
+	}
+	if !strings.Contains(err.Error(), "IP_BLOCK") {
+		t.Fatalf("expected error to mention IP_BLOCK, got: %v", err)
 	}
 }
 
@@ -1698,7 +1871,7 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 		t.Fatalf("create socks server: %v", err)
 	}
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				MaxDuration:      200 * time.Millisecond,
@@ -1817,7 +1990,7 @@ func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				MaxDuration:      2 * time.Second,
@@ -1947,7 +2120,7 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
@@ -2062,7 +2235,7 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 		}
 	}()
 
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
@@ -2218,7 +2391,7 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 
 	// Key: ExpiryGrace is set, and ExpiryWarning > ExpiryGrace (the
 	// scenario that triggered the reviewer concern).
-	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, 0),
+	handler := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(nil, nil, nil, 0),
 		tunnelserver.HandlerOptions{
 			Longevity: tunnelserver.LongevityConfig{
 				ImplementsExpiry: true,
