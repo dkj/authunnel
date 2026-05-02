@@ -39,8 +39,8 @@ type MultiplexConn struct {
 	cancel context.CancelFunc
 
 	controlC  chan ControlMessage // incoming control messages
-	closeOnce sync.Once          // guards controlC close
-	reader    io.Reader          // partial binary message reader
+	closeOnce sync.Once           // guards controlC close
+	reader    io.Reader           // partial binary message reader
 
 	writeMu sync.Mutex // serializes all frame writes
 }

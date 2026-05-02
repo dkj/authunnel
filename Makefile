@@ -41,6 +41,23 @@ test:
 race:
 	go test -race ./...
 
+.PHONY: fmtcheck
+# Scope to tracked Go files so sibling worktrees, vendored caches, and other
+# untracked trees under the working directory are not inspected. Capture
+# stderr and propagate gofmt's exit status so a parse error is not masked by
+# an empty stdout.
+fmtcheck:
+	@out=$$(git ls-files -z '*.go' | xargs -0 gofmt -l 2>&1); status=$$?; \
+	if [ $$status -ne 0 ]; then \
+	  printf '%s\n' "$$out"; \
+	  echo "gofmt exited $$status"; \
+	  exit $$status; \
+	fi; \
+	if [ -n "$$out" ]; then \
+	  echo "gofmt drift in:"; printf '%s\n' "$$out"; \
+	  exit 1; \
+	fi
+
 .PHONY: vet
 vet:
 	go vet ./...
@@ -75,4 +92,4 @@ sbom:
 	done
 
 .PHONY: lint
-lint: vet staticcheck govulncheck gosec
+lint: fmtcheck vet staticcheck govulncheck gosec
