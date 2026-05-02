@@ -50,8 +50,11 @@ func TestParseClientConfigVersionFlag(t *testing.T) {
 	}
 }
 
-func TestParseClientConfigAccessTokenFlag(t *testing.T) {
-	cfg, err := parseClientConfig([]string{"--access-token", "tok123", "--tunnel-url", "https://tunnel.example/protected/tunnel"}, func(string) string { return "" })
+func TestParseClientConfigAccessTokenFromEnv(t *testing.T) {
+	cfg, err := parseClientConfig(
+		[]string{"--tunnel-url", "https://tunnel.example/protected/tunnel"},
+		envOnly("ACCESS_TOKEN", "tok123"),
+	)
 	if err != nil {
 		t.Fatalf("parseClientConfig failed: %v", err)
 	}
@@ -64,15 +67,27 @@ func TestParseClientConfigAccessTokenFlag(t *testing.T) {
 }
 
 func TestParseClientConfigAcceptsTunnelURLFlag(t *testing.T) {
-	cfg, err := parseClientConfig([]string{
-		"--access-token", "tok123",
-		"--tunnel-url", "https://example.com/protected/tunnel",
-	}, func(string) string { return "" })
+	cfg, err := parseClientConfig(
+		[]string{"--tunnel-url", "https://example.com/protected/tunnel"},
+		envOnly("ACCESS_TOKEN", "tok123"),
+	)
 	if err != nil {
 		t.Fatalf("parseClientConfig failed: %v", err)
 	}
 	if cfg.TunnelURL != "https://example.com/protected/tunnel" {
 		t.Fatalf("unexpected TunnelURL: got %q", cfg.TunnelURL)
+	}
+}
+
+// envOnly returns a getenv that resolves a single key. Used by parser tests
+// that exercise ACCESS_TOKEN-via-environment paths now that --access-token
+// has been removed.
+func envOnly(key, value string) func(string) string {
+	return func(k string) string {
+		if k == key {
+			return value
+		}
+		return ""
 	}
 }
 
@@ -131,13 +146,12 @@ func TestParseClientConfigRejectsManualAuthWithManagedOIDCFlags(t *testing.T) {
 }
 
 func TestParseClientConfigRejectsAccessTokenWithOIDCCacheOrNoBrowser(t *testing.T) {
-	for _, extra := range [][]string{
+	for _, args := range [][]string{
 		{"--oidc-cache", "/tmp/tokens.json"},
 		{"--oidc-no-browser"},
 		{"--oidc-scopes", "openid"},
 	} {
-		args := append([]string{"--access-token", "tok"}, extra...)
-		_, err := parseClientConfig(args, func(string) string { return "" })
+		_, err := parseClientConfig(args, envOnly("ACCESS_TOKEN", "tok"))
 		if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
 			t.Errorf("parseClientConfig(%v) expected conflict error, got %v", args, err)
 		}
@@ -988,4 +1002,21 @@ func newIPv4TLSTestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	server.StartTLS()
 	t.Cleanup(server.Close)
 	return server
+}
+
+// TestParseClientConfigRejectsAccessTokenFlag locks in the removal of the
+// --access-token command-line option. Bearer tokens passed as flags are
+// visible via process listings and shell history; ACCESS_TOKEN must be
+// supplied through the environment instead.
+func TestParseClientConfigRejectsAccessTokenFlag(t *testing.T) {
+	_, err := parseClientConfig(
+		[]string{"--access-token", "tok123", "--tunnel-url", "https://tunnel.example/protected/tunnel"},
+		func(string) string { return "" },
+	)
+	if err == nil {
+		t.Fatal("parseClientConfig accepted removed --access-token flag, want error")
+	}
+	if !strings.Contains(err.Error(), "access-token") {
+		t.Fatalf("error %q does not mention the removed flag", err.Error())
+	}
 }

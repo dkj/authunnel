@@ -47,7 +47,7 @@ The target workflow is:
 ### Client flow
 
 1. Either:
-   - uses a bearer token supplied via `--access-token` or the `ACCESS_TOKEN` environment variable, or
+   - uses a bearer token supplied via the `ACCESS_TOKEN` environment variable, or
    - runs managed OIDC mode when `--oidc-issuer` and `--oidc-client-id` are configured.
 2. In managed mode the client:
    - reuses a cached token when it remains valid for more than 60 seconds,
@@ -215,7 +215,7 @@ Useful server flags and environment variables:
 - `--no-ip-block` or `NO_IP_BLOCK=true` — disable the resolved-IP deny-list entirely; mutually exclusive with `--ip-block`. Use only when the deployment legitimately needs to reach default-protected addresses (e.g. tunnelling to a localhost service) and a tighter `--ip-block` list is not sufficient
 - `--insecure-oidc-issuer` or `INSECURE_OIDC_ISSUER=true` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
 - `--max-connection-duration` or `MAX_CONNECTION_DURATION` — hard maximum tunnel lifetime (e.g. `4h`, `30m`); default `0` (unlimited)
-- `--no-connection-token-expiry` or `NO_CONNECTION_TOKEN_EXPIRY=true` — do not tie tunnel lifetime to access token expiry; by default expiry IS enforced and clients can refresh tokens to extend
+- `--no-connection-token-expiry` or `NO_CONNECTION_TOKEN_EXPIRY=true` — do not tie tunnel lifetime to access token expiry; by default expiry IS enforced and clients can refresh tokens to extend. Setting this **and** leaving `--max-connection-duration` at `0` removes every enforced lifetime cap; the server logs a `connection_lifetime_unbounded` warning at startup so the posture is visible in logs
 - `--expiry-warning` or `EXPIRY_WARNING` — warning period before either longevity limit; default `3m`
 - `--expiry-grace` or `EXPIRY_GRACE` — extend the connection deadline beyond the access token's `exp` claim to accommodate providers (e.g. Auth0) that cache access tokens; default `0` (no grace)
 - `--max-concurrent-tunnels` or `MAX_CONCURRENT_TUNNELS` — server-wide cap on simultaneous tunnels; default `0` (unlimited). Over-cap requests receive `503 Service Unavailable` with `Retry-After`.
@@ -295,7 +295,6 @@ Useful client flags:
 - `--oidc-scopes` with default `openid offline_access`
 - `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json` (macOS/Linux) or `%AppData%\authunnel\tokens.json` (Windows)
 - `--oidc-no-browser` to print the URL without attempting automatic browser launch
-- `--access-token` to supply a bearer token directly (not recommended; mutually exclusive with all OIDC flags)
 - `--tunnel-url` — tunnel endpoint URL. Secure schemes `https://` and `wss://` are accepted by default; plaintext `http://` and `ws://` require `--insecure-tunnel-url`. **Required.** May also be supplied via the `AUTHUNNEL_TUNNEL_URL` environment variable (the flag takes precedence)
 - `--unix-socket`
 - `--proxycommand`
@@ -306,24 +305,39 @@ On first use the client prints the authorization URL to `stderr` and tries to op
 
 ### Manual token (not recommended; for testing only)
 
-A pre-obtained bearer token can be supplied via the `ACCESS_TOKEN` environment variable or the `--access-token` flag. This is mutually exclusive with all managed OIDC flags.
+A pre-obtained bearer token can be supplied via the `ACCESS_TOKEN`
+environment variable. This is mutually exclusive with all managed OIDC
+flags. There is no command-line equivalent: bearer tokens passed as
+arguments would be visible via process listings and shell history.
+
+The examples below source the token from a secrets manager so the literal
+value never appears in shell history or argv. Substitute whichever helper
+you use (`pass`, `vault kv get`, `op read`, `security find-generic-password
+-w`, `gpg --decrypt`, etc.); the goal is that the token comes from outside
+the typed command line.
 
 ```bash
-export ACCESS_TOKEN='<access-token>'
+# The ACCESS_TOKEN= prefix scopes the value to this single client
+# invocation; it is not exported to the shell. Avoid
+# `export ACCESS_TOKEN=<literal>`, which writes the token to shell history.
 cd client
-CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
-  --tunnel-url https://localhost:8443/protected/tunnel \
-  --unix-socket /tmp/authunnel/proxy.sock
+ACCESS_TOKEN="$(pass show authunnel/access-token)" \
+  CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
+    --tunnel-url https://localhost:8443/protected/tunnel \
+    --unix-socket /tmp/authunnel/proxy.sock
 ```
 
-ProxyCommand example with a pre-supplied token:
+ProxyCommand example, same pattern:
 
 ```bash
-/path/to/authunnel-client \
-  --access-token "$ACCESS_TOKEN" \
+ACCESS_TOKEN="$(pass show authunnel/access-token)" /path/to/authunnel-client \
   --tunnel-url https://localhost:8443/protected/tunnel \
   --proxycommand internal-host 22
 ```
+
+If you already export `ACCESS_TOKEN` from a wrapper script or a
+shell-startup integration with your secrets manager, you can omit the
+inline substitution and just invoke the client directly.
 
 ### Unix socket SOCKS5 endpoint
 
@@ -396,9 +410,8 @@ should be explicit about what it does and does not defend against:
 
 If your threat model requires stronger at-rest protection, either run
 authunnel on a system with full-disk encryption (so offline disk access is
-excluded), or supply the access token directly via `--access-token` /
-`ACCESS_TOKEN` from a secrets manager so no refresh token is ever
-persisted by authunnel.
+excluded), or supply the access token directly via `ACCESS_TOKEN` from a
+secrets manager so no refresh token is ever persisted by authunnel.
 
 During listener creation the client restricts its process umask to `0o077`,
 so the socket inode is created owner-only in the first place; the follow-up

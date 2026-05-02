@@ -95,7 +95,6 @@ Choose one authentication method (mutually exclusive):
     --oidc-redirect-port <port>  Loopback port for OIDC callback; 0 = random port
 
   Manual token (not recommended; for testing only):
-    --access-token <token>       Bearer token passed as a flag
     ACCESS_TOKEN                 Bearer token via environment variable
 
 Connection (one of these is required):
@@ -172,7 +171,6 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.SetOutput(io.Discard)
 	var showVersion bool
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
-	fs.StringVar(&cfg.AccessToken, "access-token", cfg.AccessToken, "Bearer token for manual authentication (not recommended; prefer OIDC or ACCESS_TOKEN env var)")
 	fs.StringVar(&cfg.TunnelURL, "tunnel-url", getenv("AUTHUNNEL_TUNNEL_URL"), "Tunnel endpoint URL. Secure schemes: https:// or wss://. Plaintext http:// or ws:// requires --insecure-tunnel-url. Falls back to AUTHUNNEL_TUNNEL_URL.")
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
@@ -211,7 +209,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 		return cfg, errors.New("--oidc-redirect-port must be 0 (random) or >= 1024; low ports are unavailable after capability hardening")
 	}
 	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
-		return cfg, errors.New("--access-token / ACCESS_TOKEN cannot be combined with managed OIDC flags")
+		return cfg, errors.New("ACCESS_TOKEN cannot be combined with managed OIDC flags")
 	}
 	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
 		return cfg, errors.New("managed OIDC mode requires both --oidc-issuer and --oidc-client-id")
