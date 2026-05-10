@@ -6,7 +6,9 @@ on:
       - 'v*'
 
 permissions:
+  attestations: write
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -32,6 +34,11 @@ jobs:
         run: |
           cd dist
           sha256sum * > checksums.sha256
+
+      - name: Generate SLSA build provenance attestation
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/checksums.sha256
 
       - name: Create draft release with assets
         env:

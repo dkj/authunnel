@@ -475,7 +475,7 @@ Current fast coverage includes:
 
 ## Developer Notes
 
-Developers need Go 1.26.2+ to build and test Authunnel from source.
+Developers need Go 1.26.3+ to build and test Authunnel from source.
 
 The codebase is intentionally split so the moving parts of the auth and tunnel
 flows are easy to locate:
@@ -582,6 +582,15 @@ The GitHub Actions workflow in [`.github/workflows/keycloak-e2e.yml`](.github/wo
 ## Versioning
 
 Authunnel follows [Semantic Versioning](https://semver.org/). A new major version may introduce breaking changes to configuration flags, environment variables, or the wire protocol. Check the release notes before upgrading across a major version boundary.
+
+## Release artifact verification
+
+Release assets are accompanied by SHA-256 checksums and GitHub artifact
+attestations. After downloading an asset, verify its provenance with:
+
+```sh
+gh attestation verify authunnel-client-linux-amd64 -R dkj/authunnel
+```
 
 ## License
 
