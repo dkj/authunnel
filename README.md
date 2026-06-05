@@ -475,7 +475,7 @@ Current fast coverage includes:
 
 ## Developer Notes
 
-Developers need Go 1.26.3+ to build and test Authunnel from source.
+Developers need Go 1.26.4+ to build and test Authunnel from source.
 
 The codebase is intentionally split so the moving parts of the auth and tunnel
 flows are easy to locate:
