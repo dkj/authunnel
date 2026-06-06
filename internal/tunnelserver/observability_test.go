@@ -21,7 +21,7 @@ import (
 func TestRequestLoggingMiddlewareAddsRequestIDAndLogsTraceID(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-	handler := NewRequestLoggingMiddleware(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("ok"))
 	}))
@@ -57,10 +57,54 @@ func TestRequestLoggingMiddlewareAddsRequestIDAndLogsTraceID(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingMiddlewareForwardedClientIP(t *testing.T) {
+	t.Run("trusting mode logs forwarded_client_ip and keeps remote_ip as peer", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		handler := NewRequestLoggingMiddleware(logger, ForwardedForRightmost, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+		req.RemoteAddr = "203.0.113.7:12345"
+		req.Header.Set("X-Forwarded-For", "1.2.3.4, 198.51.100.7")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+
+		entry := parseLastLogEntry(t, logBuf.String())
+		if got := entry["remote_ip"]; got != "203.0.113.7" {
+			t.Fatalf("remote_ip = %#v, want the TCP peer 203.0.113.7", got)
+		}
+		if got := entry["forwarded_client_ip"]; got != "198.51.100.7" {
+			t.Fatalf("forwarded_client_ip = %#v, want rightmost XFF 198.51.100.7", got)
+		}
+	})
+
+	t.Run("off mode omits forwarded_client_ip", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+		req.RemoteAddr = "203.0.113.7:12345"
+		req.Header.Set("X-Forwarded-For", "198.51.100.7")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+
+		entry := parseLastLogEntry(t, logBuf.String())
+		if _, present := entry["forwarded_client_ip"]; present {
+			t.Fatalf("forwarded_client_ip must be absent under mode off, got %#v", entry["forwarded_client_ip"])
+		}
+		if got := entry["remote_ip"]; got != "203.0.113.7" {
+			t.Fatalf("remote_ip = %#v, want 203.0.113.7", got)
+		}
+	})
+}
+
 func TestCheckTokenLogsAuthFailureWithRequestID(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-	handler := NewRequestLoggingMiddleware(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		CheckToken(w, r, staticFailValidator{err: errors.New("signature mismatch")})
 	}))
 
@@ -97,7 +141,7 @@ func TestRequestLoggingMiddlewarePreservesHijacker(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-	handler := NewRequestLoggingMiddleware(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
 			t.Fatal("wrapped response writer does not implement http.Hijacker")

@@ -1183,6 +1183,98 @@ func TestParseServerConfigRejectsBurstWithoutRate(t *testing.T) {
 	}
 }
 
+func TestParseServerConfigForwardedForDefaultsToOff(t *testing.T) {
+	cfg, err := parseServerConfig(nil, minimalServerEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.PreAuthForwardedFor != tunnelserver.ForwardedForOff {
+		t.Fatalf("PreAuthForwardedFor: got %v want off", cfg.PreAuthForwardedFor)
+	}
+}
+
+func TestParseServerConfigForwardedForModesFromFlag(t *testing.T) {
+	cases := map[string]tunnelserver.ForwardedForMode{
+		"off":        tunnelserver.ForwardedForOff,
+		"leftmost":   tunnelserver.ForwardedForLeftmost,
+		"rightmost":  tunnelserver.ForwardedForRightmost,
+		"single-hop": tunnelserver.ForwardedForSingleHop,
+	}
+	for value, want := range cases {
+		t.Run(value, func(t *testing.T) {
+			cfg, err := parseServerConfig([]string{
+				"--preauth-trust-forwarded-for", value,
+			}, minimalServerEnv)
+			if err != nil {
+				t.Fatalf("parseServerConfig returned error: %v", err)
+			}
+			if cfg.PreAuthForwardedFor != want {
+				t.Fatalf("PreAuthForwardedFor: got %v want %v", cfg.PreAuthForwardedFor, want)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigForwardedForFromEnv(t *testing.T) {
+	env := func(key string) string {
+		if key == "PREAUTH_TRUST_FORWARDED_FOR" {
+			return "rightmost"
+		}
+		return minimalServerEnv(key)
+	}
+	cfg, err := parseServerConfig(nil, env)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.PreAuthForwardedFor != tunnelserver.ForwardedForRightmost {
+		t.Fatalf("PreAuthForwardedFor: got %v want rightmost", cfg.PreAuthForwardedFor)
+	}
+}
+
+func TestParseServerConfigRejectsInvalidForwardedFor(t *testing.T) {
+	if _, err := parseServerConfig([]string{
+		"--preauth-trust-forwarded-for", "bogus",
+	}, minimalServerEnv); err == nil {
+		t.Fatal("expected error for invalid --preauth-trust-forwarded-for value")
+	}
+	env := func(key string) string {
+		if key == "PREAUTH_TRUST_FORWARDED_FOR" {
+			return "bogus"
+		}
+		return minimalServerEnv(key)
+	}
+	if _, err := parseServerConfig(nil, env); err == nil {
+		t.Fatal("expected error for invalid PREAUTH_TRUST_FORWARDED_FOR value")
+	}
+}
+
+// TestParseServerConfigForwardedForValidWithTLSMode confirms the option is
+// orthogonal to the TLS-mode selection: a reverse proxy can reach this server
+// over a TLS connection and still have its X-Forwarded-For honoured, so the
+// flag must coexist with --tls-cert/--tls-key rather than tripping the
+// mutual-exclusion check.
+func TestParseServerConfigForwardedForValidWithTLSMode(t *testing.T) {
+	noTLSEnv := func(key string) string {
+		switch key {
+		case "TLS_CERT_FILE", "TLS_KEY_FILE":
+			return ""
+		default:
+			return minimalServerEnv(key)
+		}
+	}
+	cfg, err := parseServerConfig([]string{
+		"--tls-cert", "/flags/server.crt",
+		"--tls-key", "/flags/server.key",
+		"--preauth-trust-forwarded-for", "rightmost",
+	}, noTLSEnv)
+	if err != nil {
+		t.Fatalf("parseServerConfig returned error: %v", err)
+	}
+	if cfg.PreAuthForwardedFor != tunnelserver.ForwardedForRightmost {
+		t.Fatalf("PreAuthForwardedFor: got %v want rightmost", cfg.PreAuthForwardedFor)
+	}
+}
+
 func TestParseServerConfigRejectsNegativeAdmissionValues(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1882,7 +1974,7 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 	_ = socksServer // We use the observed wrapper above.
 
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
-		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), tunnelserver.ForwardedForOff, handler))
 
 	// Dial the WebSocket tunnel.
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
@@ -2000,7 +2092,7 @@ func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
 		})
 
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
-		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), tunnelserver.ForwardedForOff, handler))
 
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
@@ -2129,7 +2221,7 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 		})
 
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
-		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), tunnelserver.ForwardedForOff, handler))
 
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
@@ -2244,7 +2336,7 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 		})
 
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
-		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), tunnelserver.ForwardedForOff, handler))
 
 	// Dial the WebSocket tunnel with the short-lived initial token.
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
@@ -2401,7 +2493,7 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 		})
 
 	ts := newIPv4TestServer(t, tunnelserver.NewRequestLoggingMiddleware(
-		slog.New(slog.NewTextHandler(io.Discard, nil)), handler))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), tunnelserver.ForwardedForOff, handler))
 
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/protected/tunnel"
 	ctx := context.Background()
