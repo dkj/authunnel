@@ -29,6 +29,10 @@ type contextKey string
 const (
 	loggerContextKey       contextKey = "logger"
 	socksConnectContextKey contextKey = "socks-connect"
+	// hostDeniedContextKey carries the hostname rejected by observedSOCKSResolver
+	// so the later Rules.Allow call can deny it (rule-failure reply) without
+	// re-resolving. The value is the denied FQDN string.
+	hostDeniedContextKey contextKey = "socks-host-denied"
 )
 
 type SOCKSServer interface {
@@ -226,8 +230,12 @@ func (s *observedSOCKSServer) ServeConn(conn net.Conn) error {
 
 	server, err := socks5.New(&socks5.Config{
 		Logger: s.stdLogger,
-		Rules:  observedSOCKSRuleSet{logger: logger, allowRules: s.allowRules, ipBlock: s.ipBlock},
-		Dial:   observedSOCKSDial(logger, s.dialTimeout),
+		// Resolve gates DNS on the hostname allowlist before Rules.Allow runs,
+		// so denied FQDNs never trigger an outbound lookup. DNSResolver{} is the
+		// same default go-socks5 would otherwise apply.
+		Resolver: observedSOCKSResolver{allowRules: s.allowRules, delegate: socks5.DNSResolver{}},
+		Rules:    observedSOCKSRuleSet{logger: logger, allowRules: s.allowRules, ipBlock: s.ipBlock},
+		Dial:     observedSOCKSDial(logger, s.dialTimeout),
 	})
 	if err != nil {
 		return fmt.Errorf("create observed socks5 server: %w", err)
@@ -264,6 +272,20 @@ func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (c
 			slog.Int("target_port", details.TargetPort),
 		)
 	}
+	// observedSOCKSResolver rejected this hostname before any DNS lookup and
+	// deferred the denial here so the client receives a rule-failure reply
+	// rather than host-unreachable. Reuse the socks_connect_denied event name so
+	// operators can filter all denials uniformly; the reason attribute marks the
+	// pre-resolution hostname rejection.
+	if _, denied := ctx.Value(hostDeniedContextKey).(string); denied {
+		logger.Warn("socks_connect_denied",
+			slog.String("event", "socks_connect_denied"),
+			slog.String("target_host", details.TargetHost),
+			slog.Int("target_port", details.TargetPort),
+			slog.String("reason", "hostname_not_allowed"),
+		)
+		return ctx, false
+	}
 	// Security decision: apply operator-configured allowlist. Non-empty rules
 	// mean deny unless a rule matches; an empty Allowlist permits everything
 	// and only reaches here when the operator explicitly chose --allow-open-egress
@@ -298,6 +320,33 @@ func (r observedSOCKSRuleSet) Allow(ctx context.Context, req *socks5.Request) (c
 		return ctx, false
 	}
 	return context.WithValue(ctx, socksConnectContextKey, details), true
+}
+
+// observedSOCKSResolver gates DNS resolution on the hostname allowlist.
+//
+// go-socks5 calls Resolve before Rules.Allow and threads the returned context
+// into Allow (see request.go handleRequest -> handleConnect), so this is the
+// earliest place to reject a destination. When the requested hostname cannot
+// match any allowlist rule we skip the delegate entirely — so a denied FQDN
+// triggers no outbound DNS — and mark the denial in the context. We deliberately
+// do NOT return a resolver error here: go-socks5 maps a resolver error to a SOCKS
+// "host unreachable" reply, whereas deferring the rejection to Allow yields the
+// correct "connection not allowed by ruleset" (rule failure) reply. The
+// post-resolution Allow() check remains the authoritative gate for port,
+// resolved IP, and the IP blocklist.
+type observedSOCKSResolver struct {
+	allowRules Allowlist
+	delegate   socks5.NameResolver // real DNS; injectable for tests
+}
+
+func (r observedSOCKSResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	if !r.allowRules.PermitsHost(name) {
+		// Defer the denial to Rules.Allow (preserving the rule-failure reply)
+		// without performing any DNS lookup. The nil IP is never dialed because
+		// Allow rejects the request before the dial path runs.
+		return context.WithValue(ctx, hostDeniedContextKey, name), nil, nil
+	}
+	return r.delegate.Resolve(ctx, name) // only now is DNS performed
 }
 
 func observedSOCKSDial(logger *slog.Logger, dialTimeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
