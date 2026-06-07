@@ -27,8 +27,9 @@ type requestMetadata struct {
 type contextKey string
 
 const (
-	loggerContextKey       contextKey = "logger"
-	socksConnectContextKey contextKey = "socks-connect"
+	loggerContextKey        contextKey = "logger"
+	socksConnectContextKey  contextKey = "socks-connect"
+	forwardedClientIPCtxKey contextKey = "forwarded-client-ip"
 	// hostDeniedContextKey carries the hostname rejected by observedSOCKSResolver
 	// so the later Rules.Allow call can deny it (rule-failure reply) without
 	// re-resolving. The value is the denied FQDN string.
@@ -105,7 +106,7 @@ func (c *observedTunnelConn) TunnelLogger() *slog.Logger {
 // produces one tunnel. The IDs serve different scopes: request_id is for HTTP
 // admission, trace_id is for cross-system tracing, and tunnel_id is for the
 // long-lived tunnel session and its per-destination SOCKS events.
-func NewRequestLoggingMiddleware(baseLogger *slog.Logger, next http.Handler) http.Handler {
+func NewRequestLoggingMiddleware(baseLogger *slog.Logger, forwardedForMode ForwardedForMode, next http.Handler) http.Handler {
 	if baseLogger == nil {
 		baseLogger = slog.Default()
 	}
@@ -122,22 +123,57 @@ func NewRequestLoggingMiddleware(baseLogger *slog.Logger, next http.Handler) htt
 			slog.String("trace_id", metadata.TraceID),
 		)
 		ctx := context.WithValue(r.Context(), loggerContextKey, logger)
+		// Derive the trusted client IP once and stash it on the context so the
+		// downstream handler logs (tunnel_open, admission/pre-auth denials) can
+		// report it without each re-deriving or needing the mode threaded in.
+		forwardedClient := forwardedClientIP(r, forwardedForMode)
+		if forwardedClient != "" {
+			ctx = context.WithValue(ctx, forwardedClientIPCtxKey, forwardedClient)
+		}
 		r = r.WithContext(ctx)
 
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		next.ServeHTTP(recorder, r)
 
-		logger.Info("http_request",
+		attrs := []any{
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
 			slog.Int("status", recorder.status),
 			slog.Int("bytes", recorder.bytes),
 			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
 			slog.String("remote_ip", requestRemoteIP(r)),
-			slog.String("user_agent", r.UserAgent()),
-		)
+		}
+		if forwardedClient != "" {
+			attrs = append(attrs, slog.String("forwarded_client_ip", forwardedClient))
+		}
+		attrs = append(attrs, slog.String("user_agent", r.UserAgent()))
+		logger.Info("http_request", attrs...)
 	})
+}
+
+// forwardedClientIP returns the client IP derived from X-Forwarded-For under
+// mode, for logging only. It returns "" when mode is ForwardedForOff or the
+// header yields no trusted value. Unlike preAuthClientKey it never falls back
+// to the TCP peer, so a populated forwarded_client_ip log field always means
+// X-Forwarded-For was genuinely trusted.
+func forwardedClientIP(r *http.Request, mode ForwardedForMode) string {
+	if mode == ForwardedForOff {
+		return ""
+	}
+	if key, ok := preAuthClientKey(r, mode); ok {
+		return key
+	}
+	return ""
+}
+
+// forwardedClientIPFromContext returns the trusted client IP stashed by the
+// request-logging middleware, or "" when none was derived.
+func forwardedClientIPFromContext(ctx context.Context) string {
+	if ip, ok := ctx.Value(forwardedClientIPCtxKey).(string); ok {
+		return ip
+	}
+	return ""
 }
 
 func loggerFromContext(ctx context.Context) *slog.Logger {
