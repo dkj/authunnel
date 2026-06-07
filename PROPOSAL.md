@@ -70,7 +70,7 @@ Each `[FW]` marks a firewall / security-group gate:
 
 **Components:**
 
-- **Reverse proxy** (Ivanti vTM *or* Kemp LoadMaster, both already operated at Sanger): TLS termination at `st.sanger.ac.uk:443`, forwarding to the backend VM on port 8080. Configured to accept HTTPS only; any plain HTTP listener should either be absent or redirect to HTTPS, and it must never accept plaintext client traffic. Requires WebSocket upgrade pass-through and setting `X-Forwarded-Proto` and `X-Forwarded-Host` headers on forwarded requests.
+- **Reverse proxy** (Ivanti vTM *or* Kemp LoadMaster, both already operated at Sanger): TLS termination at `st.sanger.ac.uk:443`, forwarding to the backend VM on port 8080. Configured to accept HTTPS only; any plain HTTP listener should either be absent or redirect to HTTPS, and it must never accept plaintext client traffic. Requires WebSocket upgrade pass-through and setting `X-Forwarded-Proto` and `X-Forwarded-Host` headers on forwarded requests. Because `st.sanger.ac.uk` is internet-facing, the server's pre-auth rate limiter should be enabled to reject anonymous floods before any token validation; it works with the default `X-Forwarded-For` behaviour of both Ivanti vTM and Kemp LoadMaster.
 - **Server VM** (VMware or OpenStack): a single small Linux VM running the authunnel-server binary, managed by systemd. No database, no disk state beyond the binary and a configuration file. Security groups restrict inbound access (only from the reverse-proxy VIP) and outbound access (only to Okta OIDC endpoints, centralised logging endpoints, the permitted internal SSH destinations, and the infrastructure services the host needs to function: DNS resolvers, NTP, and DHCP if required at boot).
 - **Okta**: one public OIDC client registration (for the CLI tool) and one audience/resource entry (for token scoping to `authunnel-server`).
 - **DNS**: `st.sanger.ac.uk` pointing at the reverse-proxy VIP.
@@ -82,6 +82,8 @@ OIDC_ISSUER='https://<okta-issuer-url>'
 TOKEN_AUDIENCE='authunnel-server'
 PLAINTEXT_BEHIND_REVERSE_PROXY=true
 ALLOW_RULES='*.internal.sanger.ac.uk:22'
+PREAUTH_RATE=20                              # rate-limit anonymous requests before token validation
+PREAUTH_TRUST_FORWARDED_FOR=rightmost        # client IP from the proxy-appended X-Forwarded-For
 ```
 
 Initial deployment would limit egress to `*.internal.sanger.ac.uk:22`, or a tightly monitored subset. The server refuses to start without either one or more `--allow` rules or an explicit `--allow-open-egress` flag, so the egress posture is always a deliberate operator choice.
