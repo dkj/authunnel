@@ -82,7 +82,7 @@ The following are disabled or unlimited by default and must be explicitly config
 - **Resolved-IP deny-list** (`--ip-block`, `--no-ip-block`): on by default with a built-in protected set — loopback, IPv4/IPv6 link-local (incl. cloud IMDS `169.254.169.254`), unspecified, and multicast. Applied independently of the egress posture: the deny-list runs after the allow check in both restrictive and open modes, so a hostname rule that resolves to a protected address is rejected regardless. RFC1918, CGNAT, and IPv6 ULA are not in the default set. `--ip-block` replaces the default with an operator-supplied list (CIDR, bare IP, or bracketed IPv6); `--no-ip-block` disables the guard entirely.
 - **Connection longevity** (`--max-connection-duration`, `--expiry-grace`, `--no-connection-token-expiry`): by default tunnel lifetime is tied to the access token's `exp`. These flags let operators tune for specific IdP behaviors or impose hard ceilings. Some IdPs (e.g. Auth0) cache access tokens; `--expiry-grace` extends the enforcement deadline beyond `exp` to give the client time to obtain a genuinely new token.
 - **Admission limits** (`--max-concurrent-tunnels`, `--max-tunnels-per-user`, `--tunnel-open-rate`, `--dial-timeout`): zero or default by default. Configure for production to bound resource use and prevent a single credential from monopolising tunnel capacity or tying up goroutines on blackholed destinations.
-- **Pre-auth IP rate limit** (`--preauth-rate`, `--preauth-burst`): off by default, matching the explicit-posture style of the egress flags. When enabled, runs before bearer-token parsing on every authenticated route (`/protected`, `/protected/`, any `/protected/*`, and `/protected/tunnel`) so a flood of anonymous or junk-JWT requests is rejected with `429` before any validator or JWKS work happens. Recommended for direct internet exposure; deployments behind a load balancer that already rate-limits anonymous traffic can leave it off.
+- **Pre-auth IP rate limit** (`--preauth-rate`, `--preauth-burst`): off by default, matching the explicit-posture style of the egress flags. When enabled, runs before bearer-token parsing on every authenticated route (`/protected`, `/protected/`, any `/protected/*`, and `/protected/tunnel`) so a flood of anonymous or junk-JWT requests is rejected with `429` before any validator or JWKS work happens. Recommended for direct internet exposure; deployments behind a load balancer that already rate-limits anonymous traffic can leave it off. Buckets key on the TCP peer by default; `--preauth-trust-forwarded-for` opts into trusting `X-Forwarded-For` behind a known proxy (see below).
 
 ### Known non-goals
 
@@ -103,7 +103,7 @@ Before going to production, verify:
 - [ ] Admission limits are sized for expected load: `--max-concurrent-tunnels`, `--max-tunnels-per-user`, and `--tunnel-open-rate` are set.
 - [ ] `--dial-timeout` is set (default `10s`). Setting it to `0` allows authenticated users to hold goroutines open on blackholed destinations indefinitely.
 - [ ] The unix-socket path (if used) lives inside a private directory such as `/tmp/authunnel/` (`0700`), not directly under a world-writable parent like `/tmp`.
-- [ ] The authunnel server (if using `--plaintext-behind-reverse-proxy`) is not directly reachable over untrusted networks — only the TLS-terminating reverse proxy should be. The proxy must also overwrite (not append to) client-supplied `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For` headers before forwarding; the last one is consulted by `--preauth-rate` for per-IP bucketing and an appended client value lets attackers spoof buckets.
+- [ ] The authunnel server (if using `--plaintext-behind-reverse-proxy`) is not directly reachable over untrusted networks — only the TLS-terminating reverse proxy should be. The proxy must overwrite (not append to) client-supplied `X-Forwarded-Proto` and `X-Forwarded-Host` before forwarding, since these drive the WebSocket origin check. `X-Forwarded-For` is *not* trusted for per-IP buckets unless you set `--preauth-trust-forwarded-for`; with the recommended `rightmost` mode the proxy's default append behaviour is safe, so no overwrite is needed for bucketing.
 
 ## Usage
 
@@ -178,29 +178,26 @@ export TOKEN_AUDIENCE='authunnel-server'
 cd server && CGO_ENABLED=0 go run . --plaintext-behind-reverse-proxy --allow '*.internal:22'
 ```
 
-The server trusts `X-Forwarded-Proto` and `X-Forwarded-Host` for WebSocket origin checks. When `--preauth-rate` is set, the server additionally trusts the leftmost `X-Forwarded-For` entry as the client-IP key for the pre-auth limiter, falling back to the TCP peer address when XFF is absent. Most proxies forward these headers automatically; nginx requires explicit configuration:
+The server trusts `X-Forwarded-Proto` and `X-Forwarded-Host` for WebSocket origin checks. Most proxies forward these headers automatically; nginx requires explicit configuration:
 
 ```nginx
 proxy_set_header Host $host;
 proxy_set_header X-Forwarded-Proto $scheme;
-```
-
-**Security note:** The reverse proxy must *overwrite* (not append to) any `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For` headers supplied by clients before forwarding requests to the backend. If client-supplied headers are forwarded unchanged or appended to, a malicious client can set them to arbitrary values and influence the WebSocket origin check (`X-Forwarded-Proto`/`X-Forwarded-Host`) or spoof per-IP buckets in the pre-auth limiter (`X-Forwarded-For`, since Authunnel keys on the leftmost entry — every spoofed IP gets its own bucket, so the limiter no longer bounds anonymous cost). Add the following to your nginx configuration to ensure these headers carry only proxy-issued values:
-
-```nginx
 proxy_set_header X-Forwarded-Host  $host;
-proxy_set_header X-Forwarded-For   $remote_addr;
 ```
 
-Note `$remote_addr` (overwrite), not `$proxy_add_x_forwarded_for` (append) — the latter preserves any client-supplied prefix and defeats the bucket-keying.
+**`X-Forwarded-For` trust is separate and off by default.** The pre-auth limiter (`--preauth-rate`) keys on the TCP peer address (`RemoteAddr`) unless you explicitly opt in with `--preauth-trust-forwarded-for`. This is deliberately decoupled from `--plaintext-behind-reverse-proxy`: even in plaintext mode, a client-supplied `X-Forwarded-For` cannot mint per-IP buckets by default, so it cannot defeat the limiter. The option is also valid in TLS modes, so a reverse proxy may reach this server over a secured connection and still have its XFF honoured. Modes:
 
-**Default behaviour for `X-Forwarded-For` is *append*, not overwrite, on every common reverse proxy** — including AWS ALB, HAProxy (`option forwardfor`), Caddy 2's `reverse_proxy`, and Traefik. Concretely, that means the leftmost entry is client-controlled by default. If you cannot make your proxy overwrite XFF, leave `--preauth-rate` at `0` (off); the per-IP limiter is otherwise spoofable. Per-proxy notes:
+| Mode | Keys on | Use when |
+|------|---------|----------|
+| `off` (default) | TCP peer (`RemoteAddr`) | The server sees the real client IP directly, or you don't want XFF trusted. |
+| `rightmost` | Rightmost XFF entry | **Recommended for a single reverse proxy.** The rightmost entry is the address your immediate proxy appended, so a client-injected leftmost value is ignored. |
+| `leftmost` | Leftmost XFF entry | Only on a fully trusted network where the leftmost value is sanitised/overwritten upstream; it is the client's own claim and is otherwise spoofable. |
+| `single-hop` | The sole XFF entry | A single trusted proxy that appends exactly one hop; any other count is rejected. |
 
-- **nginx**: use `proxy_set_header X-Forwarded-For $remote_addr` (overwrite), as shown above. Avoid `$proxy_add_x_forwarded_for`.
-- **HAProxy**: `option forwardfor` appends. To overwrite, drop that option and use `http-request set-header X-Forwarded-For %[src]` instead.
-- **Caddy**: in the `reverse_proxy` block use `header_up X-Forwarded-For {remote_host}` to overwrite (Caddy otherwise appends).
-- **AWS ALB**: ALB always appends to client-supplied `X-Forwarded-For`. There is no overwrite mode. If the listener is internet-facing, treat `--preauth-rate` as unsafe and either keep it off or terminate at a proxy you control before forwarding to ALB-fronted Authunnel.
-- **Traefik**: appends by default; an explicit middleware (e.g. `headers.customRequestHeaders`) is required to overwrite.
+In any trusting mode, a request whose `X-Forwarded-For` violates the expectation (absent, empty, or the wrong hop count) is rejected with `400`. The trusted client IP is also logged as `forwarded_client_ip`, while `remote_ip` always remains the TCP peer for forensics.
+
+**Why `rightmost` is the easy choice:** every common reverse proxy *appends* the client to `X-Forwarded-For` by default — AWS ALB, HAProxy (`option forwardfor`), Caddy 2's `reverse_proxy`, Traefik, and nginx's `$proxy_add_x_forwarded_for`. With `rightmost`, that append behaviour is exactly what you want: a single trusted proxy appends the real client to the right of any client-supplied prefix, so the value Authunnel reads is spoof-resistant with no special proxy configuration. Use `leftmost` only if your proxy *overwrites* XFF (e.g. nginx `proxy_set_header X-Forwarded-For $remote_addr`, HAProxy `http-request set-header X-Forwarded-For %[src]`, Caddy `header_up X-Forwarded-For {remote_host}`). For multi-proxy chains, neither leftmost nor rightmost reliably identifies the client — terminate at a single proxy you control before forwarding.
 
 For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origin check), Caddy, AWS ALB, Traefik, and HAProxy generally set sane values, but you should still explicitly configure them so the value is proxy-issued rather than client-passthrough.
 
@@ -229,8 +226,9 @@ Useful server flags and environment variables:
 - `--tunnel-open-rate` or `TUNNEL_OPEN_RATE` — per-user tunnel-open rate (tunnels/sec); default `0` (disabled). Exceeding the rate yields `429` with `Retry-After` derived from the token-bucket delay.
 - `--tunnel-open-burst` or `TUNNEL_OPEN_BURST` — burst size for the per-user rate limiter; defaults to `ceil(rate)` when rate is set. Setting burst without rate is a startup error.
 - `--dial-timeout` or `DIAL_TIMEOUT` — per-outbound-dial timeout applied to SOCKS CONNECT destinations; default `10s`. Bounds failure time against blackholed targets.
-- `--preauth-rate` or `PREAUTH_RATE` — per-source-IP rate limit applied before token parsing on every authenticated route (`/protected`, `/protected/`, any `/protected/*`, and `/protected/tunnel`); requests/sec; default `0` (disabled), max `10000`. Behind a load balancer that already rate-limits anonymous traffic this can stay off; enable it for direct internet exposure so junk JWTs and oversized headers are rejected with `429` before reaching the validator. When `--plaintext-behind-reverse-proxy` is set, the limiter keys on the leftmost `X-Forwarded-For` entry, falling back to the TCP peer address; otherwise it always keys on the TCP peer.
+- `--preauth-rate` or `PREAUTH_RATE` — per-source-IP rate limit applied before token parsing on every authenticated route (`/protected`, `/protected/`, any `/protected/*`, and `/protected/tunnel`); requests/sec; default `0` (disabled), max `10000`. Behind a load balancer that already rate-limits anonymous traffic this can stay off; enable it for direct internet exposure so junk JWTs and oversized headers are rejected with `429` before reaching the validator. By default the limiter keys on the TCP peer address; see `--preauth-trust-forwarded-for` to key on `X-Forwarded-For` behind a trusted proxy.
 - `--preauth-burst` or `PREAUTH_BURST` — burst size for `--preauth-rate`; defaults to `ceil(rate)` when the rate is set. Setting burst without rate is a startup error.
+- `--preauth-trust-forwarded-for` or `PREAUTH_TRUST_FORWARDED_FOR` — how the pre-auth limiter derives the client IP from `X-Forwarded-For`: `off` (default; bucket by the TCP peer), `leftmost`, `rightmost` (recommended for a single reverse proxy), or `single-hop` (require exactly one entry). Decoupled from the listening mode and off by default even under `--plaintext-behind-reverse-proxy`, so a client-supplied header cannot mint new buckets; valid in TLS modes too. In any trusting mode a request whose header violates the expectation is rejected with `400`, and the trusted client IP is logged as `forwarded_client_ip`.
 
 Admission rejections are emitted as structured `warn` log records with `event=tunnel_admission_denied` and a `reason` field (`global`, `per_user`, or `rate`), so operators can distinguish abuse from undersized limits without adding a metrics stack. Pre-auth rejections are logged separately with `event=preauth_rate_limited` so the two layers can be told apart in queries. Per-user policy is keyed on the OIDC `sub` claim; tokens without a stable subject are rejected earlier by the JWT validator before admission runs.
 
@@ -475,7 +473,7 @@ Current fast coverage includes:
 
 ## Developer Notes
 
-Developers need Go 1.26.3+ to build and test Authunnel from source.
+Developers need Go 1.26.4+ to build and test Authunnel from source.
 
 The codebase is intentionally split so the moving parts of the auth and tunnel
 flows are easy to locate:

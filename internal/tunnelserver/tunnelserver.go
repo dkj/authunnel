@@ -200,12 +200,16 @@ type HandlerOptions struct {
 	// route (/protected, /protected/, any /protected/*, and
 	// /protected/tunnel) before the bearer token is parsed. A nil value
 	// (the default) disables the gate entirely.
-	// PreAuthTrustForwardedFor controls whether the limiter keys on the
-	// leftmost X-Forwarded-For entry; only enable it in deployments where
-	// an upstream proxy is known to populate the header reliably (the same
-	// trust property used for X-Forwarded-Host).
-	PreAuth                  *PreAuthLimiter
-	PreAuthTrustForwardedFor bool
+	//
+	// PreAuthForwardedForMode controls how the limiter derives the client IP
+	// it buckets by. It is decoupled from the listening mode: the default
+	// (ForwardedForOff) buckets by the TCP peer so a client-supplied
+	// X-Forwarded-For cannot mint new buckets, even in plaintext-behind-proxy
+	// deployments. Enable a trusting mode only where an upstream proxy is known
+	// to populate the header reliably; it is valid in TLS modes too, so a
+	// reverse proxy may reach this server over a secured connection.
+	PreAuth                 *PreAuthLimiter
+	PreAuthForwardedForMode ForwardedForMode
 }
 
 // NewHandler installs the small HTTP surface used by the server:
@@ -245,7 +249,14 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		if opt.PreAuth == nil {
 			return true
 		}
-		key := preAuthClientKey(r, opt.PreAuthTrustForwardedFor)
+		key, ok := preAuthClientKey(r, opt.PreAuthForwardedForMode)
+		if !ok {
+			// A trusting mode was configured but X-Forwarded-For did not
+			// satisfy it; refuse rather than fall back to RemoteAddr, which
+			// would let a client evade bucketing by omitting/padding the header.
+			WriteForwardedForRejected(w, r)
+			return false
+		}
 		if ok, retryAfter := opt.PreAuth.Allow(key); !ok {
 			WritePreAuthDenied(w, r, key, retryAfter)
 			return false
@@ -315,10 +326,14 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 			return
 		}
 		defer c.CloseNow()
-		tunnelLogger := loggerFromContext(r.Context()).With(
+		tunnelLogArgs := []any{
 			slog.String("tunnel_id", newLogID()),
 			slog.String("remote_ip", requestRemoteIP(r)),
-		)
+		}
+		if fwd := forwardedClientIPFromContext(r.Context()); fwd != "" {
+			tunnelLogArgs = append(tunnelLogArgs, slog.String("forwarded_client_ip", fwd))
+		}
+		tunnelLogger := loggerFromContext(r.Context()).With(tunnelLogArgs...)
 		tunnelLogger = loggerWithAccessTokenClaims(tunnelLogger, claims)
 		tunnelStart := time.Now()
 		tunnelLogger.Info("tunnel_open")

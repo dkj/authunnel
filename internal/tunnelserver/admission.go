@@ -203,6 +203,9 @@ func writeAdmissionDenied(w http.ResponseWriter, r *http.Request, decision Admit
 		slog.String("reason", decision.String()),
 		slog.String("remote_ip", requestRemoteIP(r)),
 	}
+	if fwd := forwardedClientIPFromContext(r.Context()); fwd != "" {
+		attrs = append(attrs, slog.String("forwarded_client_ip", fwd))
+	}
 	if subject != "" {
 		attrs = append(attrs, slog.String("subject", subject))
 	}

@@ -1,6 +1,10 @@
 DIST               := dist
 VERSION            := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 CYCLONEDX_VERSION  := v1.10.0
+LIZARD             ?= lizard
+LIZARD_CC_LIMIT    ?= 15
+LIZARD_LENGTH_LIMIT ?= 120
+LIZARD_MAX_WARNINGS ?= -1
 LDFLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
 
 .PHONY: build
@@ -73,6 +77,21 @@ govulncheck:
 .PHONY: gosec
 gosec:
 	go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
+
+.PHONY: lizard
+# Keep lizard opt-in: it is a Python tool, and this target is an audit prompt
+# rather than a replacement for code review. Set LIZARD_MAX_WARNINGS=0 to make
+# new complexity warnings fail the build.
+lizard:
+	@if ! command -v $(LIZARD) >/dev/null 2>&1; then \
+	  echo "lizard not found. Install with: python3 -m pip install lizard"; \
+	  echo "or override LIZARD=/path/to/lizard"; \
+	  exit 127; \
+	fi
+	git ls-files -z '*.go' | xargs -0 $(LIZARD) -l go -w -s cyclomatic_complexity -C $(LIZARD_CC_LIMIT) -L $(LIZARD_LENGTH_LIMIT) -i $(LIZARD_MAX_WARNINGS)
+
+.PHONY: complexity
+complexity: lizard
 
 .PHONY: sbom
 sbom:

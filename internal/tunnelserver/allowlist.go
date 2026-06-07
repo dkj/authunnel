@@ -71,6 +71,40 @@ func (al Allowlist) Permits(fqdn string, ip net.IP, port int) bool {
 	return false
 }
 
+// PermitsHost reports whether the hostname could be permitted by some rule,
+// evaluated before DNS resolution. The port is unknown at resolve time and the
+// resolved IP does not yet exist, so this is a deliberately permissive superset
+// filter: it denies only hostnames that no rule could ever match. The
+// authoritative port/IP enforcement still happens in Permits after resolution,
+// so PermitsHost never widens what is ultimately allowed — it only short-circuits
+// DNS for hostnames that are certain to be denied.
+//
+// Matching rules:
+//   - empty Allowlist  -> true (open mode, same gating as Permits)
+//   - any CIDR rule     -> true: the unresolved IP might fall in the range, so we
+//     cannot deny without resolving first
+//   - any fqdn glob hit -> true
+//   - otherwise         -> false (safe to deny without DNS)
+func (al Allowlist) PermitsHost(fqdn string) bool {
+	if len(al) == 0 {
+		return true // open mode: no restrictions configured
+	}
+	lowerFQDN := strings.ToLower(fqdn)
+	for _, rule := range al {
+		// A CIDR rule matches on the resolved IP, which does not exist yet, so
+		// its membership cannot be ruled out before resolution.
+		if rule.cidr != nil {
+			return true
+		}
+		if rule.fqdn != "" && lowerFQDN != "" {
+			if matched, _ := filepath.Match(rule.fqdn, lowerFQDN); matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ParseAllowRule parses a single allow-rule string of the form:
 //
 //	host-glob:port          e.g. *.internal:22

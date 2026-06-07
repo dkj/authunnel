@@ -95,6 +95,13 @@ type serverConfig struct {
 	// when unset.
 	PreAuthRate  float64
 	PreAuthBurst int
+
+	// PreAuthForwardedFor controls how the pre-auth limiter derives the client
+	// IP from X-Forwarded-For. Decoupled from the listening mode and off by
+	// default (bucket by the TCP peer), so a client-supplied header cannot mint
+	// new buckets even under --plaintext-behind-reverse-proxy. Valid in any TLS
+	// mode too.
+	PreAuthForwardedFor tunnelserver.ForwardedForMode
 }
 
 func serverUsage(w io.Writer) {
@@ -170,10 +177,24 @@ Admission and resource limits:
                              Behind a properly configured edge load balancer that already rate-limits
                              anonymous traffic this can stay off; enable it for direct exposure where
                              oversized headers, junk JWTs, or unknown-kid bursts would otherwise reach the
-                             validator. When --plaintext-behind-reverse-proxy is set, the limiter keys on the
-                             leftmost X-Forwarded-For entry, falling back to the TCP peer address; otherwise
-                             it always keys on the TCP peer.
+                             validator. By default the limiter keys on the TCP peer address; see
+                             --preauth-trust-forwarded-for to key on X-Forwarded-For behind a trusted proxy.
   --preauth-burst <n>        Burst size for --preauth-rate (env: PREAUTH_BURST, default: ceil(rate), max: 10000)
+  --preauth-trust-forwarded-for <mode>
+                             How the pre-auth limiter derives the client IP (env: PREAUTH_TRUST_FORWARDED_FOR,
+                             default: off). Decoupled from the listening mode and valid in any TLS mode, so a
+                             reverse proxy may reach this server over a secured connection and still have its
+                             X-Forwarded-For honoured. Modes:
+                               off        Ignore X-Forwarded-For; bucket by the TCP peer. The default, even
+                                          under --plaintext-behind-reverse-proxy, so a client-supplied header
+                                          cannot mint new buckets.
+                               leftmost   Trust the leftmost entry (original client claim; spoofable — only on
+                                          a fully trusted network).
+                               rightmost  Trust the rightmost entry (the address the immediate trusted proxy
+                                          appended). Recommended for a single reverse proxy.
+                               single-hop Trust X-Forwarded-For only when it carries exactly one entry.
+                             In any trusting mode a request whose header violates the expectation (absent,
+                             empty, or wrong hop count) is rejected with HTTP 400.
 
 Other:
 
@@ -270,13 +291,13 @@ func main() {
 				ExpiryWarning:    cfg.ExpiryWarning,
 				ExpiryGrace:      cfg.ExpiryGrace,
 			},
-			Admission:                admitter,
-			PreAuth:                  preAuth,
-			PreAuthTrustForwardedFor: cfg.PlaintextBehindProxy,
+			Admission:               admitter,
+			PreAuth:                 preAuth,
+			PreAuthForwardedForMode: cfg.PreAuthForwardedFor,
 		})
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           tunnelserver.NewRequestLoggingMiddleware(logger, serverMux),
+		Handler:           tunnelserver.NewRequestLoggingMiddleware(logger, cfg.PreAuthForwardedFor, serverMux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -458,6 +479,13 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		}
 		cfg.PreAuthBurst = n
 	}
+	if v := getenv("PREAUTH_TRUST_FORWARDED_FOR"); v != "" {
+		mode, err := tunnelserver.ParseForwardedForMode(v)
+		if err != nil {
+			return cfg, fmt.Errorf("PREAUTH_TRUST_FORWARDED_FOR: %w", err)
+		}
+		cfg.PreAuthForwardedFor = mode
+	}
 
 	envLogLevel := getenv("LOG_LEVEL")
 	envAllowRules := getenv("ALLOW_RULES")
@@ -627,6 +655,14 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 			return fmt.Errorf("must be between 0 and %d", maxTunnelOpenRate)
 		}
 		cfg.PreAuthBurst = n
+		return nil
+	})
+	fs.Func("preauth-trust-forwarded-for", "How the pre-auth limiter derives the client IP from X-Forwarded-For: off (default; bucket by TCP peer), leftmost (client claim, spoofable), rightmost (immediate trusted proxy; recommended for a single reverse proxy), or single-hop (require exactly one entry). Decoupled from the listening mode; valid in TLS modes too", func(value string) error {
+		mode, err := tunnelserver.ParseForwardedForMode(value)
+		if err != nil {
+			return err
+		}
+		cfg.PreAuthForwardedFor = mode
 		return nil
 	})
 	if err := fs.Parse(args); err != nil {

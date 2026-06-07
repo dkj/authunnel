@@ -21,7 +21,7 @@ import (
 func TestRequestLoggingMiddlewareAddsRequestIDAndLogsTraceID(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-	handler := NewRequestLoggingMiddleware(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("ok"))
 	}))
@@ -57,10 +57,54 @@ func TestRequestLoggingMiddlewareAddsRequestIDAndLogsTraceID(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingMiddlewareForwardedClientIP(t *testing.T) {
+	t.Run("trusting mode logs forwarded_client_ip and keeps remote_ip as peer", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		handler := NewRequestLoggingMiddleware(logger, ForwardedForRightmost, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+		req.RemoteAddr = "203.0.113.7:12345"
+		req.Header.Set("X-Forwarded-For", "1.2.3.4, 198.51.100.7")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+
+		entry := parseLastLogEntry(t, logBuf.String())
+		if got := entry["remote_ip"]; got != "203.0.113.7" {
+			t.Fatalf("remote_ip = %#v, want the TCP peer 203.0.113.7", got)
+		}
+		if got := entry["forwarded_client_ip"]; got != "198.51.100.7" {
+			t.Fatalf("forwarded_client_ip = %#v, want rightmost XFF 198.51.100.7", got)
+		}
+	})
+
+	t.Run("off mode omits forwarded_client_ip", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+		req.RemoteAddr = "203.0.113.7:12345"
+		req.Header.Set("X-Forwarded-For", "198.51.100.7")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+
+		entry := parseLastLogEntry(t, logBuf.String())
+		if _, present := entry["forwarded_client_ip"]; present {
+			t.Fatalf("forwarded_client_ip must be absent under mode off, got %#v", entry["forwarded_client_ip"])
+		}
+		if got := entry["remote_ip"]; got != "203.0.113.7" {
+			t.Fatalf("remote_ip = %#v, want 203.0.113.7", got)
+		}
+	})
+}
+
 func TestCheckTokenLogsAuthFailureWithRequestID(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-	handler := NewRequestLoggingMiddleware(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		CheckToken(w, r, staticFailValidator{err: errors.New("signature mismatch")})
 	}))
 
@@ -97,7 +141,7 @@ func TestRequestLoggingMiddlewarePreservesHijacker(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-	handler := NewRequestLoggingMiddleware(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := NewRequestLoggingMiddleware(logger, ForwardedForOff, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
 			t.Fatal("wrapped response writer does not implement http.Hijacker")
@@ -529,4 +573,125 @@ func parseLogLine(t *testing.T, line string) map[string]any {
 		t.Fatalf("parse log line %q: %v", line, err)
 	}
 	return entry
+}
+
+// trackingResolver records every hostname passed to Resolve so tests can prove
+// whether the gating resolver delegated the lookup or short-circuited first.
+type trackingResolver struct{ calls []string }
+
+func (t *trackingResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	t.calls = append(t.calls, name)
+	return ctx, net.ParseIP("10.0.0.1"), nil
+}
+
+func TestObservedSOCKSResolverGatesDNSOnAllowlist(t *testing.T) {
+	cases := []struct {
+		name       string
+		al         Allowlist
+		host       string
+		wantDenied bool // denied pre-resolution: nil IP, deny marker, no DNS
+		wantCalls  []string
+	}{
+		{
+			// Core requirement: a denied FQDN must not invoke the resolver callback.
+			name:       "denied hostname does not invoke resolver",
+			al:         Allowlist{mustParseAllowRule(t, "*.internal:22")},
+			host:       "evil.example.com",
+			wantDenied: true,
+			wantCalls:  nil,
+		},
+		{
+			name:      "allowed hostname is resolved exactly once",
+			al:        Allowlist{mustParseAllowRule(t, "*.internal:22")},
+			host:      "db.internal",
+			wantCalls: []string{"db.internal"},
+		},
+		{
+			name:      "open mode resolves everything",
+			al:        Allowlist{},
+			host:      "anything.example.com",
+			wantCalls: []string{"anything.example.com"},
+		},
+		{
+			name:      "CIDR-only allowlist resolves hostnames",
+			al:        Allowlist{mustParseAllowRule(t, "10.0.0.0/8:443")},
+			host:      "whatever.example.com",
+			wantCalls: []string{"whatever.example.com"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tracker := &trackingResolver{}
+			resolver := observedSOCKSResolver{allowRules: tc.al, delegate: tracker}
+
+			ctx, ip, err := resolver.Resolve(context.Background(), tc.host)
+			if err != nil {
+				t.Fatalf("Resolve(%q) unexpected error: %v", tc.host, err)
+			}
+
+			// A pre-resolution denial must not surface as a resolver error
+			// (that would yield a host-unreachable reply); instead it marks the
+			// context so Rules.Allow can deny with a rule-failure reply.
+			_, denied := ctx.Value(hostDeniedContextKey).(string)
+			if denied != tc.wantDenied {
+				t.Errorf("deny marker present = %v, want %v", denied, tc.wantDenied)
+			}
+			if tc.wantDenied && ip != nil {
+				t.Errorf("expected nil IP for denied host, got %v", ip)
+			}
+
+			if len(tracker.calls) != len(tc.wantCalls) {
+				t.Fatalf("resolver calls = %v, want %v", tracker.calls, tc.wantCalls)
+			}
+			for i, want := range tc.wantCalls {
+				if tracker.calls[i] != want {
+					t.Errorf("resolver call %d = %q, want %q", i, tracker.calls[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestObservedSOCKSResolverDeferredDenialIsRuleFailure proves the end-to-end
+// gate: the resolver marks a denied hostname (without DNS), and the marked
+// context drives Rules.Allow to deny — which makes go-socks5 send a rule-failure
+// reply rather than the host-unreachable reply a resolver error would produce.
+func TestObservedSOCKSResolverDeferredDenialIsRuleFailure(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	tracker := &trackingResolver{}
+	resolver := observedSOCKSResolver{
+		allowRules: Allowlist{mustParseAllowRule(t, "*.internal:22")},
+		delegate:   tracker,
+	}
+
+	ctx, _, err := resolver.Resolve(context.Background(), "evil.example.com")
+	if err != nil {
+		t.Fatalf("Resolve returned error (would map to host-unreachable): %v", err)
+	}
+	if len(tracker.calls) != 0 {
+		t.Fatalf("denied host triggered DNS: %v", tracker.calls)
+	}
+
+	ruleset := observedSOCKSRuleSet{logger: logger, allowRules: resolver.allowRules}
+	_, ok := ruleset.Allow(ctx, &socks5.Request{
+		Command:  socks5.ConnectCommand,
+		DestAddr: &socks5.AddrSpec{FQDN: "evil.example.com", Port: 22},
+	})
+	if ok {
+		t.Fatal("expected Allow to deny the marked hostname (rule failure)")
+	}
+
+	entry := parseLogEntryByMessage(t, logBuf.String(), "socks_connect_denied")
+	if got := entry["event"]; got != "socks_connect_denied" {
+		t.Errorf("event: got %#v want socks_connect_denied", got)
+	}
+	if got := entry["reason"]; got != "hostname_not_allowed" {
+		t.Errorf("reason: got %#v want hostname_not_allowed", got)
+	}
+	if got := entry["target_host"]; got != "evil.example.com" {
+		t.Errorf("target_host: got %#v want evil.example.com", got)
+	}
 }

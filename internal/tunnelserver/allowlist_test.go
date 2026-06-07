@@ -284,3 +284,74 @@ func TestAllowlistPermits(t *testing.T) {
 		})
 	}
 }
+
+func TestAllowlistPermitsHost(t *testing.T) {
+	ruleHostPort := mustParseAllowRule(t, "*.internal:5432")
+	ruleCIDRPort := mustParseAllowRule(t, "10.0.0.0/8:443")
+	ruleBareIPv4 := mustParseAllowRule(t, "10.0.0.1:443")
+
+	cases := []struct {
+		name string
+		al   Allowlist
+		fqdn string
+		want bool
+	}{
+		{
+			name: "empty allowlist permits all",
+			al:   Allowlist{},
+			fqdn: "anything",
+			want: true,
+		},
+		{
+			name: "hostname glob match",
+			al:   Allowlist{ruleHostPort},
+			fqdn: "db.internal",
+			want: true,
+		},
+		{
+			name: "hostname glob match ignores port",
+			al:   Allowlist{mustParseAllowRule(t, "*.internal:22")},
+			fqdn: "db.internal",
+			want: true,
+		},
+		{
+			name: "hostname glob miss",
+			al:   Allowlist{ruleHostPort},
+			fqdn: "db.external",
+			want: false,
+		},
+		{
+			name: "glob wildcard matches multi-level subdomain",
+			al:   Allowlist{ruleHostPort},
+			fqdn: "a.b.internal",
+			want: true,
+		},
+		{
+			name: "CIDR rule forces resolution regardless of hostname",
+			al:   Allowlist{ruleCIDRPort},
+			fqdn: "whatever.example.com",
+			want: true,
+		},
+		{
+			name: "bare IP rule (host-route CIDR) forces resolution",
+			al:   Allowlist{ruleBareIPv4},
+			fqdn: "whatever.example.com",
+			want: true,
+		},
+		{
+			name: "hostname miss but CIDR present still permits pre-resolution",
+			al:   Allowlist{ruleHostPort, ruleCIDRPort},
+			fqdn: "db.external",
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.al.PermitsHost(tc.fqdn)
+			if got != tc.want {
+				t.Errorf("PermitsHost(%q) = %v, want %v", tc.fqdn, got, tc.want)
+			}
+		})
+	}
+}
