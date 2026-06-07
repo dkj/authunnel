@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Minimal authunnel test/dev CloudFormation stack with NLB TLS termination and locked-down targets'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+
+  VpcId:
+    Description: VPC to deploy the authunnel test/dev stack into
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetIds:
+    Description: Public subnet IDs for the internet-facing Network Load Balancer and EC2 instances. Choose at least one subnet; two in different Availability Zones is better.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  CertificateArn:
+    Description: ACM certificate ARN for the NLB TLS listener. Must be in the same region as this stack and cover the DNS name testers will use.
+    Type: String
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/.+$'
+    ConstraintDescription: must be a valid ACM certificate ARN.
+
+  OidcIssuer:
+    Description: OIDC issuer URL passed to authunnel-server
+    Type: String
+    Default: https://dkj.uk.auth0.com/
+
+  TokenAudience:
+    Description: Token audience passed to authunnel-server
+    Type: String
+    Default: https://authunnel.nowhere/api
+
+Resources:
+  # Security Group for the internet-facing Network Load Balancer.
+  # Clients connect to this security group on 443.
+  AuthtunnelLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: allow public TLS access to the authunnel NLB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS/TLS access to the NLB from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+          Description: HTTPS/TLS access to the NLB from anywhere IPv6
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-lb-sg
+
+  # Security Group for the EC2 targets.
+  # Port 8080 is only reachable from the NLB security group, not directly
+  # from the internet, even when the target group preserves the client IP.
+  AuthtunnelSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ssh access and authunnel target access from NLB only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIpv6: ::/0
+          Description: SSH access from anywhere IPv6
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AuthtunnelLoadBalancerSecurityGroup
+          Description: Authunnel target access from the NLB only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-sg
+
+  # EC2 Instance 1
+  AuthtunnelInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref AuthtunnelSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<'EOF'
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --allow-open-egress --no-ip-block --oidc-issuer=${OidcIssuer} --token-audience=${TokenAudience}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # EC2 Instance 2
+  AuthtunnelInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref AuthtunnelSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<'EOF'
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --allow-open-egress --no-ip-block --oidc-issuer=${OidcIssuer} --token-audience=${TokenAudience}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # Target Group
+  AuthtunnelTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref AuthtunnelInstance1
+          Port: 8080
+        - Id: !Ref AuthtunnelInstance2
+          Port: 8080
+      HealthCheckProtocol: TCP
+      HealthCheckPort: 8080
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: authunnel-tg
+
+  # Network Load Balancer
+  AuthtunnelNetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AuthtunnelLoadBalancerSecurityGroup
+      Subnets: !Ref PublicSubnetIds
+      Tags:
+        - Key: Name
+          Value: authunnel-lb
+
+  # TLS Listener
+  TLSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AuthtunnelTargetGroup
+      LoadBalancerArn: !Ref AuthtunnelNetworkLoadBalancer
+      Port: 443
+      Protocol: TLS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the Network Load Balancer
+    Value: !GetAtt AuthtunnelNetworkLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerDNS
+
+  LoadBalancerArn:
+    Description: ARN of the Network Load Balancer
+    Value: !Ref AuthtunnelNetworkLoadBalancer
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerArn
+
+  TargetGroupArn:
+    Description: ARN of the Target Group
+    Value: !Ref AuthtunnelTargetGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-TargetGroupArn
+
+  Instance1Id:
+    Description: Instance ID of the first authunnel server
+    Value: !Ref AuthtunnelInstance1
+    Export:
+      Name: !Sub ${AWS::StackName}-Instance1Id
+
+  Instance2Id:
+    Description: Instance ID of the second authunnel server
+    Value: !Ref AuthtunnelInstance2
+    Export:
+      Name: !Sub ${AWS::StackName}-Instance2Id
+
+  SecurityGroupId:
+    Description: Security Group ID for authunnel instances
+    Value: !Ref AuthtunnelSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroupId
+
+  LoadBalancerSecurityGroupId:
+    Description: Security Group ID for the authunnel Network Load Balancer
+    Value: !Ref AuthtunnelLoadBalancerSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerSecurityGroupId
+
+  VpcIdOutput:
+    Description: VPC used by the authunnel stack
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+
+  PublicSubnetIdsOutput:
+    Description: Public subnet IDs used by the authunnel stack
+    Value: !Join [",", !Ref PublicSubnetIds]
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnetIds
+

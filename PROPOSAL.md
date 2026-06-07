@@ -26,7 +26,7 @@ Authunnel is an authenticated tunnel for reaching internal SSH services. Users r
 
    On the **target hosts**, Authunnel adds no daemon, no in-process SSH server, and no outbound persistent tunnel; it simply proxies TCP to the existing OpenSSH `sshd`. Teleport's current deployment adds a Teleport node agent on each target host (its own Go SSH server, plus a persistent outbound TLS reverse-tunnel to the Proxy and node-side cluster credentials), running alongside `sshd`. Authunnel has zero target-host footprint.
 
-   The two designs imply different **network postures**. Authunnel is **firewall-enhanced**: its own `--allow` rules control destinations at the application layer, and outbound TCP connections to `host:22` are further constrained by explicit ingress firewall rules to access each target (in practice tightly scoped: particular internal destination IPs and a single port). These rules are exactly the kind of perimeter control institutional firewall regimes are built to express and audit. Teleport's reverse-tunnel approach is **firewall-evading by design**: each node holds a persistent outbound TLS connection to the Proxy, so target hosts need only permissive egress and no ingress rules. Access decisions then sit inside Teleport's configuration rather than at the firewall, which lets Teleport work through restrictive networks but also moves access policy out of the layer most security teams already monitor. The reverse-tunnel topology also makes the Proxy a high-value central pivot: every node's connection is routed through it, and it holds cluster-level Teleport credentials. Authunnel has no comparable cluster role: it sees only opaque SSH bytes flowing between user and target `sshd` (the SSH session is end-to-end encrypted), and its access decisions are enforced (and visible) at the firewall layer, reinforcing the server's own configured allowlist.
+   These two designs — Authunnel's and Teleport's — imply different **network postures**. Authunnel is **firewall-enhanced**: its own `--allow` rules control destinations at the application layer, and outbound TCP connections to `host:22` are further constrained by explicit ingress firewall rules to access each target (in practice tightly scoped: particular internal destination IPs and a single port). These rules are exactly the kind of perimeter control institutional firewall regimes are built to express and audit. Teleport's reverse-tunnel approach is **firewall-evading by design**: each node holds a persistent outbound TLS connection to the Proxy, so target hosts need only permissive egress and no ingress rules. Access decisions then sit inside Teleport's configuration rather than at the firewall, which lets Teleport work through restrictive networks but also moves access policy out of the layer most security teams already monitor. The reverse-tunnel topology also makes the Proxy a high-value central pivot: every node's connection is routed through it, and it holds cluster-level Teleport credentials. Authunnel has no comparable cluster role: it sees only opaque SSH bytes flowing between user and target `sshd` (the SSH session is end-to-end encrypted), and its access decisions are enforced (and visible) at the firewall layer, reinforcing the server's own configured allowlist.
 
 5. **Scoped access at multiple levels.** Access can be restricted at several independent layers, each enforced by a different part of the infrastructure:
    - **Destination allowlist:** The `--allow` option restricts which destinations authenticated users can reach, using host glob patterns and CIDR rules (e.g. `*.internal:22`, `10.0.0.0/8:22`). Starting the server without either `--allow` rules or an explicit `--allow-open-egress` flag is rejected: the egress posture is never silently permissive.
@@ -100,6 +100,8 @@ Host *.internal.sanger.ac.uk
     --proxycommand %h %p
 ```
 
+**A working reference deployment** is included in the repository as [`aws_cf_authunnel_testdev_generic.yaml`](aws_cf_authunnel_testdev_generic.yaml) — a single CloudFormation template that stands up the whole topology on AWS so a deployer can see it run end-to-end before committing to the Sanger build. It mirrors the architecture above, with an internet-facing Network Load Balancer terminating TLS on `:443` (the role Ivanti vTM or Kemp would play here) in front of two stateless `authunnel-server` instances on `:8080`, where the backend security group accepts `:8080` only from the load balancer. It is deliberately a **test/dev** stack, not a production blueprint: it runs with open egress (`--allow-open-egress`), the resolved-IP guard disabled (`--no-ip-block`), and debug logging — the opposite of the locked-down egress and admission posture proposed above — so it is useful for learning and evaluation but the production deployment would tighten each of those.
+
 ## What's Required
 
 | Item | Owner | Effort |
@@ -120,7 +122,7 @@ Host *.internal.sanger.ac.uk
 | SBOM generation per release (CycloneDX JSON) | Authunnel maintainer | Already in place: generated and published automatically per release binary |
 | Client binary distribution + SSH config docs | Authunnel maintainer | Documentation task |
 
-The repository's [Deployment Hardening Checklist](https://github.com/dkj/authunnel/blob/main/README.md#deployment-hardening-checklist) provides a concrete pre-production checklist (HTTPS enforcement, egress posture, admission limits, dial timeout, socket hygiene, reverse-proxy header handling, etc.) that the infrastructure and security teams can work against directly.
+The repository's [Deployment Hardening Checklist](README.md#deployment-hardening-checklist) provides a concrete pre-production checklist (HTTPS enforcement, egress posture, admission limits, dial timeout, socket hygiene, reverse-proxy header handling, etc.) that the infrastructure and security teams can work against directly.
 
 ## Logging & Observability
 
@@ -196,7 +198,7 @@ We would like the security team to consider reviewing the deployment architectur
 - **Logging and monitoring**: are the logged fields sufficient for incident response and audit purposes? Are there additional events or fields the security team would want to see?
 - **Threat model**: what residual risks does the security team see with an authenticated WebSocket tunnel to internal SSH hosts, how do these compare with the existing Teleport provision, and what additional controls (if any) would they recommend?
 
-The [codebase is open](https://github.com/dkj/authunnel/blob/main/README.md) and so available for review now. Given its size (~3,400 lines of Go source, excluding tests, comments, and blanks), a full read-through is realistic within a day or two.
+The [codebase is open](https://github.com/dkj/authunnel) and so available for review now. Given its size (~3,400 lines of Go source, excluding tests, comments, and blanks), a full read-through is realistic within a day or two.
 
 ## Vulnerability Management
 
@@ -219,11 +221,12 @@ All three layers are cheap to add and keep running. The SAST and SCA tools (`gov
 
 ## Proposed Rollout
 
-1. **Security review**: engage the security team for review of the codebase and proposed deployment architecture. Incorporate their findings before proceeding.
-2. **Pilot**: deploy to a small group of willing early adopters, particularly those working from non-Sanger machines or those who would benefit from scoped SSH-only access.
-3. **Evaluate**: confirm that token lifecycle (cache, refresh, re-login), allow rules, logging integration, and user experience meet expectations.
-4. **Expand**: roll out to the broader user base with documentation and SSH config examples.
-5. **Assess Teleport**: once Authunnel is proven in production, evaluate whether Teleport licence renewal is still justified at the next contract cycle.
+1. **Familiarise**: stand up the included [AWS reference deployment](aws_cf_authunnel_testdev_generic.yaml) to see the end-to-end topology run in a throwaway test/dev environment before building on Sanger infrastructure.
+2. **Security review**: engage the security team for review of the codebase and proposed deployment architecture. Incorporate their findings before proceeding.
+3. **Pilot**: deploy to a small group of willing early adopters, particularly those working from non-Sanger machines or those who would benefit from scoped SSH-only access.
+4. **Evaluate**: confirm that token lifecycle (cache, refresh, re-login), allow rules, logging integration, and user experience meet expectations.
+5. **Expand**: roll out to the broader user base with documentation and SSH config examples.
+6. **Assess Teleport**: once Authunnel is proven in production, evaluate whether Teleport licence renewal is still justified at the next contract cycle.
 
 ## Reviews
 
