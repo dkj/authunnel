@@ -100,7 +100,12 @@ Host *.internal.sanger.ac.uk
     --proxycommand %h %p
 ```
 
-**A working reference deployment** is included in the repository as [`aws_cf_authunnel_testdev_generic.yaml`](aws_cf_authunnel_testdev_generic.yaml) — a single CloudFormation template that stands up the whole topology on AWS so a deployer can see it run end-to-end before committing to the Sanger build. It mirrors the architecture above, with an internet-facing Network Load Balancer terminating TLS on `:443` (the role Ivanti vTM or Kemp would play here) in front of two stateless `authunnel-server` instances on `:8080`, where the backend security group accepts `:8080` only from the load balancer. It is deliberately a **test/dev** stack, not a production blueprint: it runs with open egress (`--allow-open-egress`), the resolved-IP guard disabled (`--no-ip-block`), and debug logging — the opposite of the locked-down egress and admission posture proposed above — so it is useful for learning and evaluation but the production deployment would tighten each of those.
+**Working reference deployments** are included in the repository as CloudFormation templates that stand up the whole topology on AWS, so a deployer can see it run end-to-end before committing to the Sanger build:
+
+- [`aws_cf_authunnel_testdev_generic.yaml`](aws_cf_authunnel_testdev_generic.yaml) — uses an internet-facing AWS Network Load Balancer to terminate TLS on `:443` in front of two stateless `authunnel-server` instances on `:8080`, where the backend security group accepts `:8080` only from the load balancer. The NLB stands in for the TLS-terminating reverse proxy.
+- [`aws_cf_authunnel_testdev_ivanti_vtm_ce.yaml`](aws_cf_authunnel_testdev_ivanti_vtm_ce.yaml) — the same topology but with **Ivanti vTM in its licence-free Community Edition** as the TLS-terminating reverse proxy, closely matching the proposed Sanger architecture. The vTM terminates TLS on `:443`, load-balances the backend pool on `:8080`, and sets the `X-Forwarded-*` headers the server expects (the backends run with `--preauth-trust-forwarded-for=rightmost`). Community Edition needs no licence key (capped at 10 Mb/s and a 4-node cluster — ample for evaluation). The L7 service is applied after boot by the companion `configure_vtm.sh`, which starts with a self-signed certificate; once DNS points at the vTM you swap in a real one. (On the tested build, vTM 22.9r4, the built-in Let's Encrypt only succeeded via the DNS-01 challenge with a Cloudflare-hosted zone — HTTP-01 failed — which is itself a reason production would lean on the institutional CA / existing Ivanti certificate workflow rather than vTM's native ACME.)
+
+Both are deliberately **test/dev** stacks, not production blueprints: they run the servers with open egress (`--allow-open-egress`), the resolved-IP guard disabled (`--no-ip-block`), and debug logging — the opposite of the locked-down posture proposed above — so they are useful for learning and evaluation but a production deployment would tighten each of those.
 
 ## What's Required
 
@@ -221,7 +226,7 @@ All three layers are cheap to add and keep running. The SAST and SCA tools (`gov
 
 ## Proposed Rollout
 
-1. **Familiarise**: stand up the included [AWS reference deployment](aws_cf_authunnel_testdev_generic.yaml) to see the end-to-end topology run in a throwaway test/dev environment before building on Sanger infrastructure.
+1. **Familiarise**: stand up one of the included AWS reference deployments (the [generic NLB](aws_cf_authunnel_testdev_generic.yaml) or the [Ivanti vTM Community Edition](aws_cf_authunnel_testdev_ivanti_vtm_ce.yaml) variant) to see the end-to-end topology run in a throwaway test/dev environment before building on Sanger infrastructure.
 2. **Security review**: engage the security team for review of the codebase and proposed deployment architecture. Incorporate their findings before proceeding.
 3. **Pilot**: deploy to a small group of willing early adopters, particularly those working from non-Sanger machines or those who would benefit from scoped SSH-only access.
 4. **Evaluate**: confirm that token lifecycle (cache, refresh, re-login), allow rules, logging integration, and user experience meet expectations.
