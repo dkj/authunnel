@@ -7,9 +7,9 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/zitadel/oidc/v3 v3.47.5
-	golang.org/x/crypto v0.52.0
+	golang.org/x/crypto v0.53.0
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.46.0
 	golang.org/x/time v0.15.0
 )
 
@@ -32,5 +32,5 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 )
