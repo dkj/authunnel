@@ -128,7 +128,7 @@ All three are deliberately **test/dev** stacks, not production blueprints: they 
 | SBOM generation per release (CycloneDX JSON) | Authunnel maintainer | Already in place: generated and published automatically per release binary |
 | Client binary distribution + SSH config docs | Authunnel maintainer | Documentation task |
 
-The repository's [Deployment Hardening Checklist](README.md#deployment-hardening-checklist) provides a concrete pre-production checklist (HTTPS enforcement, egress posture, admission limits, dial timeout, socket hygiene, reverse-proxy header handling, etc.) that the infrastructure and security teams can work against directly.
+The repository's [Deployment Hardening Checklist](docs/DEPLOYMENT.md#deployment-hardening-checklist) provides a concrete pre-production checklist (HTTPS enforcement, egress posture, admission limits, dial timeout, socket hygiene, reverse-proxy header handling, etc.) that the infrastructure and security teams can work against directly.
 
 ## Logging & Observability
 
