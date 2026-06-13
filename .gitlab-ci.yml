@@ -1,0 +1,12 @@
+pages:
+  stage: deploy
+  script:
+    - mkdir -p public
+    - cp requirements_table.html public/index.html
+  pages:                              # nested keyword marks this a Pages job
+    path_prefix: "$CI_COMMIT_BRANCH"
+    expire_in: 4 weeks
+  artifacts:
+    paths: [public]
+  rules:
+    - if: $CI_COMMIT_BRANCH
