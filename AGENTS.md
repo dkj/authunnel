@@ -22,7 +22,7 @@ Instructions for contributors and coding agents working in this repository.
    - Favor deterministic behavior and clear startup/runtime failure modes.
 
 3. **Document behavior**
-   - Update `README.md` when CLI flags, runtime flows, or architecture change.
+   - Update the documentation when CLI flags, runtime flows, or architecture change: `README.md` for the security posture and client usage, `docs/DEPLOYMENT.md` for server operation and the flag reference, `docs/DEVELOPMENT.md` for codebase layout, invariants, and testing.
    - Keep examples runnable and aligned with actual code paths.
 
 4. **Testing expectations**

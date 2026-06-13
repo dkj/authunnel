@@ -38,10 +38,10 @@ The operator must make an explicit choice to run in broad-access mode. Least pri
 
 ### Code touchpoints
 
-- [internal/tunnelserver/allowlist.go](internal/tunnelserver/allowlist.go)
-- [internal/tunnelserver/observability.go](internal/tunnelserver/observability.go)
-- [server/server.go](server/server.go)
-- [README.md](README.md)
+- [internal/tunnelserver/allowlist.go](../../internal/tunnelserver/allowlist.go)
+- [internal/tunnelserver/observability.go](../../internal/tunnelserver/observability.go)
+- [server/server.go](../../server/server.go)
+- [README.md](../../README.md)
 
 ### Acceptance criteria
 
@@ -77,10 +77,10 @@ Insecure transports are rejected unless the operator intentionally opts in with 
 
 ### Code touchpoints
 
-- [client/client.go](client/client.go)
-- [client/auth.go](client/auth.go)
-- [server/server.go](server/server.go)
-- [README.md](README.md)
+- [client/client.go](../../client/client.go)
+- [client/auth.go](../../client/auth.go)
+- [server/server.go](../../server/server.go)
+- [README.md](../../README.md)
 
 ### Acceptance criteria
 
@@ -117,7 +117,7 @@ Token validation should match the intended security model:
 
 ### Code touchpoints
 
-- [internal/tunnelserver/tunnelserver.go](internal/tunnelserver/tunnelserver.go)
+- [internal/tunnelserver/tunnelserver.go](../../internal/tunnelserver/tunnelserver.go)
 - Relevant upstream assumptions are currently exercised through:
   `github.com/zitadel/oidc/v3/pkg/op.VerifyAccessToken`
 
@@ -154,10 +154,10 @@ The local proxy endpoint should be safe-by-default on multi-user systems.
 
 ### Code touchpoints
 
-- [client/client.go](client/client.go)
-- [client/auth.go](client/auth.go)
-- [client/flock_unix.go](client/flock_unix.go)
-- [client/flock_windows.go](client/flock_windows.go)
+- [client/client.go](../../client/client.go)
+- [client/auth.go](../../client/auth.go)
+- [client/flock_unix.go](../../client/flock_unix.go)
+- [client/flock_windows.go](../../client/flock_windows.go)
 
 ### Acceptance criteria
 
@@ -204,9 +204,9 @@ The service should have predictable, auditable failure modes under load or abuse
 
 ### Code touchpoints
 
-- [internal/tunnelserver/tunnelserver.go](internal/tunnelserver/tunnelserver.go)
-- [internal/tunnelserver/observability.go](internal/tunnelserver/observability.go)
-- Possibly [server/server.go](server/server.go) for configuration plumbing if timeout values are exposed as flags.
+- [internal/tunnelserver/tunnelserver.go](../../internal/tunnelserver/tunnelserver.go)
+- [internal/tunnelserver/observability.go](../../internal/tunnelserver/observability.go)
+- Possibly [server/server.go](../../server/server.go) for configuration plumbing if timeout values are exposed as flags.
 
 ### Acceptance criteria
 
@@ -242,7 +242,7 @@ The documentation should lead operators toward safer deployments by default.
 
 ### Code touchpoints
 
-- [README.md](README.md)
+- [README.md](../../README.md)
 
 ### Acceptance criteria
 
@@ -276,7 +276,7 @@ This order front-loads the issues most likely to silently weaken the trust model
 - Decide and implement `sub` requirements for refresh continuity.
 - Add focused unit tests.
 
-Implemented in [internal/tunnelserver/tunnelserver.go](internal/tunnelserver/tunnelserver.go):
+Implemented in [internal/tunnelserver/tunnelserver.go](../../internal/tunnelserver/tunnelserver.go):
 
 - `validateStandardClaims` enforces non-empty `sub`, rejects `iat` meaningfully in the future (with a 30 s clock-skew allowance), and rejects tokens with `nbf > exp`.
 - `checkTokenUsableBy` is a strict comparison used in two places: admission passes `time.Now() + tokenClockSkew` so IdP clock drift is tolerated at the wall-clock boundary; refresh passes the current enforced connection deadline (`exp + --expiry-grace`) unmodified, so a future-`nbf` token is only accepted if it activates at or before that operator-chosen policy point — the skew does not apply there.
@@ -292,16 +292,16 @@ Tests: `TestValidateStandardClaims` and `TestCheckTokenUsableBy` cover the pure-
 - Add dial timeout and, if needed, in-progress dial caps.
 - Add focused tests for rejection and timeout behavior.
 
-Implemented as a single `Admitter` controller in [internal/tunnelserver/admission.go](internal/tunnelserver/admission.go), wired into the handler after token validation and before the WebSocket upgrade at [internal/tunnelserver/tunnelserver.go](internal/tunnelserver/tunnelserver.go):
+Implemented as a single `Admitter` controller in [internal/tunnelserver/admission.go](../../internal/tunnelserver/admission.go), wired into the handler after token validation and before the WebSocket upgrade at [internal/tunnelserver/tunnelserver.go](../../internal/tunnelserver/tunnelserver.go):
 
 - `AdmissionConfig` exposes `GlobalMax`, `PerUserMax`, `PerUserRate`, and `PerUserBurst`; zero values disable the corresponding control, so existing deployments keep today's behaviour until an operator opts in. Per-user state is keyed on the validated `sub` claim (Task B guarantees it is non-empty, so admission does not re-check).
 - Rate limiting uses `golang.org/x/time/rate` with a cancel-on-deny pattern so failed attempts do not consume tokens.
 - Rejections distinguish `global` (503 + `Retry-After`), `per_user` (429 + `Retry-After`), and `rate` (429 with delay derived from the token-bucket reservation). A single structured warn record per rejection (`event=tunnel_admission_denied`, `reason=...`, `subject`, `remote_ip`, `retry_after_ms`) lets operators distinguish abuse from undersized limits without adding a metrics dependency.
-- Outbound SOCKS dials now use a bounded `net.Dialer.Timeout` threaded through `NewObservedSOCKSServer` at [internal/tunnelserver/observability.go](internal/tunnelserver/observability.go), removing the previous zero-timeout hole for blackholed destinations. Default is `10s`.
-- Five new flags/envs in [server/server.go](server/server.go): `--max-concurrent-tunnels`, `--max-tunnels-per-user`, `--tunnel-open-rate`, `--tunnel-open-burst` (auto-derived from rate when unset), `--dial-timeout`. Burst without rate is a startup error.
-- The client now captures `*http.Response` from `websocket.Dial` and returns a typed `tunnelDialError` carrying `StatusCode` and `Retry-After` at [client/client.go](client/client.go), so 401/429/503 surface as distinct operator-visible messages instead of the prior opaque `"websocket dial failed"`. Automatic retry/backoff is intentionally deferred to a separate PR.
+- Outbound SOCKS dials now use a bounded `net.Dialer.Timeout` threaded through `NewObservedSOCKSServer` at [internal/tunnelserver/observability.go](../../internal/tunnelserver/observability.go), removing the previous zero-timeout hole for blackholed destinations. Default is `10s`.
+- Five new flags/envs in [server/server.go](../../server/server.go): `--max-concurrent-tunnels`, `--max-tunnels-per-user`, `--tunnel-open-rate`, `--tunnel-open-burst` (auto-derived from rate when unset), `--dial-timeout`. Burst without rate is a startup error.
+- The client now captures `*http.Response` from `websocket.Dial` and returns a typed `tunnelDialError` carrying `StatusCode` and `Retry-After` at [client/client.go](../../client/client.go), so 401/429/503 surface as distinct operator-visible messages instead of the prior opaque `"websocket dial failed"`. Automatic retry/backoff is intentionally deferred to a separate PR.
 
-Tests: `TestAdmit_*` in [internal/tunnelserver/admission_test.go](internal/tunnelserver/admission_test.go) cover the global cap, per-user cap, deterministic rate-limit behaviour (fake-clock), idle-user GC, bucket preservation on partial drain, idempotent release, and concurrent safety. `TestHandler_RejectsWhenGlobalCapExceeded` exercises the handler rejection path end-to-end; `TestObservedSOCKSDial_RespectsDialTimeout` verifies the dial timeout. Server config coverage in [server/server_test.go](server/server_test.go) verifies flag/env parsing, burst-from-rate derivation, and negative-value rejection. `TestDialTunnel_SurfacesAdmissionRejection` / `TestDialTunnel_SurfacesCapacityRejection` cover the client wrapper, and `TestE2E_GlobalTunnelCapRejects` / `TestE2E_PerUserTunnelCapRejects` in [client/oidc_e2e_test.go](client/oidc_e2e_test.go) exercise the full real-server + real-OIDC + real-client path.
+Tests: `TestAdmit_*` in [internal/tunnelserver/admission_test.go](../../internal/tunnelserver/admission_test.go) cover the global cap, per-user cap, deterministic rate-limit behaviour (fake-clock), idle-user GC, bucket preservation on partial drain, idempotent release, and concurrent safety. `TestHandler_RejectsWhenGlobalCapExceeded` exercises the handler rejection path end-to-end; `TestObservedSOCKSDial_RespectsDialTimeout` verifies the dial timeout. Server config coverage in [server/server_test.go](../../server/server_test.go) verifies flag/env parsing, burst-from-rate derivation, and negative-value rejection. `TestDialTunnel_SurfacesAdmissionRejection` / `TestDialTunnel_SurfacesCapacityRejection` cover the client wrapper, and `TestE2E_GlobalTunnelCapRejects` / `TestE2E_PerUserTunnelCapRejects` in [client/oidc_e2e_test.go](../../client/oidc_e2e_test.go) exercise the full real-server + real-OIDC + real-client path.
 
 Intentionally deferred: per-source-IP rate limiting, in-progress outbound dial cap (dial timeout + per-user cap already bound resource use), Prometheus metrics (structured warn logs are sufficient for v1), and automatic client-side retry/backoff on 429/503.
 
@@ -311,14 +311,14 @@ Intentionally deferred: per-source-IP rate limiting, in-progress outbound dial c
 - Add explicit dangerous override if approved.
 - Update README and startup tests.
 
-Implemented in [server/server.go](server/server.go):
+Implemented in [server/server.go](../../server/server.go):
 
 - `serverConfig.AllowOpenEgress` backs a new `--allow-open-egress` flag and `ALLOW_OPEN_EGRESS=true` env; the flag is documented under "egress posture" in the usage text and alongside `--allow` in the README flag reference.
 - Startup validation enforces default-deny: an empty allowlist with no explicit opt-in returns `at least one --allow rule is required, or pass --allow-open-egress ...`. The combination of `--allow` rules and `--allow-open-egress` is rejected as `mutually exclusive`, so the active posture is always unambiguous in logs and config.
 - At startup the server emits either `event=egress_mode_allowlist` (info, with rule count) or `event=egress_mode_open` (warn, with hint) so operators can see the posture in the same log stream as admission rejections.
 - Built-in denylist for loopback/metadata in open mode was considered and deferred — the plan flags it as a "consider" item contingent on "without surprising operators", and a silent implicit denial of `127.0.0.1` would confuse anyone intentionally choosing `--allow-open-egress` for local-service tunnelling. Operators who want those denies can express them through explicit `--allow` policy.
 
-Tests in [server/server_test.go](server/server_test.go): `TestParseServerConfigRejectsEmptyAllowlistByDefault`, `TestParseServerConfigAcceptsAllowOpenEgressFlag`, `TestParseServerConfigAcceptsAllowOpenEgressEnv`, `TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress`, and `TestParseServerConfigRejectsAllowRulesWithOpenEgress` cover each branch of the new posture gate. A companion helper `minimalServerEnvWithRules` keeps the pre-existing `--allow`-based tests from inheriting the shortcut and tripping the new mutual-exclusion rule. README examples under "Start server", "Security Posture", and the Keycloak test-env section now demonstrate the explicit posture choice.
+Tests in [server/server_test.go](../../server/server_test.go): `TestParseServerConfigRejectsEmptyAllowlistByDefault`, `TestParseServerConfigAcceptsAllowOpenEgressFlag`, `TestParseServerConfigAcceptsAllowOpenEgressEnv`, `TestParseServerConfigAcceptsAllowRulesWithoutOpenEgress`, and `TestParseServerConfigRejectsAllowRulesWithOpenEgress` cover each branch of the new posture gate. A companion helper `minimalServerEnvWithRules` keeps the pre-existing `--allow`-based tests from inheriting the shortcut and tripping the new mutual-exclusion rule. README examples under "Start server", "Security Posture", and the Keycloak test-env section now demonstrate the explicit posture choice.
 
 ### Task E: Local client filesystem hardening ✓ done
 
@@ -326,13 +326,13 @@ Tests in [server/server_test.go](server/server_test.go): `TestParseServerConfigR
 - Tighten socket and cache path behavior.
 - Add local-permission tests.
 
-Implemented as two small platform-specific helpers in [client/safefs_unix.go](client/safefs_unix.go) and [client/safefs_windows.go](client/safefs_windows.go), wired into the three code paths that create private per-user files:
+Implemented as two small platform-specific helpers in [internal/safefs/safefs_unix.go](../../internal/safefs/safefs_unix.go) and [internal/safefs/safefs_windows.go](../../internal/safefs/safefs_windows.go), wired into the three code paths that create private per-user files:
 
-- `ensurePrivateDir` replaces the ad-hoc `os.MkdirAll(..., 0o755)` calls in [client/auth.go](client/auth.go) (cache dir), [client/flock_unix.go](client/flock_unix.go) / [client/flock_windows.go](client/flock_windows.go) (lock dir), and the socket-dir path in [client/client.go](client/client.go). On POSIX it creates missing directories `0o700` and Chmod-tightens against umask drift; on existing directories it leaves the operator's permissions alone but validates them. Validation rejects any directory that is group- or world-writable (mode & `0o022`) or owned by another local uid — catching sticky `/tmp` (`1777`), shared group-writable staging areas, and directories pre-created by a malicious local peer. The Windows variant is intentionally a lighter check (directory exists + is a directory) because NTFS uses ACLs rather than POSIX mode bits.
-- `safelyRemoveExistingSocket` replaces the previous "`os.Remove` and hope" stale-socket cleanup in [client/client.go](client/client.go). It lstats the path, refuses anything that is not a unix-domain socket, and on POSIX additionally refuses sockets owned by a different uid. A regular file accidentally placed at the socket path now surfaces as an error instead of being silently unlinked.
+- `ensurePrivateDir` replaces the ad-hoc `os.MkdirAll(..., 0o755)` calls in [client/auth.go](../../client/auth.go) (cache dir), [client/flock_unix.go](../../client/flock_unix.go) / [client/flock_windows.go](../../client/flock_windows.go) (lock dir), and the socket-dir path in [client/client.go](../../client/client.go). On POSIX it creates missing directories `0o700` and Chmod-tightens against umask drift; on existing directories it leaves the operator's permissions alone but validates them. Validation rejects any directory that is group- or world-writable (mode & `0o022`) or owned by another local uid — catching sticky `/tmp` (`1777`), shared group-writable staging areas, and directories pre-created by a malicious local peer. The Windows variant is intentionally a lighter check (directory exists + is a directory) because NTFS uses ACLs rather than POSIX mode bits.
+- `safelyRemoveExistingSocket` replaces the previous "`os.Remove` and hope" stale-socket cleanup in [client/client.go](../../client/client.go). It lstats the path, refuses anything that is not a unix-domain socket, and on POSIX additionally refuses sockets owned by a different uid. A regular file accidentally placed at the socket path now surfaces as an error instead of being silently unlinked.
 - `withUmask(0o077, ...)` wraps the `net.Listen("unix", ...)` call so the socket inode is created with owner-only permissions in the first place, closing the window in which another local user could connect between `bind` and the follow-up `tightenUnixSocketPermissions`. The existing `chmod` to `0o600` is kept as a safety net for filesystems that ignore umask on AF_UNIX bind.
 
-Tests in [client/safefs_unix_test.go](client/safefs_unix_test.go) cover:
+Tests in [client/safefs_unix_test.go](../../client/safefs_unix_test.go) cover:
 
 - creation with owner-only mode under a permissive process umask (`0o022`),
 - acceptance of an existing `0o755` owner-owned directory (default home-directory shape),
@@ -342,7 +342,7 @@ Tests in [client/safefs_unix_test.go](client/safefs_unix_test.go) cover:
 - end-to-end umask behaviour: the socket inode created via the `runUnixSocketMode` sequence has no group/world permission bits even before `tightenUnixSocketPermissions` runs,
 - the admission-layer hardening propagates to the token cache and lock file: `acquireFileLock` and `managedOIDCTokenSource.AccessToken` both refuse a group-writable cache directory with the same error message operators will see elsewhere.
 
-README [README.md](README.md) documents the new failure mode and points operators at the documented `/tmp/authunnel/` subdirectory pattern.
+README [README.md](../../README.md) documents the new failure mode and points operators at the documented `/tmp/authunnel/` subdirectory pattern.
 
 Intentionally deferred / out of scope: sticky-bit "allow if owned by me" exception (the plan explicitly flags it as requiring review, and the subdirectory pattern is already documented); POSIX-style ACL inspection on Windows (the default `%AppData%` path is already user-scoped by the OS).
 
@@ -351,7 +351,7 @@ Intentionally deferred / out of scope: sticky-bit "allow if owned by me" excepti
 - Reconcile README with final merged behavior.
 - Add a hardening checklist and migration notes.
 
-Implemented in [README.md](README.md):
+Implemented in [README.md](../../README.md):
 
 - "Security Posture" restructured into three explicit subsections: *Required guarantees* (unconditional enforcement: JWT fields, subject pinning, refresh deadline, secure transport, explicit egress posture), *Operator-controlled* (allowlist vs open-egress, connection longevity, admission limits), and *Known non-goals* (live revocation, tunnel-chain observability, architecture redesign).
 - "Deployment Hardening Checklist" section added with eight pre-production checks covering insecure flags (`--insecure-oidc-issuer`, `--insecure-tunnel-url`, `--no-connection-token-expiry`), egress posture, connection ceiling, admission limits, dial timeout, unix-socket path placement, and reverse-proxy exposure.
@@ -374,7 +374,7 @@ go test ./...
 
 ## Contributor Requirements
 
-All work on this plan must follow [AGENTS.md](AGENTS.md). Key obligations relevant to hardening changes:
+All work on this plan must follow [AGENTS.md](../../AGENTS.md). Key obligations relevant to hardening changes:
 
 - Update `README.md` when CLI flags, runtime flows, or architecture change.
 - Keep code comments up to date when behavior changes.
