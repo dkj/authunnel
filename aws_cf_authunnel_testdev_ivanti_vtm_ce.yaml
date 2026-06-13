@@ -50,11 +50,13 @@ Description: >-
 #     * creates the TLS-decrypting :443 virtual server (WebSockets pass through),
 #     * creates a :80 virtual server that redirects to HTTPS except the ACME
 #       challenge path (ready for the Let's Encrypt switch below).
-#   PREREQUISITE: enable the vTM REST API (Admin UI: System > Security) so the
-#   script can reach https://<vtm>:9070/api/tm/. The script auto-detects the
-#   REST API version (it varies by release -- 22.x is past 9.0); the Admin UI
-#   can do the same steps if a PUT is rejected. The ConfigureVtmCommand stack
-#   output prints the exact invocation.
+#   NOTE: the vTM REST API is enabled by default -- you do NOT need to turn it
+#   on in the Admin UI first. After boot the appliance takes a few minutes to
+#   bring up its web (:9090) and REST (:9070) services, so the first connection
+#   may be refused; just wait and retry. The script then reaches
+#   https://<vtm>:9070/api/tm/. The REST API version varies by release (22.x is
+#   past 9.0); the Admin UI can do the same steps if a PUT is rejected. The
+#   ConfigureVtmCommand stack output prints the exact invocation.
 #
 # TLS CERTIFICATE: TWO PHASES (self-signed now, Let's Encrypt later)
 #   configure_vtm.sh installs a self-signed cert on :443 so the stack is usable
@@ -228,6 +230,19 @@ Resources:
       Tags:
         - Key: Name
           Value: authunnel-backend-sg
+
+  # Allow the authunnel backends to SSH to each other over their private IPs.
+  # A self-referencing rule must be a separate resource: an inline ingress rule
+  # cannot reference the security group that contains it (circular dependency).
+  BackendInterHostSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BackendSecurityGroup
+      Description: SSH between authunnel backends over their private IPs
 
   # Backend authunnel-server target 1.
   AuthunnelInstance1:
@@ -412,7 +427,7 @@ Outputs:
       Name: !Sub ${AWS::StackName}-Backend2PrivateIp
 
   ConfigureVtmCommand:
-    Description: Run this from inside AdminCidr (after enabling the vTM REST API) to apply the Layer-7 configuration.
+    Description: Run this from inside AdminCidr to apply the Layer-7 configuration. The REST API is on by default; allow a few minutes after boot for the vTM web/REST services to start.
     Value: !Sub 'VTM_HOST=${VtmEip} VTM_ADMIN_PW=<password> BACKEND1=${AuthunnelInstance1.PrivateIp} BACKEND2=${AuthunnelInstance2.PrivateIp} DOMAIN=${DomainName} ./configure_vtm.sh'
 
   VtmSecurityGroupId:

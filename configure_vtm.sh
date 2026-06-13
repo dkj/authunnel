@@ -20,8 +20,10 @@
 # PREREQUISITES
 #   * Run from a host inside AdminCidr (the vTM REST API on :9070 is restricted
 #     to that CIDR by the stack's security group).
-#   * Enable the vTM REST API first (Admin UI: System > Security). Confirm and
-#     list supported API versions with:
+#   * The REST API is enabled by default -- no need to turn it on in the Admin
+#     UI first. But after boot the appliance takes a few minutes to bring up the
+#     web (:9090) and REST (:9070) services, so the first connection may be
+#     refused; wait and retry. Confirm it is up and list supported API versions:
 #       curl -sk -u admin:PW https://VTM_HOST:9070/api/tm/
 #   * openssl and python3 must be available locally (used to mint and JSON-encode
 #     the self-signed certificate).
@@ -83,9 +85,10 @@ vtm_put() {
 
 echo "==> Using REST API version ${API_VER}: ${REST}"
 if ! "${CURL[@]}" "${REST}/" >/dev/null 2>&1; then
-  echo "ERROR: cannot reach ${REST}/. Is the REST API enabled (Admin UI:" >&2
-  echo "       System > Security), are you inside AdminCidr, and is API version" >&2
-  echo "       ${API_VER} supported? List versions: curl -sk -u admin:PW https://${VTM_HOST}:9070/api/tm/" >&2
+  echo "ERROR: cannot reach ${REST}/. If the node booted only a few minutes ago" >&2
+  echo "       the REST/web services may still be starting -- wait and retry." >&2
+  echo "       Otherwise check you are inside AdminCidr and that API version" >&2
+  echo "       ${API_VER} is supported: curl -sk -u admin:PW https://${VTM_HOST}:9070/api/tm/" >&2
   exit 1
 fi
 

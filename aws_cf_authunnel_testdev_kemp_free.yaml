@@ -221,6 +221,19 @@ Resources:
         - Key: Name
           Value: authunnel-backend-sg
 
+  # Allow the authunnel backends to SSH to each other over their private IPs.
+  # A self-referencing rule must be a separate resource: an inline ingress rule
+  # cannot reference the security group that contains it (circular dependency).
+  BackendInterHostSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BackendSecurityGroup
+      Description: SSH between authunnel backends over their private IPs
+
   # Backend authunnel-server target 1.
   AuthunnelInstance1:
     Type: AWS::EC2::Instance
