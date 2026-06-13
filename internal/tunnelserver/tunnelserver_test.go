@@ -46,7 +46,7 @@ func TestRouteAuthBoundaries(t *testing.T) {
 		// POST under /protected* is rejected by the mux's method matcher
 		// before the auth handler runs, so unauthenticated callers see 405
 		// rather than 401. The methods supported on these paths are not
-		// secret (smoke-test endpoint, documented in README/Notes.md), so
+		// secret (smoke-test endpoint, documented in README.md and docs/Notes.md), so
 		// disclosing GET/HEAD via Allow is acceptable.
 		{name: "protected_post_unauth_405", method: http.MethodPost, path: "/protected", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
 		{name: "protected_slash_post_unauth_405", method: http.MethodPost, path: "/protected/", wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
