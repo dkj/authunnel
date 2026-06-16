@@ -12,6 +12,19 @@ The target workflow is:
 4. The server hosts a SOCKS5 backend and opens the requested `%h:%p` destination.
 5. SSH stdio is bridged over that authenticated path.
 
+## Scope: tunnel authentication, not SSH login
+
+Authunnel authenticates the **network path** to a private service: it decides, using OIDC, who may open a tunnel to a destination. It does **not** provide OIDC-authenticated SSH login. Once the tunnel is open, SSH performs its own host and user authentication (keys, certificates, passwords) exactly as it would over any other transport. Authunnel never sees or brokers your SSH credentials, and a valid OIDC token does not by itself grant a login to any host.
+
+In other words, Authunnel provides **bastion-like** functionality — a single authenticated, audited entry point to an internal network — rather than federating SSH login to your identity provider.
+
+If you instead want OIDC identity to issue the SSH credential itself, use a purpose-built tool built on open source and open standards, optionally alongside Authunnel:
+
+- **opkssh / OpenPubkey** — embeds an OIDC ID token in the SSH public key so OpenSSH can authenticate the user against their IdP ([github.com/openpubkey/opkssh](https://github.com/openpubkey/opkssh)).
+- **Smallstep `step-ca`** with its OIDC provisioner — an open source SSH certificate authority that issues short-lived SSH user certificates after an OIDC browser login ([smallstep.com/docs/step-ca](https://smallstep.com/docs/step-ca/)).
+
+These compose naturally with Authunnel: OIDC governs the tunnel (network admission and audit) while an OIDC-backed SSH CA governs the login on the host at the far end.
+
 ## Documentation
 
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist.
@@ -93,6 +106,7 @@ The following are disabled or unlimited by default and must be explicitly config
 
 - **Live token revocation**: revoking a token at the IdP does not terminate an already-established tunnel. Authunnel enforces token expiry but does not perform per-request introspection checks.
 - **Tunnel chain observability**: Authunnel can only log and control connections it directly brokers. A client could SOCKS CONNECT to a second tunnel or proxy, creating a chain Authunnel cannot observe.
+- **OIDC-authenticated SSH login**: Authunnel authenticates the tunnel, not the SSH session. It does not federate host login to your IdP — see [Scope: tunnel authentication, not SSH login](#scope-tunnel-authentication-not-ssh-login) for the distinction and for open-source tools that do.
 - **Session architecture redesign**: the current WebSocket-to-SOCKS model is intentionally simple and is not expected to change.
 
 ## Usage
