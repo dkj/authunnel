@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
-	github.com/coder/websocket v1.8.14
+	github.com/coder/websocket v1.8.15
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/zitadel/oidc/v3 v3.47.5
 	golang.org/x/crypto v0.53.0
