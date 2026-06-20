@@ -4,21 +4,25 @@
 
 Authunnel is an authenticated tunnel for reaching private TCP services, including SSH, through an OAuth2-protected TLS WebSocket conduit.
 
-The target workflow is:
+## Primary use-case: OIDC SSH bastion
+
+ An Authunnel server acts as an "SSH Bastion": it exposes a TLS-secured, OIDC-authenticated port, through which clients can reach internal SSH hosts that are otherwise firewalled from the internet.
+ 
+ The typical workflow is:
 
 1. `ssh` launches the Authunnel client as `ProxyCommand`.
 2. The client reuses a cached token, refreshes it, or completes Authorization Code + PKCE in a browser.
 3. The Authunnel server, acting as an OAuth2 resource server, uses OIDC discovery to locate the issuer's JWKS endpoint and validates the JWT access token locally.
-4. The server hosts a SOCKS5 backend and opens the requested `%h:%p` destination.
+4. The server opens the requested `%h:%p` destination.
 5. SSH stdio is bridged over that authenticated path.
 
-## Scope: tunnel authentication, not SSH login
+### Scope: tunnel authentication, not SSH login
 
 Authunnel authenticates the **network path** to a private service: it decides, using OIDC, who may open a tunnel to a destination. It does **not** provide OIDC-authenticated SSH login. Once the tunnel is open, SSH performs its own host and user authentication (keys, certificates, passwords) exactly as it would over any other transport. Authunnel never sees or brokers your SSH credentials, and a valid OIDC token does not by itself grant a login to any host.
 
 In other words, Authunnel provides **bastion-like** functionality — a single authenticated, audited entry point to an internal network — rather than federating SSH login to your identity provider.
 
-If you instead want OIDC identity to issue the SSH credential itself, use a purpose-built tool built on open source and open standards, optionally alongside Authunnel:
+If you want OIDC identity to issue the SSH credential itself, use a purpose-built tool built on open source and open standards, optionally alongside Authunnel:
 
 - **opkssh / OpenPubkey** — embeds an OIDC ID token in the SSH public key so OpenSSH can authenticate the user against their IdP ([github.com/openpubkey/opkssh](https://github.com/openpubkey/opkssh)).
 - **Smallstep `step-ca`** with its OIDC provisioner — an open source SSH certificate authority that issues short-lived SSH user certificates after an OIDC browser login ([smallstep.com/docs/step-ca](https://smallstep.com/docs/step-ca/)).
