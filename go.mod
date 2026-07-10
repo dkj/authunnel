@@ -1,6 +1,6 @@
 module authunnel
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
