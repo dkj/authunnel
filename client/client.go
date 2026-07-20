@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +52,7 @@ type clientConfig struct {
 	OIDCIssuer       string
 	OIDCClientID     string
 	OIDCAudience     string
+	OIDCResource     string
 	OIDCScopes       string
 	OIDCCache        string
 	OIDCNoBrowser    bool
@@ -88,7 +90,8 @@ Choose one authentication method (mutually exclusive):
   Managed OIDC (typical):
     --oidc-issuer <url>          OIDC issuer for managed login (required with --oidc-client-id)
     --oidc-client-id <id>        OIDC client ID (required with --oidc-issuer)
-    --oidc-audience <string>     Audience/resource requested during managed login
+    --oidc-audience <string>     Auth0-style 'audience' parameter requested during managed login
+    --oidc-resource <url>        RFC 8707 'resource' parameter; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)
     --oidc-scopes <scopes>       Space-delimited OIDC scopes (default: openid offline_access)
     --oidc-cache <path>          Token cache path for managed OIDC login
     --oidc-no-browser            Print the authorization URL without opening a browser
@@ -176,7 +179,8 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
 	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", "", "OIDC client ID used for managed login")
-	fs.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Audience/resource requested during managed login")
+	fs.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Auth0-style 'audience' parameter requested during managed login")
+	fs.StringVar(&cfg.OIDCResource, "oidc-resource", "", "RFC 8707 'resource' parameter requested during managed login; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)")
 	fs.StringVar(&cfg.OIDCScopes, "oidc-scopes", "openid offline_access", "Space-delimited OIDC scopes for managed login")
 	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
 	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
@@ -208,7 +212,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	if cfg.OIDCRedirectPort != 0 && cfg.OIDCRedirectPort < 1024 {
 		return cfg, errors.New("--oidc-redirect-port must be 0 (random) or >= 1024; low ports are unavailable after capability hardening")
 	}
-	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
+	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCResource != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
 		return cfg, errors.New("ACCESS_TOKEN cannot be combined with managed OIDC flags")
 	}
 	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
@@ -262,6 +266,19 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 		}
 		if issuerU.Scheme != "https" && !cfg.InsecureOIDCIssuer {
 			return cfg, errors.New("--oidc-issuer must use an https:// URL; use --insecure-oidc-issuer to allow plaintext (development only)")
+		}
+	}
+	if cfg.OIDCResource != "" {
+		// RFC 8707 resource indicators: the value MUST be an absolute URI and
+		// MUST NOT contain a fragment. Validate up front so a malformed value
+		// surfaces as a clear startup error rather than a confusing failure at
+		// the provider partway through the browser login.
+		if strings.ContainsRune(cfg.OIDCResource, '#') {
+			return cfg, fmt.Errorf("--oidc-resource %q must not contain a fragment (RFC 8707 resource indicators)", cfg.OIDCResource)
+		}
+		resourceU, err := url.Parse(cfg.OIDCResource)
+		if err != nil || !resourceU.IsAbs() {
+			return cfg, fmt.Errorf("--oidc-resource %q must be an absolute URI, for example https://api.example (RFC 8707 resource indicators)", cfg.OIDCResource)
 		}
 	}
 
