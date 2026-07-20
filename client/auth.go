@@ -55,6 +55,7 @@ type managedOIDCTokenSource struct {
 	issuer       string
 	clientID     string
 	audience     string
+	resource     string
 	scopes       string
 	cachePath    string
 	noBrowser    bool
@@ -70,11 +71,12 @@ type managedOIDCTokenSource struct {
 
 // tokenCache is intentionally a single JSON document so developers can inspect
 // and delete it easily during debugging. Cache entries are scoped to issuer,
-// client ID, audience, and scopes to avoid cross-provider token reuse.
+// client ID, audience, resource, and scopes to avoid cross-provider token reuse.
 type tokenCache struct {
 	Issuer       string    `json:"issuer"`
 	ClientID     string    `json:"client_id"`
 	Audience     string    `json:"audience,omitempty"`
+	Resource     string    `json:"resource,omitempty"`
 	Scopes       string    `json:"scopes"`
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token"`
@@ -108,6 +110,7 @@ func newAuthTokenSource(cfg clientConfig) (authTokenSource, error) {
 			issuer:       cfg.OIDCIssuer,
 			clientID:     cfg.OIDCClientID,
 			audience:     cfg.OIDCAudience,
+			resource:     cfg.OIDCResource,
 			scopes:       normalizeScopes(cfg.OIDCScopes),
 			cachePath:    cfg.OIDCCache,
 			noBrowser:    cfg.OIDCNoBrowser,
@@ -163,7 +166,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 	if cache.RefreshToken != "" {
 		refreshed, err := s.refreshToken(ctx, cache)
 		if err == nil {
-			nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.scopes, refreshed)
+			nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.resource, s.scopes, refreshed)
 			if err := s.saveCache(nextCache); err != nil {
 				return "", err
 			}
@@ -175,7 +178,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 	if err != nil {
 		return "", err
 	}
-	nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.scopes, token)
+	nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.resource, s.scopes, token)
 	if err := s.saveCache(nextCache); err != nil {
 		return "", err
 	}
@@ -223,7 +226,7 @@ func (s *managedOIDCTokenSource) loadCache() (tokenCache, error) {
 	if err := json.Unmarshal(data, &cache); err != nil {
 		return tokenCache{}, fmt.Errorf("parse OIDC token cache: %w", err)
 	}
-	if cache.Issuer != s.issuer || cache.ClientID != s.clientID || cache.Audience != s.audience || normalizeScopes(cache.Scopes) != s.scopes {
+	if cache.Issuer != s.issuer || cache.ClientID != s.clientID || cache.Audience != s.audience || cache.Resource != s.resource || normalizeScopes(cache.Scopes) != s.scopes {
 		return tokenCache{}, nil
 	}
 	return cache, nil
@@ -359,6 +362,12 @@ func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.
 	if s.audience != "" {
 		authCodeOptions = append(authCodeOptions, oauth2.SetAuthURLParam("audience", s.audience))
 	}
+	// RFC 8707 resource indicator. Providers that bind the access-token `aud`
+	// claim to a requested resource (e.g. AWS Cognito) require this parameter;
+	// the Auth0-style `audience` parameter above is ignored by them.
+	if s.resource != "" {
+		authCodeOptions = append(authCodeOptions, oauth2.SetAuthURLParam("resource", s.resource))
+	}
 	authURL := config.AuthCodeURL(state, authCodeOptions...)
 	fmt.Fprintf(s.output, "Open this URL to authenticate:\n%s\n", authURL)
 	if !s.noBrowser {
@@ -402,11 +411,12 @@ func tokenUsable(token *oauth2.Token, now time.Time) bool {
 	return token.Expiry.After(now.Add(tokenReuseWindow))
 }
 
-func tokenCacheFromOAuth2Token(issuer, clientID, audience, scopes string, token *oauth2.Token) tokenCache {
+func tokenCacheFromOAuth2Token(issuer, clientID, audience, resource, scopes string, token *oauth2.Token) tokenCache {
 	cache := tokenCache{
 		Issuer:       issuer,
 		ClientID:     clientID,
 		Audience:     audience,
+		Resource:     resource,
 		Scopes:       scopes,
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,

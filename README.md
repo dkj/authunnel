@@ -174,7 +174,8 @@ Useful client flags:
 
 - `--oidc-issuer`
 - `--oidc-client-id`
-- `--oidc-audience` to request a specific API/resource audience during managed login
+- `--oidc-audience` to send the Auth0-style `audience` parameter during managed login
+- `--oidc-resource` to send the RFC 8707 `resource` parameter during managed login; required by providers that bind the token `aud` to a requested resource, such as AWS Cognito
 - `--oidc-redirect-port` to use a fixed loopback callback port instead of a random one
 - `--oidc-scopes` with default `openid offline_access`
 - `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json` (macOS/Linux) or `%AppData%\authunnel\tokens.json` (Windows)

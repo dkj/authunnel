@@ -160,7 +160,7 @@ For managed client mode, register a **public** OIDC client with:
 - scopes that include `openid` and `offline_access`
 - an access-token audience that includes the Authunnel resource, for example `authunnel-server`
 
-Some providers, including Auth0 custom APIs, require an explicit audience/resource parameter on the authorization request. Use `--oidc-audience` in those environments.
+Some providers require an explicit audience/resource parameter on the authorization request before they will populate the access-token `aud` claim. The parameter name differs by provider: Auth0 custom APIs use `audience` (pass `--oidc-audience`), while providers implementing RFC 8707 resource indicators — notably AWS Cognito — use `resource` (pass `--oidc-resource <url>`, whose value becomes the `aud`). For Cognito also request the resource server's custom scope, e.g. `--oidc-scopes 'openid https://your-resource/tunnel'`.
 
 Some providers require an exact loopback callback URL instead of allowing a random local port. Use `--oidc-redirect-port` when you need to register a fixed callback URL in the IdP.
 

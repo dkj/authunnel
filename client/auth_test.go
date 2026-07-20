@@ -133,6 +133,50 @@ func TestParseClientConfigRejectsInvalidOIDCRedirectPort(t *testing.T) {
 	}
 }
 
+func TestParseClientConfigAcceptsAbsoluteOIDCResource(t *testing.T) {
+	for _, resource := range []string{
+		"https://authunnel.example/api",
+		"https://api.example/path?query=1",
+		"myapp://resource",
+	} {
+		cfg, err := parseClientConfig([]string{
+			"--oidc-issuer", "https://issuer.example",
+			"--oidc-client-id", "client",
+			"--oidc-resource", resource,
+			"--tunnel-url", "https://tunnel.example/protected/tunnel",
+		}, func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("parseClientConfig(%q) failed: %v", resource, err)
+		}
+		if cfg.OIDCResource != resource {
+			t.Fatalf("unexpected OIDC resource: got %q want %q", cfg.OIDCResource, resource)
+		}
+	}
+}
+
+func TestParseClientConfigRejectsInvalidOIDCResource(t *testing.T) {
+	cases := []struct {
+		resource string
+		wantMsg  string
+	}{
+		{"not-a-url", "absolute URI"},
+		{"/relative/path", "absolute URI"},
+		{"https://api.example/#fragment", "fragment"},
+		{"https://api.example/path#", "fragment"},
+	}
+	for _, tc := range cases {
+		_, err := parseClientConfig([]string{
+			"--oidc-issuer", "https://issuer.example",
+			"--oidc-client-id", "client",
+			"--oidc-resource", tc.resource,
+			"--tunnel-url", "https://tunnel.example/protected/tunnel",
+		}, func(string) string { return "" })
+		if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
+			t.Fatalf("--oidc-resource %q: expected error containing %q, got %v", tc.resource, tc.wantMsg, err)
+		}
+	}
+}
+
 func TestParseClientConfigRejectsManualAuthWithManagedOIDCFlags(t *testing.T) {
 	_, err := parseClientConfig([]string{"--oidc-audience", "authunnel-server"}, func(key string) string {
 		if key == "ACCESS_TOKEN" {
@@ -491,6 +535,43 @@ func TestManagedOIDCTokenSourceIncludesAudienceAndConfiguredRedirectPortInAuthUR
 			}
 			if got := redirectURI.Port(); got != strconv.Itoa(redirectPort) {
 				t.Fatalf("unexpected redirect port: got %q want %q", got, strconv.Itoa(redirectPort))
+			}
+			return provider.completeBrowserAuth(authURL)
+		},
+		now: time.Now,
+	}
+
+	token, err := source.AccessToken(context.Background(), true)
+	if err != nil {
+		t.Fatalf("expected interactive flow to succeed, got error: %v", err)
+	}
+	if token != provider.codeAccessToken {
+		t.Fatalf("unexpected token: got %q want %q", token, provider.codeAccessToken)
+	}
+}
+
+func TestManagedOIDCTokenSourceIncludesResourceParameterInAuthURL(t *testing.T) {
+	provider := newFakeOIDCProvider(t)
+
+	source := &managedOIDCTokenSource{
+		issuer:     provider.issuer(),
+		clientID:   "authunnel-cli",
+		resource:   "https://authunnel.example/api",
+		scopes:     normalizeScopes("openid"),
+		cachePath:  filepathForTest(t, "tokens.json"),
+		httpClient: provider.server.Client(),
+		output:     io.Discard,
+		openBrowser: func(ctx context.Context, authURL string) error {
+			parsed, err := url.Parse(authURL)
+			if err != nil {
+				return err
+			}
+			if got := parsed.Query().Get("resource"); got != "https://authunnel.example/api" {
+				t.Fatalf("unexpected resource query parameter: got %q", got)
+			}
+			// With no audience configured, the Auth0-style parameter must not leak.
+			if got := parsed.Query().Get("audience"); got != "" {
+				t.Fatalf("audience query parameter should be absent, got %q", got)
 			}
 			return provider.completeBrowserAuth(authURL)
 		},
