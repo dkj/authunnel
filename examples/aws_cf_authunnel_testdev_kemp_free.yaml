@@ -1,0 +1,502 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Minimal authunnel test/dev CloudFormation stack that fronts the authunnel
+  servers with a Progress Kemp LoadMaster (Free edition) instead of an AWS NLB
+  or Ivanti vTM. The LoadMaster terminates TLS on :443 and reverse-proxies to a
+  pool of locked-down authunnel-server targets on :8080. This is the Kemp
+  counterpart to aws_cf_authunnel_testdev_ivanti_vtm_ce.yaml.
+
+# ---------------------------------------------------------------------------
+# WHAT THIS IS (AND IS NOT)
+# ---------------------------------------------------------------------------
+# A TEST/DEV learning aid, not a production blueprint. Like its siblings it runs
+# the authunnel servers with a deliberately permissive posture (open egress, IP
+# guard off, debug logging). Lock those down for any real deployment.
+#
+# Kemp LoadMaster FREE EDITION:
+#   * Fully functional, perpetual (not a 30-day trial), capped at 20 Mb/s --
+#     ample for evaluation. You pay only AWS infrastructure costs.
+#   * Subscribe to the "Kemp LoadMaster Load Balancer ADC - FREE" listing in AWS
+#     Marketplace and pass its AMI ID (per region) as KempAmiId.
+#
+# IMPORTANT DIFFERENCES FROM THE vTM TEMPLATE (Kemp friction points):
+#   1. Licensing is manual rather than user-data driven, but the AWS Free AMI may
+#      arrive ALREADY licensed (System Administration > License Management showing
+#      "Licensed until: Unlimited") -- if so there is nothing to do. Otherwise
+#      apply the free licence there with a Progress/Kemp ID. The Progress ID /
+#      Password fields only register ownership and are optional for test/dev.
+#   2. First login is user "bal" with the EC2 INSTANCE ID as the password. The
+#      SSH setup console sets the admin password at the end of the wizard: it
+#      prompts for the CURRENT password first (= the instance ID), then the new
+#      one. Enter the instance ID when asked for the current password and it
+#      succeeds (typing a brand-new value as the "current" password is what
+#      causes the "password reset fail" message).
+#   3. On this AWS Free image the admin WUI/API is on :8443 by default, leaving
+#      :443 free for the authunnel virtual service -- no port move needed. (If a
+#      build instead serves the WUI on :443, move it to :8443 via Certificates &
+#      Security > Remote Access > "Admin WUI Access port".) This stack's security
+#      group opens :443 to the world (the VS) and :8443 to AdminCidr (WUI/API).
+#   4. The RESTful API may be off by default. Tick "Enable API Interface" in the
+#      WUI under "Certificates & Security > Remote Access" (the menu location and
+#      exact label vary by build; older firmware had it under System
+#      Configuration > Miscellaneous Options > Remote Access).
+#
+# FIRST-BOOT SEQUENCE (all manual):
+#   a. SSH in (ssh bal@<public-ip>) to the setup console. When it asks for the
+#      appliance IP, accept the PRIVATE IP it pre-fills with the subnet mask
+#      (e.g. 172.31.16.110/20) -- NOT the public/Elastic IP (that is an AWS NAT
+#      address and is not on the interface) and NOT /32 (a host mask is rejected
+#      on a multi-host subnet). Default gateway is the subnet base +1
+#      (e.g. 172.31.16.1); DNS is the VPC base +2 (e.g. 172.31.0.2); no proxy.
+#      At the end, set the admin password (enter the instance ID as the CURRENT
+#      password, then your new one -- friction point 2). A reboot may be needed
+#      before the WUI answers.
+#   b. Browse to https://<public-ip>:8443/ and log in as bal with the password
+#      you set (or the instance ID if you skipped that). Accept the EULA; license
+#      the Free edition only if needed (friction point 1 -- often already done).
+#   c. Enable the RESTful API (friction point 4). No WUI port move is needed.
+#
+# CONFIGURING THE L7 SERVICE (after the first-boot sequence above):
+#   Run the companion script configure_kemp.sh from inside AdminCidr. It uses the
+#   LoadMaster RESTful API (https://<lm>:8443/access/...) to:
+#     * (optionally) import a self-signed cert -- but see the QUIRK below; in
+#       practice you import the cert in the WUI and run with SKIP_CERT=1,
+#     * create the :443 virtual service (SSL offload, X-Forwarded-For via
+#       addvia=5, X-Forwarded-Proto=https via an extra header),
+#     * add the two authunnel backends as real servers on :8080,
+#     * create a :80 virtual service that redirects to HTTPS.
+#   The ConfigureKempCommand stack output prints the exact invocation. The Kemp
+#   API parameters are VERSION SENSITIVE; the WUI can do the same steps.
+#
+#   CERTIFICATE IMPORT QUIRK (observed on firmware 7.2.63.2): the addcert API
+#   refuses to CREATE a new identifier from a combined key+cert PEM (HTTP 422
+#   "Certificate Identifier has been deleted") though it will REPLACE an existing
+#   one. The reliable flow is therefore a WUI import then SKIP_CERT=1:
+#     1. Run configure_kemp.sh once WITHOUT SKIP_CERT. When addcert fails it
+#        writes ./authunnel.crt and ./authunnel.key for you and prints the steps.
+#     2. WUI > Certificates & Security > SSL Certificates > Import: those two
+#        files, Certificate Identifier "authunnel" (separate cert/key fields
+#        succeed where the combined-PEM API call does not).
+#     3. Re-run with SKIP_CERT=1 to build the VS/pool against that cert.
+#   (Or skip steps 1-2 and import any cert -- self-signed or ACME -- by hand.)
+#
+# TLS CERTIFICATE (two phases): the stack ends up with a self-signed "authunnel"
+# cert so it works immediately. For a real cert, issue one
+# via ACME Certificates (Certificates & Security; DNS-01 with Cloudflare works
+# well, as it did for vTM). A new cert cannot reuse the "authunnel" identifier
+# while the self-signed one exists, so issue it under a distinct name (e.g.
+# "authunnel-acme") and either reassign the :443 VS to it in the WUI, or re-run
+# the script with CERT_NAME=authunnel-acme SKIP_CERT=1. As with vTM, for a real
+# Sanger deployment the institutional CA / existing Kemp cert workflow is the
+# better fit than the box's built-in ACME.
+#
+# The AWS resources (VPC wiring, security groups, instances, EIP) are exact; the
+# LoadMaster licensing is a manual wizard step and the L7 config is a best-effort
+# REST bootstrap you can also complete/adjust in the WUI.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+
+  VpcId:
+    Description: VPC to deploy the authunnel test/dev stack into
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetIds:
+    Description: Public subnet IDs for the internet-facing LoadMaster and the EC2 instances. Choose at least one subnet; two in different Availability Zones is better for the backend pool.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  KempAmiId:
+    Description: AMI ID of the "Kemp LoadMaster Load Balancer ADC - FREE" image (subscribe in AWS Marketplace, then use the AMI ID for this region).
+    Type: AWS::EC2::Image::Id
+
+  KempInstanceType:
+    Description: Instance type for the LoadMaster node
+    Type: String
+    Default: t3.medium
+
+  AdminCidr:
+    Description: CIDR allowed to reach SSH (22) and the LoadMaster admin WUI/REST API (8443). Restrict this to your own address; do NOT leave it as 0.0.0.0/0.
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: must be a valid CIDR of the form x.x.x.x/n.
+
+  DomainName:
+    Description: DNS name testers will use to reach the LoadMaster. Used as the CN/SAN of the self-signed TLS certificate generated for the :443 listener.
+    Type: String
+    Default: authunnel.test.example
+
+  OidcIssuer:
+    Description: OIDC issuer URL passed to authunnel-server
+    Type: String
+    Default: https://dkj.uk.auth0.com/
+
+  TokenAudience:
+    Description: Token audience passed to authunnel-server
+    Type: String
+    Default: https://authunnel.nowhere/api
+
+  ExtraServerArgs:
+    Description: >-
+      Extra command-line arguments appended verbatim to authunnel-server on every
+      backend instance, e.g. "--expiry-grace 60s --max-connection-duration 8h".
+      Leave blank for none.
+    Type: String
+    Default: ''
+
+Resources:
+  # Security Group for the internet-facing LoadMaster.
+  # Clients connect on 443 (and 80 for redirect/ACME). The admin WUI/API (8443)
+  # and SSH (22) are restricted to AdminCidr.
+  KempSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: public TLS to the LoadMaster, with admin WUI/API and SSH restricted to AdminCidr
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS/TLS access to the LoadMaster virtual service from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+          Description: HTTPS/TLS access to the LoadMaster virtual service from anywhere IPv6
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP for the HTTPS redirect and ACME HTTP-01 challenge
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIpv6: ::/0
+          Description: HTTP for the HTTPS redirect and ACME HTTP-01 challenge IPv6
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: !Ref AdminCidr
+          Description: LoadMaster admin WUI and RESTful API, restricted to AdminCidr
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+          Description: SSH to the LoadMaster, restricted to AdminCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-kemp-sg
+
+  # Security Group for the authunnel EC2 targets.
+  # Port 8080 is only reachable from the LoadMaster security group, never from
+  # the internet. SSH is limited to AdminCidr.
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: authunnel target access from the LoadMaster only, plus admin SSH
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref KempSecurityGroup
+          Description: Authunnel target access from the LoadMaster only
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+          Description: SSH access, restricted to AdminCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-backend-sg
+
+  # Allow the authunnel backends to SSH to each other over their private IPs.
+  # A self-referencing rule must be a separate resource: an inline ingress rule
+  # cannot reference the security group that contains it (circular dependency).
+  BackendInterHostSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BackendSecurityGroup
+      Description: SSH between authunnel backends over their private IPs
+
+  # Security Group for the isolated backend host. This demonstrates
+  # authunnel's actual purpose: a host with no direct network path from
+  # anywhere except the authunnel-server nodes. SSH to it only works by
+  # tunnelling through authunnel (see IsolatedHostPrivateIp output and the
+  # README for the authunnel-client ProxyCommand invocation).
+  AuthunnelIsolatedHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH reachable only from the authunnel-server nodes, nothing else in or out
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: SSH access from the authunnel-server nodes only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          DestinationSecurityGroupId: !Ref BackendSecurityGroup
+          Description: >-
+            Not actually needed for SSH replies (security groups are
+            stateful), kept only so the group has no implicit allow-all
+            egress and its only stated peer is the authunnel-server nodes.
+      Tags:
+        - Key: Name
+          Value: authunnel-isolated-host-sg
+
+  # Isolated backend host. Stock AL2023 sshd, no UserData needed. Reachable
+  # only via an authunnel tunnel to port 22 on its private IP; there is no
+  # other ingress path (see the security group above).
+  AuthunnelIsolatedHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: false
+          SubnetId: !Select [0, !Ref PublicSubnetIds]
+          GroupSet:
+            - !Ref AuthunnelIsolatedHostSecurityGroup
+      Tags:
+        - Key: Name
+          Value: authunnel-isolated-host
+
+  # Backend authunnel-server target 1.
+  AuthunnelInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref BackendSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<'EOF'
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          # Test/dev posture: permissive egress, IP guard off, debug logging.
+          # --preauth-trust-forwarded-for=rightmost reads the client IP from the
+          # entry the single trusted LoadMaster hop appends to X-Forwarded-For.
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --preauth-trust-forwarded-for=rightmost --allow-open-egress --no-ip-block --oidc-issuer=${OidcIssuer} --token-audience=${TokenAudience} ${ExtraServerArgs}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # Backend authunnel-server target 2.
+  AuthunnelInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref BackendSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<'EOF'
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --preauth-trust-forwarded-for=rightmost --allow-open-egress --no-ip-block --oidc-issuer=${OidcIssuer} --token-audience=${TokenAudience} ${ExtraServerArgs}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # The Kemp LoadMaster node (Free edition). Boots from the Marketplace AMI; its
+  # initial password is the EC2 instance ID and licensing is completed by hand in
+  # the WUI setup wizard (see header notes) -- the Free edition cannot be licensed
+  # from user-data, so no UserData is set here.
+  KempInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref KempAmiId
+      InstanceType: !Ref KempInstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref KempSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      Tags:
+        - Key: Name
+          Value: authunnel-kemp
+
+  # Stable public address for the LoadMaster (point your DomainName DNS at this).
+  KempEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: authunnel-kemp-eip
+
+  KempEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt KempEip.AllocationId
+      InstanceId: !Ref KempInstance
+
+Outputs:
+  KempPublicIp:
+    Description: Public (Elastic) IP of the LoadMaster. Point your DomainName DNS record at this, and reach the API/WUI at https://<this>:8443/.
+    Value: !Ref KempEip
+    Export:
+      Name: !Sub ${AWS::StackName}-KempPublicIp
+
+  KempPrivateIp:
+    Description: Private IP of the LoadMaster. This is the address the :443/:80 virtual services bind to (pass to configure_kemp.sh as KEMP_VS_IP).
+    Value: !GetAtt KempInstance.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-KempPrivateIp
+
+  KempWuiUrl:
+    Description: LoadMaster admin WUI / RESTful API base (move the admin port to 8443 in the wizard; reachable only from AdminCidr)
+    Value: !Sub 'https://${KempEip}:8443/'
+    Export:
+      Name: !Sub ${AWS::StackName}-KempWuiUrl
+
+  KempInitialPasswordHint:
+    Description: Initial WUI login is user "bal" with the EC2 instance ID as the password.
+    Value: !Sub 'bal / ${KempInstance} (instance ID)'
+
+  Backend1PrivateIp:
+    Description: Private IP of backend 1 (pass to configure_kemp.sh as BACKEND1)
+    Value: !GetAtt AuthunnelInstance1.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-Backend1PrivateIp
+
+  Backend2PrivateIp:
+    Description: Private IP of backend 2 (pass to configure_kemp.sh as BACKEND2)
+    Value: !GetAtt AuthunnelInstance2.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-Backend2PrivateIp
+
+  ConfigureKempCommand:
+    Description: Run this from inside AdminCidr (after the wizard + enabling the RESTful API) to apply the Layer-7 configuration. Run from the repo root, or drop the "cd examples &&" prefix if already inside examples/.
+    Value: !Sub 'cd examples && KEMP_HOST=${KempEip} KEMP_ADMIN_PW=<password> KEMP_VS_IP=${KempInstance.PrivateIp} BACKEND1=${AuthunnelInstance1.PrivateIp} BACKEND2=${AuthunnelInstance2.PrivateIp} DOMAIN=${DomainName} ./configure_kemp.sh'
+
+  KempSecurityGroupId:
+    Description: Security Group ID for the LoadMaster node
+    Value: !Ref KempSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-KempSecurityGroupId
+
+  BackendSecurityGroupId:
+    Description: Security Group ID for the authunnel backends
+    Value: !Ref BackendSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-BackendSecurityGroupId
+
+  IsolatedHostInstanceId:
+    Description: Instance ID of the isolated backend host (reachable only via an authunnel tunnel)
+    Value: !Ref AuthunnelIsolatedHost
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostInstanceId
+
+  IsolatedHostPrivateIp:
+    Description: >-
+      Private IP of the isolated backend host. This is the target for
+      authunnel-client, e.g. --proxycommand <this-ip> 22 or an SSH config
+      HostName pointing here via ProxyCommand.
+    Value: !GetAtt AuthunnelIsolatedHost.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostPrivateIp
+
+  IsolatedHostSecurityGroupId:
+    Description: Security Group ID for the isolated backend host
+    Value: !Ref AuthunnelIsolatedHostSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostSecurityGroupId
+
+  VpcIdOutput:
+    Description: VPC used by the authunnel stack
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+
+  PublicSubnetIdsOutput:
+    Description: Public subnet IDs used by the authunnel stack
+    Value: !Join [",", !Ref PublicSubnetIds]
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnetIds

@@ -1,0 +1,532 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Minimal authunnel test/dev CloudFormation stack that fronts the authunnel
+  servers with Ivanti Virtual Traffic Manager (vTM) running in the licence-free
+  Community Edition, instead of an AWS Network Load Balancer. The vTM terminates
+  TLS on :443 and reverse-proxies to a pool of locked-down authunnel-server
+  targets on :8080. This mirrors the proposed Sanger architecture, where Ivanti
+  vTM (or Kemp) provides the external TLS-terminating interface.
+
+# ---------------------------------------------------------------------------
+# WHAT THIS IS (AND IS NOT)
+# ---------------------------------------------------------------------------
+# This is a TEST/DEV learning aid, not a production blueprint. Like the sibling
+# template aws_cf_authunnel_testdev_generic.yaml it runs the authunnel servers
+# with a deliberately permissive posture (open egress, IP guard off, debug
+# logging). Lock those down for any real deployment.
+#
+# Ivanti vTM COMMUNITY EDITION (licence-free):
+#   * Activates automatically when no licence key is supplied: the appliance
+#     boots Unlicensed and runs as Community Edition until a key is added.
+#   * Full, production-ready feature set, but capped at 10 Mb/s of throughput
+#     and a maximum cluster size of 4 nodes. Ample for evaluation; this stack
+#     deploys a single vTM node well within those limits.
+#   * See: https://help.ivanti.com/ps/help/en_US/VTM/21.4/softwaregs/ps-vtm-software-gsg/the_community_edition.htm
+#   * Verified against the AWS Marketplace listing "Pulse Secure Virtual Traffic
+#     Manager with Web Application Firewall" (Ivanti), 22.x, Ubuntu, x86_64.
+#
+# OPERATOR-SUPPLIED PIECES (vTM is third-party software, so unlike the NLB
+# template some inputs cannot be hard-coded):
+#   1. VtmAmiId  - subscribe to the Ivanti vTM listing in AWS Marketplace (the
+#      Community & BYOL listing is no-cost-to-subscribe) and pass the AMI ID for
+#      YOUR region. Community Edition needs no Marketplace licence fee.
+#   2. First-boot settings are passed via the vTM APPLIANCE user-data format
+#      (key=value lines the appliance parses itself -- it does NOT run shell
+#      scripts). This stack sets:  password=<admin pw>, timezone=<tz>, and
+#      accept_license=Yes (accepts the EULA unattended). Leaving the licence key
+#      unset selects Community Edition. Because user-data cannot carry L7 config,
+#      the virtual servers/pool/cert/rules are applied AFTER boot (see below).
+#
+# CONFIGURING THE vTM L7 SERVICE (after boot):
+#   The stack brings up a running vTM (known admin password) plus the two
+#   authunnel backends, security groups and EIP. The virtual servers, pool,
+#   TLS cert and TrafficScript rules are then applied with the companion script
+#   configure_vtm.sh (committed alongside this template), or by hand in the
+#   Admin UI (:9090). The script:
+#     * installs a self-signed cert on :443 (PHASE 1 placeholder),
+#     * creates the backend pool over plaintext :8080,
+#     * adds a request rule setting X-Forwarded-Proto/Host/For (the backends run
+#       with --preauth-trust-forwarded-for=rightmost),
+#     * creates the TLS-decrypting :443 virtual server (WebSockets pass through),
+#     * creates a :80 virtual server that redirects to HTTPS except the ACME
+#       challenge path (ready for the Let's Encrypt switch below).
+#   NOTE: the vTM REST API is enabled by default -- you do NOT need to turn it
+#   on in the Admin UI first. After boot the appliance takes a few minutes to
+#   bring up its web (:9090) and REST (:9070) services, so the first connection
+#   may be refused; just wait and retry. The script then reaches
+#   https://<vtm>:9070/api/tm/. The REST API version varies by release (22.x is
+#   past 9.0); the Admin UI can do the same steps if a PUT is rejected. The
+#   ConfigureVtmCommand stack output prints the exact invocation.
+#
+# TLS CERTIFICATE: TWO PHASES (self-signed now, Let's Encrypt later)
+#   configure_vtm.sh installs a self-signed cert on :443 so the stack is usable
+#   straight away. vTM has built-in Let's Encrypt/ACME support and auto-renews,
+#   so once the name is publicly resolvable you can swap in a publicly-trusted
+#   cert (no custom CA trust on clients). Inbound :80 is already open and the
+#   :80 virtual server already leaves /.well-known/acme-challenge/ for vTM.
+#
+#   SWITCHING TO LET'S ENCRYPT (do this after configure_vtm.sh has run):
+#     1. Point your DomainName DNS record at the stack's VtmPublicIp output and
+#        wait for it to resolve globally.
+#     2. In the vTM Admin UI: Catalogs > SSL > Server Certs > LetsEncrypt >
+#        "Create Let's Encrypt Certificate". Create/select a UACME account, enter
+#        DomainName, and issue.
+#        IMPORTANT (verified on vTM 22.9r4): use the DNS-01 challenge with a
+#        Cloudflare-hosted zone -- supply the zone's ID and a Cloudflare API
+#        token (scoped Zone:DNS:Edit). The HTTP-01 challenge does NOT work on
+#        this build: the form mandates the Cloudflare fields even for HTTP-01
+#        and then fails order creation ("uacme: failed to create new order").
+#        DNS-01 also needs no inbound :80 and supports wildcards.
+#     3. Edit the "authunnel" virtual server (:443) and set its SSL server
+#        certificate to the new Let's Encrypt cert, replacing "authunnel".
+#     vTM then renews the certificate automatically as it nears expiry.
+#
+#   NOTE for a real Sanger deployment: vTM's built-in Let's Encrypt is, on this
+#   release, effectively Cloudflare-DNS-only -- not a fit for Sanger DNS. The
+#   :80 redirect VS and open :80 are left in place for completeness, but
+#   production would keep the existing Ivanti cert workflow or an institutional
+#   CA. This ACME path is aimed only at the throwaway AWS test/dev box.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+
+  VpcId:
+    Description: VPC to deploy the authunnel test/dev stack into
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetIds:
+    Description: Public subnet IDs for the internet-facing vTM and the EC2 instances. Choose at least one subnet; two in different Availability Zones is better for the backend pool.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  VtmAmiId:
+    Description: AMI ID of the Ivanti Virtual Traffic Manager image (subscribe in AWS Marketplace, then use the AMI ID for this region). Community Edition incurs no Ivanti licence fee.
+    Type: AWS::EC2::Image::Id
+
+  VtmInstanceType:
+    Description: Instance type for the vTM node (needs ~2 GB RAM or more)
+    Type: String
+    Default: t3.medium
+
+  AdminCidr:
+    Description: CIDR allowed to reach SSH (22), the vTM Admin UI (9090) and the vTM REST API (9070). Restrict this to your own address; do NOT leave it as 0.0.0.0/0.
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: must be a valid CIDR of the form x.x.x.x/n.
+
+  VtmAdminPassword:
+    Description: Password to set for the vTM 'admin' user during unattended configuration. Also used by this stack to call the vTM REST API.
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    ConstraintDescription: must be at least 8 characters.
+
+  Timezone:
+    Description: Timezone for the vTM appliance (tz database name), set via appliance user-data.
+    Type: String
+    Default: Europe/London
+
+  DomainName:
+    Description: DNS name testers will use to reach the vTM. Used as the CN/SAN of the self-signed TLS certificate generated for the :443 listener.
+    Type: String
+    Default: authunnel.test.example
+
+  OidcIssuer:
+    Description: OIDC issuer URL passed to authunnel-server
+    Type: String
+    Default: https://dkj.uk.auth0.com/
+
+  TokenAudience:
+    Description: Token audience passed to authunnel-server
+    Type: String
+    Default: https://authunnel.nowhere/api
+
+  ExtraServerArgs:
+    Description: >-
+      Extra command-line arguments appended verbatim to authunnel-server on every
+      backend instance, e.g. "--expiry-grace 60s --max-connection-duration 8h".
+      Leave blank for none.
+    Type: String
+    Default: ''
+
+Resources:
+  # Security Group for the internet-facing Ivanti vTM node.
+  # Clients connect on 443. The Admin UI (9090) and REST API (9070) are
+  # restricted to AdminCidr, as is SSH (22).
+  VtmSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: public TLS to the vTM, with admin/REST/SSH restricted to AdminCidr
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS/TLS access to the vTM from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+          Description: HTTPS/TLS access to the vTM from anywhere IPv6
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP for the ACME HTTP-01 challenge and HTTPS redirect
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIpv6: ::/0
+          Description: HTTP for the ACME HTTP-01 challenge and HTTPS redirect IPv6
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          CidrIp: !Ref AdminCidr
+          Description: vTM Admin UI, restricted to AdminCidr
+        - IpProtocol: tcp
+          FromPort: 9070
+          ToPort: 9070
+          CidrIp: !Ref AdminCidr
+          Description: vTM REST API, restricted to AdminCidr
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+          Description: SSH to the vTM, restricted to AdminCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-vtm-sg
+
+  # Security Group for the authunnel EC2 targets.
+  # Port 8080 is only reachable from the vTM security group, never directly
+  # from the internet. SSH is limited to AdminCidr.
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: authunnel target access from the vTM only, plus admin SSH
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref VtmSecurityGroup
+          Description: Authunnel target access from the vTM only
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+          Description: SSH access, restricted to AdminCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-backend-sg
+
+  # Allow the authunnel backends to SSH to each other over their private IPs.
+  # A self-referencing rule must be a separate resource: an inline ingress rule
+  # cannot reference the security group that contains it (circular dependency).
+  BackendInterHostSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BackendSecurityGroup
+      Description: SSH between authunnel backends over their private IPs
+
+  # Security Group for the isolated backend host. This demonstrates
+  # authunnel's actual purpose: a host with no direct network path from
+  # anywhere except the authunnel-server nodes. SSH to it only works by
+  # tunnelling through authunnel (see IsolatedHostPrivateIp output and the
+  # README for the authunnel-client ProxyCommand invocation).
+  AuthunnelIsolatedHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH reachable only from the authunnel-server nodes, nothing else in or out
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: SSH access from the authunnel-server nodes only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          DestinationSecurityGroupId: !Ref BackendSecurityGroup
+          Description: >-
+            Not actually needed for SSH replies (security groups are
+            stateful), kept only so the group has no implicit allow-all
+            egress and its only stated peer is the authunnel-server nodes.
+      Tags:
+        - Key: Name
+          Value: authunnel-isolated-host-sg
+
+  # Isolated backend host. Stock AL2023 sshd, no UserData needed. Reachable
+  # only via an authunnel tunnel to port 22 on its private IP; there is no
+  # other ingress path (see the security group above).
+  AuthunnelIsolatedHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: false
+          SubnetId: !Select [0, !Ref PublicSubnetIds]
+          GroupSet:
+            - !Ref AuthunnelIsolatedHostSecurityGroup
+      Tags:
+        - Key: Name
+          Value: authunnel-isolated-host
+
+  # Backend authunnel-server target 1.
+  AuthunnelInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref BackendSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<'EOF'
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          # Test/dev posture: permissive egress, IP guard off, debug logging.
+          # --preauth-trust-forwarded-for=rightmost reads the client IP from the
+          # entry the single trusted vTM hop appends to X-Forwarded-For.
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --preauth-trust-forwarded-for=rightmost --allow-open-egress --no-ip-block --oidc-issuer=${OidcIssuer} --token-audience=${TokenAudience} ${ExtraServerArgs}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # Backend authunnel-server target 2.
+  AuthunnelInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref BackendSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<'EOF'
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --preauth-trust-forwarded-for=rightmost --allow-open-egress --no-ip-block --oidc-issuer=${OidcIssuer} --token-audience=${TokenAudience} ${ExtraServerArgs}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # The Ivanti vTM node (Community Edition). Boots from the Marketplace AMI with
+  # only its admin password set, via the vTM appliance's OWN user-data format:
+  # the appliance parses instance user-data for the key `password=...` and does
+  # NOT execute shell scripts. Leaving the licence unset selects Community
+  # Edition. All Layer-7 configuration (pool, virtual servers, cert, rules) is
+  # applied AFTER boot -- it cannot be expressed in appliance user-data -- using
+  # the companion script configure_vtm.sh or the Admin UI (:9090). See the
+  # "CONFIGURING THE vTM L7 SERVICE" header notes.
+  VtmInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref VtmAmiId
+      InstanceType: !Ref VtmInstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref VtmSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      # vTM appliance user-data (key=value lines the appliance parses itself;
+      # NOT a shell script). accept_license=Yes accepts the EULA unattended;
+      # leaving the licence key unset selects Community Edition.
+      UserData:
+        Fn::Base64: !Sub |
+          password=${VtmAdminPassword}
+          timezone=${Timezone}
+          accept_license=Yes
+      Tags:
+        - Key: Name
+          Value: authunnel-vtm
+
+  # Stable public address for the vTM (point your DomainName DNS record here).
+  VtmEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: authunnel-vtm-eip
+
+  VtmEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt VtmEip.AllocationId
+      InstanceId: !Ref VtmInstance
+
+Outputs:
+  VtmPublicIp:
+    Description: Public (Elastic) IP of the vTM. Point your DomainName DNS record at this.
+    Value: !Ref VtmEip
+    Export:
+      Name: !Sub ${AWS::StackName}-VtmPublicIp
+
+  VtmAdminUiUrl:
+    Description: vTM Admin UI (reachable only from AdminCidr)
+    Value: !Sub 'https://${VtmEip}:9090/'
+    Export:
+      Name: !Sub ${AWS::StackName}-VtmAdminUiUrl
+
+  VtmInstanceId:
+    Description: Instance ID of the vTM node
+    Value: !Ref VtmInstance
+    Export:
+      Name: !Sub ${AWS::StackName}-VtmInstanceId
+
+  Backend1Id:
+    Description: Instance ID of the first authunnel backend
+    Value: !Ref AuthunnelInstance1
+    Export:
+      Name: !Sub ${AWS::StackName}-Backend1Id
+
+  Backend2Id:
+    Description: Instance ID of the second authunnel backend
+    Value: !Ref AuthunnelInstance2
+    Export:
+      Name: !Sub ${AWS::StackName}-Backend2Id
+
+  Backend1PrivateIp:
+    Description: Private IP of backend 1 (pass to configure_vtm.sh as BACKEND1)
+    Value: !GetAtt AuthunnelInstance1.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-Backend1PrivateIp
+
+  Backend2PrivateIp:
+    Description: Private IP of backend 2 (pass to configure_vtm.sh as BACKEND2)
+    Value: !GetAtt AuthunnelInstance2.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-Backend2PrivateIp
+
+  ConfigureVtmCommand:
+    Description: Run this from inside AdminCidr to apply the Layer-7 configuration. The REST API is on by default; allow a few minutes after boot for the vTM web/REST services to start. Run from the repo root, or drop the "cd examples &&" prefix if already inside examples/.
+    Value: !Sub 'cd examples && VTM_HOST=${VtmEip} VTM_ADMIN_PW=<password> BACKEND1=${AuthunnelInstance1.PrivateIp} BACKEND2=${AuthunnelInstance2.PrivateIp} DOMAIN=${DomainName} ./configure_vtm.sh'
+
+  VtmSecurityGroupId:
+    Description: Security Group ID for the vTM node
+    Value: !Ref VtmSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-VtmSecurityGroupId
+
+  BackendSecurityGroupId:
+    Description: Security Group ID for the authunnel backends
+    Value: !Ref BackendSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-BackendSecurityGroupId
+
+  IsolatedHostInstanceId:
+    Description: Instance ID of the isolated backend host (reachable only via an authunnel tunnel)
+    Value: !Ref AuthunnelIsolatedHost
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostInstanceId
+
+  IsolatedHostPrivateIp:
+    Description: >-
+      Private IP of the isolated backend host. This is the target for
+      authunnel-client, e.g. --proxycommand <this-ip> 22 or an SSH config
+      HostName pointing here via ProxyCommand.
+    Value: !GetAtt AuthunnelIsolatedHost.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostPrivateIp
+
+  IsolatedHostSecurityGroupId:
+    Description: Security Group ID for the isolated backend host
+    Value: !Ref AuthunnelIsolatedHostSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostSecurityGroupId
+
+  VpcIdOutput:
+    Description: VPC used by the authunnel stack
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+
+  PublicSubnetIdsOutput:
+    Description: Public subnet IDs used by the authunnel stack
+    Value: !Join [",", !Ref PublicSubnetIds]
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnetIds

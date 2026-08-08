@@ -33,6 +33,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist.
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building and testing from source: codebase layout, auth-flow invariants, the test suite, and the local Keycloak environment.
+- [examples/](examples/) — runnable CloudFormation templates that stand up a complete Authunnel topology on AWS, so you can see it working end to end before deploying on your own infrastructure.
 
 ## Components
 

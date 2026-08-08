@@ -1,0 +1,749 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Self-contained authunnel test/dev stack: an NLB fronting two authunnel-server
+  targets AND a Keycloak instance acting as the OIDC authorization server. The
+  authunnel test realm is imported inline, so the stack needs no external files
+  and no pre-existing identity provider.
+
+# ---------------------------------------------------------------------------
+# What this stack adds over aws_cf_authunnel_testdev_generic.yaml
+# ---------------------------------------------------------------------------
+# The generic stack is issuer-agnostic: you point --oidc-issuer at an existing
+# provider (Auth0, Okta, an external Keycloak, ...). This variant instead
+# *deploys* the authorization server too, so a reviewer can bring up a working
+# end-to-end demo from nothing.
+#
+# Topology:
+#
+#   client ──443/TLS──▶ NLB ──▶ authunnel-server x2  (:8080, plaintext behind LB)
+#   client ─8443/TLS──▶ NLB ──▶ Keycloak            (:8080, plaintext behind LB)
+#
+# Both listeners terminate TLS on the NLB with the same ACM certificate, so the
+# public DNS name (PublicHostname) must resolve to the NLB and be covered by the
+# certificate. The authunnel servers reach the issuer back through the public
+# NLB, so no split-horizon DNS is required.
+#
+# The authorization server is Keycloak because the repo already ships a working
+# realm (testenv/keycloak/authunnel-realm.json) that the authunnel client and
+# server are known to interoperate with, with zero client-side changes. The
+# realm below is a copy of that file; keep the two in sync.
+#
+# TEST/DEV SECRET EXPOSURE: KeycloakAdminPassword and KeycloakDevUserPassword
+# are substituted into this instance's EC2 user data. NoEcho keeps them out of
+# the CloudFormation console, and the boot script keeps them out of the
+# cloud-init log, but EC2 user data itself is retrievable (base64-encoded, not
+# encrypted) by anyone who can reach the instance metadata service or holds
+# ec2:DescribeInstanceAttribute. This is acceptable only because these stacks
+# are throwaway test/dev environments; a production deployment should fetch
+# secrets at boot from a secrets manager instead of embedding them here.
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+
+  VpcId:
+    Description: VPC to deploy the authunnel test/dev stack into
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetIds:
+    Description: >-
+      Public subnet IDs for the internet-facing Network Load Balancer. The NLB
+      spans every subnet you list (so list two in different AZs for load-balancer
+      AZ coverage), but note the EC2 backends and the Keycloak instance all launch
+      in the FIRST subnet listed; these test/dev stacks do not spread the backends
+      across AZs. Supply at least one subnet.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  CertificateArn:
+    Description: ACM certificate ARN for both NLB TLS listeners. Must be in the same region as this stack and cover PublicHostname.
+    Type: String
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/.+$'
+    ConstraintDescription: must be a valid ACM certificate ARN.
+
+  PublicHostname:
+    Description: >-
+      Public DNS name that resolves to the NLB and is covered by CertificateArn
+      (e.g. st.sanger.ac.uk). Used to build the OIDC issuer URL and Keycloak's
+      advertised hostname. You must create this DNS record pointing at the NLB
+      (see the LoadBalancerDNS output) after the stack is created.
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9.-]+$'
+    ConstraintDescription: must be a bare DNS hostname, no scheme or path.
+
+  KeycloakTlsPort:
+    Description: NLB TLS listener port for Keycloak. The tunnel itself uses 443; Keycloak is exposed on a separate port so both share one NLB and one certificate.
+    Type: Number
+    Default: 8443
+    MinValue: 1
+    MaxValue: 65535
+
+  KeycloakImage:
+    Description: Keycloak container image to run as the authorization server.
+    Type: String
+    Default: quay.io/keycloak/keycloak:26.5.6
+
+  KeycloakAdminPassword:
+    Description: Bootstrap admin password for the Keycloak console (username "admin"). Choose a non-default value even for test/dev.
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    ConstraintDescription: must be at least 8 characters.
+
+  KeycloakDevUserPassword:
+    Description: >-
+      Password for the realm's test login user "dev-user". No default: the
+      tunnel is internet-facing with open egress, so a repository-known password
+      would let anyone who reads this template use the deployment as an open
+      proxy. Choose your own. Avoid double quotes and backslashes (the value is
+      embedded in the imported realm JSON).
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    AllowedPattern: '^[A-Za-z0-9!@#%^&*()_+=.,:;?~-]{8,64}$'
+    ConstraintDescription: 8-64 chars from letters, digits, and common punctuation excluding quotes and backslash.
+
+  ExtraServerArgs:
+    Description: >-
+      Extra command-line arguments appended verbatim to authunnel-server on every
+      backend instance, e.g. "--expiry-grace 60s --max-connection-duration 8h".
+      Leave blank for none.
+    Type: String
+    Default: ''
+
+Rules:
+  # 443 is already taken by the tunnel TLS listener. Allowing it here would
+  # create a duplicate NLB listener and duplicate security-group ingress, both
+  # of which fail the stack at create time. Reject it up front with a clear
+  # message instead.
+  KeycloakTlsPortNotTunnelPort:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref KeycloakTlsPort, '443']]
+        AssertDescription: KeycloakTlsPort must not be 443; the tunnel TLS listener already uses port 443.
+
+Resources:
+  # Security Group for the internet-facing Network Load Balancer.
+  # Clients connect to this security group on 443 (tunnel) and KeycloakTlsPort (OIDC).
+  AuthunnelLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: allow public TLS access to the authunnel NLB (tunnel + Keycloak)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS/TLS tunnel access to the NLB from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+          Description: HTTPS/TLS tunnel access to the NLB from anywhere IPv6
+        - IpProtocol: tcp
+          FromPort: !Ref KeycloakTlsPort
+          ToPort: !Ref KeycloakTlsPort
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS/TLS Keycloak (OIDC) access to the NLB from anywhere
+        - IpProtocol: tcp
+          FromPort: !Ref KeycloakTlsPort
+          ToPort: !Ref KeycloakTlsPort
+          CidrIpv6: ::/0
+          Description: HTTPS/TLS Keycloak (OIDC) access to the NLB from anywhere IPv6
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-lb-sg
+
+  # Security Group for the authunnel EC2 targets.
+  # Port 8080 is only reachable from the NLB security group, not directly
+  # from the internet, even when the target group preserves the client IP.
+  AuthunnelSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ssh access and authunnel target access from NLB only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIpv6: ::/0
+          Description: SSH access from anywhere IPv6
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AuthunnelLoadBalancerSecurityGroup
+          Description: Authunnel target access from the NLB only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-sg
+
+  # Security Group for the Keycloak EC2 target.
+  # Port 8080 is only reachable from the NLB security group.
+  KeycloakSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ssh access and Keycloak target access from NLB only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIpv6: ::/0
+          Description: SSH access from anywhere IPv6
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AuthunnelLoadBalancerSecurityGroup
+          Description: Keycloak HTTP target access from the NLB only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: All outbound traffic IPv6
+      Tags:
+        - Key: Name
+          Value: authunnel-keycloak-sg
+
+  # Security Group for the isolated backend host. This demonstrates
+  # authunnel's actual purpose: a host with no direct network path from
+  # anywhere except the authunnel-server nodes. SSH to it only works by
+  # tunnelling through authunnel (see IsolatedHostPrivateIp output and the
+  # README for the authunnel-client ProxyCommand invocation).
+  AuthunnelIsolatedHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH reachable only from the authunnel-server nodes, nothing else in or out
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref AuthunnelSecurityGroup
+          Description: SSH access from the authunnel-server nodes only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          DestinationSecurityGroupId: !Ref AuthunnelSecurityGroup
+          Description: >-
+            Not actually needed for SSH replies (security groups are
+            stateful), kept only so the group has no implicit allow-all
+            egress and its only stated peer is the authunnel-server nodes.
+      Tags:
+        - Key: Name
+          Value: authunnel-isolated-host-sg
+
+  # Isolated backend host. Stock AL2023 sshd, no UserData needed. Reachable
+  # only via an authunnel tunnel to port 22 on its private IP; there is no
+  # other ingress path (see the security group above).
+  AuthunnelIsolatedHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: false
+          SubnetId: !Select [0, !Ref PublicSubnetIds]
+          GroupSet:
+            - !Ref AuthunnelIsolatedHostSecurityGroup
+      Tags:
+        - Key: Name
+          Value: authunnel-isolated-host
+
+  # EC2 Instance 1 (authunnel-server)
+  AuthunnelInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref AuthunnelSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<EOF
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --allow-open-egress --no-ip-block --oidc-issuer=https://${PublicHostname}:${KeycloakTlsPort}/realms/authunnel --token-audience=authunnel-server ${ExtraServerArgs}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # EC2 Instance 2 (authunnel-server)
+  AuthunnelInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.nano
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref AuthunnelSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y wget
+
+          cd /opt
+          wget -O authunnel-server-linux-arm64 https://github.com/dkj/authunnel/releases/latest/download/authunnel-server-linux-arm64
+          chmod +x /opt/authunnel-server-linux-arm64
+
+          cat > /etc/systemd/system/authunnel-server.service <<EOF
+          [Unit]
+          Description=Authunnel test/dev server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt
+          ExecStart=/opt/authunnel-server-linux-arm64 --log-level debug --plaintext-behind-reverse-proxy --allow-open-egress --no-ip-block --oidc-issuer=https://${PublicHostname}:${KeycloakTlsPort}/realms/authunnel --token-audience=authunnel-server ${ExtraServerArgs}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now authunnel-server.service
+      Tags:
+        - Key: Name
+          Value: authunnel-vm
+
+  # EC2 Instance running Keycloak as the OIDC authorization server.
+  # Runs the container in dev mode with the authunnel realm imported. KC_HOSTNAME
+  # is set to the public HTTPS URL because TLS is terminated at the NLB (Keycloak
+  # itself sees plain HTTP), so it must be told the externally visible origin to
+  # build correct issuer/redirect URLs and a valid discovery document.
+  KeycloakInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: t4g.small
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref KeycloakSecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # Restrict permissions on every file we create below (realm + env file)
+          # so the embedded passwords are not world/group readable on disk. Set
+          # before the first heredoc, not just before the env file.
+          umask 077
+
+          dnf install -y docker
+          systemctl enable --now docker
+
+          # Import realm: a copy of testenv/keycloak/authunnel-realm.json.
+          cat > /opt/authunnel-realm.json <<'REALM_EOF'
+          {
+            "realm": "authunnel",
+            "enabled": true,
+            "registrationAllowed": false,
+            "loginWithEmailAllowed": true,
+            "duplicateEmailsAllowed": false,
+            "resetPasswordAllowed": false,
+            "rememberMe": false,
+            "users": [
+              {
+                "username": "dev-user",
+                "enabled": true,
+                "emailVerified": true,
+                "firstName": "Dev",
+                "lastName": "User",
+                "email": "dev-user@example.com",
+                "credentials": [
+                  {
+                    "type": "password",
+                    "value": "${KeycloakDevUserPassword}",
+                    "temporary": false
+                  }
+                ],
+                "requiredActions": []
+              }
+            ],
+            "clientScopes": [
+              {
+                "name": "authunnel-audience",
+                "description": "Adds the Authunnel server audience to access tokens",
+                "protocol": "openid-connect",
+                "attributes": {
+                  "include.in.token.scope": "true",
+                  "display.on.consent.screen": "false"
+                },
+                "protocolMappers": [
+                  {
+                    "name": "authunnel-server-audience",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-audience-mapper",
+                    "consentRequired": false,
+                    "config": {
+                      "included.client.audience": "authunnel-server",
+                      "id.token.claim": "false",
+                      "access.token.claim": "true"
+                    }
+                  },
+                  {
+                    "name": "sub",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-sub-mapper",
+                    "consentRequired": false,
+                    "config": {
+                      "access.token.claim": "true",
+                      "introspection.token.claim": "true"
+                    }
+                  }
+                ]
+              }
+            ],
+            "clients": [
+              {
+                "clientId": "authunnel-cli",
+                "name": "authunnel-cli",
+                "description": "Public native client for Authunnel PKCE login",
+                "protocol": "openid-connect",
+                "enabled": true,
+                "publicClient": true,
+                "bearerOnly": false,
+                "standardFlowEnabled": true,
+                "directAccessGrantsEnabled": false,
+                "implicitFlowEnabled": false,
+                "serviceAccountsEnabled": false,
+                "redirectUris": [
+                  "http://127.0.0.1/*"
+                ],
+                "webOrigins": [
+                  "http://127.0.0.1/*"
+                ],
+                "attributes": {
+                  "pkce.code.challenge.method": "S256"
+                },
+                "defaultClientScopes": [
+                  "authunnel-audience"
+                ]
+              },
+              {
+                "clientId": "authunnel-server",
+                "name": "authunnel-server",
+                "protocol": "openid-connect",
+                "enabled": true,
+                "bearerOnly": true
+              }
+            ]
+          }
+          REALM_EOF
+
+          # umask 077 left the realm file root-only, but the Keycloak container
+          # process runs as uid 1000 and bind-mounts this file to import it, so
+          # it must be readable by that uid. This chown (rather than a
+          # world-readable chmod) keeps it off group/other. NOTE: on Amazon
+          # Linux 2023 uid 1000 is also the default ec2-user login account, so
+          # the file — and the dev-user password in it — is readable by anyone
+          # with SSH access to this box. That is no worse than the exposure
+          # already noted in the header: the same password sits in this
+          # instance's EC2 user data, which ec2-user can read via the metadata
+          # service regardless. Acceptable for a throwaway test/dev stack; a
+          # hardened build would not co-locate the login account with the
+          # container uid (e.g. run Keycloak under a dedicated service uid).
+          chown 1000:1000 /opt/authunnel-realm.json
+
+          # Write bootstrap config (including the admin password) to a root-only
+          # env file (0600 via the umask above; read by the Docker daemon as root)
+          # with tracing disabled, so the secret never reaches the traced
+          # `docker run` command line or the cloud-init log, and so any awkward
+          # character in the password is passed literally rather than through
+          # shell quoting. The quoted heredoc means the shell does not expand the
+          # values; CloudFormation Fn::Sub has already substituted them at
+          # template-render time.
+          set +x
+          cat > /opt/keycloak.env <<'KC_ENV_EOF'
+          KC_BOOTSTRAP_ADMIN_USERNAME=admin
+          KC_BOOTSTRAP_ADMIN_PASSWORD=${KeycloakAdminPassword}
+          KC_HTTP_ENABLED=true
+          KC_HOSTNAME=https://${PublicHostname}:${KeycloakTlsPort}
+          KC_ENV_EOF
+          set -x
+
+          docker run -d --name keycloak --restart always \
+            -p 8080:8080 \
+            --env-file /opt/keycloak.env \
+            -v /opt/authunnel-realm.json:/opt/keycloak/data/import/authunnel-realm.json:ro \
+            ${KeycloakImage} \
+            start-dev --import-realm --http-port=8080
+      Tags:
+        - Key: Name
+          Value: authunnel-keycloak-vm
+
+  # Target Group for authunnel-server
+  AuthunnelTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref AuthunnelInstance1
+          Port: 8080
+        - Id: !Ref AuthunnelInstance2
+          Port: 8080
+      HealthCheckProtocol: TCP
+      HealthCheckPort: 8080
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: authunnel-tg
+
+  # Target Group for Keycloak
+  KeycloakTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref KeycloakInstance
+          Port: 8080
+      HealthCheckProtocol: TCP
+      HealthCheckPort: 8080
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: authunnel-keycloak-tg
+
+  # Network Load Balancer (shared by the tunnel and Keycloak listeners)
+  AuthunnelNetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AuthunnelLoadBalancerSecurityGroup
+      Subnets: !Ref PublicSubnetIds
+      Tags:
+        - Key: Name
+          Value: authunnel-lb
+
+  # TLS Listener for the tunnel (authunnel-server)
+  TLSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AuthunnelTargetGroup
+      LoadBalancerArn: !Ref AuthunnelNetworkLoadBalancer
+      Port: 443
+      Protocol: TLS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+
+  # TLS Listener for the OIDC authorization server (Keycloak)
+  KeycloakTLSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref KeycloakTargetGroup
+      LoadBalancerArn: !Ref AuthunnelNetworkLoadBalancer
+      Port: !Ref KeycloakTlsPort
+      Protocol: TLS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the Network Load Balancer. Point PublicHostname at this (CNAME or Route 53 alias).
+    Value: !GetAtt AuthunnelNetworkLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerDNS
+
+  TunnelEndpoint:
+    Description: Public URL of the authunnel tunnel endpoint (the server --listen equivalent clients connect to).
+    Value: !Sub https://${PublicHostname}:443
+    Export:
+      Name: !Sub ${AWS::StackName}-TunnelEndpoint
+
+  OidcIssuer:
+    Description: OIDC issuer URL for the deployed Keycloak realm. Use as authunnel --oidc-issuer (already wired into the server instances).
+    Value: !Sub https://${PublicHostname}:${KeycloakTlsPort}/realms/authunnel
+    Export:
+      Name: !Sub ${AWS::StackName}-OidcIssuer
+
+  OidcClientId:
+    Description: OIDC client ID for the authunnel CLI login flow. Fixed by the imported realm (public PKCE client), not generated by AWS.
+    Value: authunnel-cli
+    Export:
+      Name: !Sub ${AWS::StackName}-OidcClientId
+
+  OidcDiscoveryUrl:
+    Description: OIDC discovery document for smoke-testing the authorization server.
+    Value: !Sub https://${PublicHostname}:${KeycloakTlsPort}/realms/authunnel/.well-known/openid-configuration
+    Export:
+      Name: !Sub ${AWS::StackName}-OidcDiscoveryUrl
+
+  KeycloakAdminConsole:
+    Description: Keycloak admin console URL (username "admin", password as supplied in KeycloakAdminPassword).
+    Value: !Sub https://${PublicHostname}:${KeycloakTlsPort}/admin/
+    Export:
+      Name: !Sub ${AWS::StackName}-KeycloakAdminConsole
+
+  LoadBalancerArn:
+    Description: ARN of the Network Load Balancer
+    Value: !Ref AuthunnelNetworkLoadBalancer
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerArn
+
+  TargetGroupArn:
+    Description: ARN of the authunnel Target Group
+    Value: !Ref AuthunnelTargetGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-TargetGroupArn
+
+  KeycloakTargetGroupArn:
+    Description: ARN of the Keycloak Target Group
+    Value: !Ref KeycloakTargetGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-KeycloakTargetGroupArn
+
+  Instance1Id:
+    Description: Instance ID of the first authunnel server
+    Value: !Ref AuthunnelInstance1
+    Export:
+      Name: !Sub ${AWS::StackName}-Instance1Id
+
+  Instance2Id:
+    Description: Instance ID of the second authunnel server
+    Value: !Ref AuthunnelInstance2
+    Export:
+      Name: !Sub ${AWS::StackName}-Instance2Id
+
+  KeycloakInstanceId:
+    Description: Instance ID of the Keycloak authorization server
+    Value: !Ref KeycloakInstance
+    Export:
+      Name: !Sub ${AWS::StackName}-KeycloakInstanceId
+
+  SecurityGroupId:
+    Description: Security Group ID for authunnel instances
+    Value: !Ref AuthunnelSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroupId
+
+  KeycloakSecurityGroupId:
+    Description: Security Group ID for the Keycloak instance
+    Value: !Ref KeycloakSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-KeycloakSecurityGroupId
+
+  LoadBalancerSecurityGroupId:
+    Description: Security Group ID for the authunnel Network Load Balancer
+    Value: !Ref AuthunnelLoadBalancerSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerSecurityGroupId
+
+  IsolatedHostInstanceId:
+    Description: Instance ID of the isolated backend host (reachable only via an authunnel tunnel)
+    Value: !Ref AuthunnelIsolatedHost
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostInstanceId
+
+  IsolatedHostPrivateIp:
+    Description: >-
+      Private IP of the isolated backend host. This is the target for
+      authunnel-client, e.g. --proxycommand <this-ip> 22 or an SSH config
+      HostName pointing here via ProxyCommand.
+    Value: !GetAtt AuthunnelIsolatedHost.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostPrivateIp
+
+  IsolatedHostSecurityGroupId:
+    Description: Security Group ID for the isolated backend host
+    Value: !Ref AuthunnelIsolatedHostSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-IsolatedHostSecurityGroupId
+
+  VpcIdOutput:
+    Description: VPC used by the authunnel stack
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+
+  PublicSubnetIdsOutput:
+    Description: Public subnet IDs used by the authunnel stack
+    Value: !Join [",", !Ref PublicSubnetIds]
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnetIds
