@@ -142,9 +142,12 @@ Resources:
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
       InstanceType: t4g.nano
       KeyName: !Ref KeyName
-      SecurityGroupIds:
-        - !Ref AuthunnelIsolatedHostSecurityGroup
-      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: false
+          SubnetId: !Select [0, !Ref PublicSubnetIds]
+          GroupSet:
+            - !Ref AuthunnelIsolatedHostSecurityGroup
       Tags:
         - Key: Name
           Value: authunnel-isolated-host
