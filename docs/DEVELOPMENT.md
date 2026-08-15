@@ -2,7 +2,7 @@
 
 This guide covers building and testing Authunnel from source: codebase layout, the invariants to preserve when changing the auth flow, the test suite, and the local Keycloak environment.
 
-Developers need Go 1.26.4+ to build and test Authunnel from source.
+Developers need Go 1.26.6+ to build and test Authunnel from source.
 
 ## Codebase layout
 
