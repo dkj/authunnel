@@ -170,7 +170,7 @@ the client-side check, so both callers adopt one rule together. It cannot ride a
 helper move in item 1: wiring the allowlist into the server's discovery path changes what the
 server accepts, which is precisely what item 1 must not do.
 
-### 3. `--oidc-metadata-url` / `OIDC_METADATA_URL` on the client
+### 3. `--oidc-metadata-url` on the client (flag only — see the note in Sequencing)
 
 Same flag name, same semantics, same mutual-exclusion-free simplicity as the server minus the
 pinning half. `oidcclient.Discover` already takes the variadic `wellKnownUrl`, so this is one
@@ -302,8 +302,12 @@ Client-side, mirroring `internal/tunnelserver/discovery_override_test.go`:
 - metadata at a non-derived path resolves with `--oidc-metadata-url` and fails without it;
 - a metadata document advertising a different issuer is refused (assert `oidc.ErrIssuerInvalid`,
   not just any error);
-- config parsing: flag/env, `file://` refused including under `--insecure-oidc-issuer`,
-  malformed URLs.
+- config parsing: the flag (there is no env var — the client has none for OIDC settings),
+  `file://` refused including under `--insecure-oidc-issuer`, malformed URLs, and the override
+  rejected without `--oidc-issuer`;
+- the override reaching discovery **through `newAuthTokenSource`**, not only through a directly
+  constructed token source. Setting the field on the source bypasses the config-to-source mapping
+  entirely, so a test that does that cannot detect the mapping being removed.
 
 Plus, **for item 2**: a test that `authhttp.NewBoundedClient()` refuses an https→http redirect, so
 the constructor default is covered independently of either caller. This belongs with item 2
@@ -347,7 +351,24 @@ treat the docs as part of the change, not as a follow-up.
    justification updated at `client/browser_other.go:26-29`, the server-side allowlist gap at
    `tunnelserver.go:179` closed, plus tests and the doc scoping corrections for all of it. Land
    before item 3; this is one change because every part of it alters behaviour on the same path.
-3. `--oidc-metadata-url` plumbing + tests.
+3. ✓ done — `--oidc-metadata-url` plumbing + tests. Two decisions resolved during
+   implementation:
+   - **No `OIDC_METADATA_URL` env var**, contrary to this plan as first written (the section
+     heading above has been corrected). The client has no
+     environment variables for any OIDC flag — `--oidc-issuer` included; only `ACCESS_TOKEN` and
+     `AUTHUNNEL_TUNNEL_URL` come from the environment. Adding one here alone would invite "why
+     does this have an env var and the issuer does not". The plan assumed symmetry with the
+     server, which does use env for everything.
+   - **The metadata URL stays out of the token cache key**, as reasoned above and confirmed
+     against `loadCache` (`client/auth.go:261`), which discards the cache on any mismatch of
+     issuer, client ID, audience, resource, or scopes. A token obtained through the override is
+     the same token — the document's issuer is verified against the configured issuer either way
+     — so keying on it would discard every cached token the first time an operator set the flag.
+     Recorded as a deliberate exclusion in the `tokenCache` doc comment.
+
+   One consequence worth noting: the downgrade check is now judged against the metadata URL when
+   set, not the issuer, since it is the document's own transport that decides whether an endpoint
+   is a downgrade. `TestDowngradeIsJudgedAgainstMetadataURLNotIssuer` pins it.
 4. Shared URL validation helper for config-time checks.
 5. Remaining docs.
 

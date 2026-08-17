@@ -100,6 +100,23 @@ Both accept `http://` under `INSECURE_OIDC_ISSUER=true`, but neither accepts
 `file://`. The startup log line `token_validator_ready` reports which mode
 resolved.
 
+The client has the matching `--oidc-metadata-url`, with the same semantics and
+the same `--insecure-oidc-issuer` relaxation.
+
+There is no client equivalent of `--oidc-jwks-uri`. Not because pinning could
+never help — it would, in the narrow case where metadata is unavailable while the
+token and authorization endpoints still respond, which a provider migration can
+produce — but because the cost is wrong. A bad `--oidc-jwks-uri` on the server
+rejects tokens; a bad pinned token endpoint on the client *receives the refresh
+token*, so a typo or a stale value after a migration becomes credential
+disclosure rather than a failed login. If that outage case ever matters, caching
+the endpoints discovery already verified is the better direction, and it has its
+own stale-endpoint risks to design around. See
+[PLAN_202608_client_discovery.md](plans/PLAN_202608_client_discovery.md).
+
+Note the client's OIDC settings are flags only — it has no environment-variable
+equivalents beyond `ACCESS_TOKEN` and `AUTHUNNEL_TUNNEL_URL`.
+
 ### 3) Start Authunnel client in managed mode
 
 ```bash

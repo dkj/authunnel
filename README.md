@@ -176,6 +176,7 @@ Useful client flags:
 
 - `--oidc-issuer`
 - `--oidc-client-id`
+- `--oidc-metadata-url` to fetch the authorization server metadata document from a URL other than the well-known path derived from `--oidc-issuer`; needed for an authorization server publishing RFC 8414 metadata, which inserts the well-known segment before the path component. The document's `issuer` is still checked against `--oidc-issuer`, so this changes where metadata is fetched from, not which issuer is trusted
 - `--oidc-audience` to send the Auth0-style `audience` parameter during managed login
 - `--oidc-resource` to send the RFC 8707 `resource` parameter during managed login; required by providers that bind the token `aud` to a requested resource, such as AWS Cognito
 - `--oidc-redirect-port` to use a fixed loopback callback port instead of a random one
@@ -185,7 +186,7 @@ Useful client flags:
 - `--tunnel-url` — tunnel endpoint URL. Secure schemes `https://` and `wss://` are accepted by default; plaintext `http://` and `ws://` require `--insecure-tunnel-url`. **Required.** May also be supplied via the `AUTHUNNEL_TUNNEL_URL` environment variable (the flag takes precedence)
 - `--unix-socket`
 - `--proxycommand`
-- `--insecure-oidc-issuer` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
+- `--insecure-oidc-issuer` — allow non-HTTPS OIDC issuer and metadata URLs **(development only; do not use in production)**. Relaxes transport security only; other schemes such as `file://` stay rejected
 - `--insecure-tunnel-url` — allow a non-HTTPS tunnel endpoint URL **(development only; do not use in production)**
 
 On first use the client prints the authorization URL to `stderr` and tries to open the system browser. Subsequent runs reuse the cache or refresh token when possible.

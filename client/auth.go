@@ -52,7 +52,11 @@ type browserOpener func(context.Context, string) error
 // cached tokens when they are still safely valid, refreshes when possible, and
 // only falls back to interactive PKCE when needed.
 type managedOIDCTokenSource struct {
-	issuer       string
+	issuer string
+	// metadataURL, when set, replaces the well-known path derived from
+	// issuer. It relocates the document only: zitadel still checks the
+	// document's issuer against issuer.
+	metadataURL  string
 	clientID     string
 	audience     string
 	resource     string
@@ -72,6 +76,14 @@ type managedOIDCTokenSource struct {
 // tokenCache is intentionally a single JSON document so developers can inspect
 // and delete it easily during debugging. Cache entries are scoped to issuer,
 // client ID, audience, resource, and scopes to avoid cross-provider token reuse.
+//
+// The metadata URL is deliberately *not* part of that key. It selects where the
+// document is fetched from, not which issuer minted the token — and since the
+// document's issuer is verified against the configured issuer either way, a
+// token obtained through an override is the same token. Adding it would discard
+// every cached token the first time an operator set the flag, forcing an
+// interactive login, and again whenever they switched between the override and
+// the derived path, for no gain in isolation.
 type tokenCache struct {
 	Issuer       string    `json:"issuer"`
 	ClientID     string    `json:"client_id"`
@@ -114,6 +126,7 @@ func newAuthTokenSource(cfg clientConfig) (authTokenSource, error) {
 		}
 		return &managedOIDCTokenSource{
 			issuer:       cfg.OIDCIssuer,
+			metadataURL:  cfg.OIDCMetadataURL,
 			clientID:     cfg.OIDCClientID,
 			audience:     cfg.OIDCAudience,
 			resource:     cfg.OIDCResource,
@@ -205,9 +218,21 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 // test Keycloak public client rejects the default client-auth style negotiation.
 func (s *managedOIDCTokenSource) oauthConfig(ctx context.Context, redirectURL string) (*oauth2.Config, error) {
 	if s.discovery.AuthURL == "" || s.discovery.TokenURL == "" {
-		discovery, err := oidcclient.Discover(context.WithValue(ctx, oauth2.HTTPClient, s.httpClient), s.issuer, s.httpClient)
+		// Discover ignores an empty wellKnownUrl, so the derived path needs
+		// no branch. On both paths it checks the document's issuer against
+		// s.issuer, which is what keeps an operator-chosen metadata URL from
+		// rebinding the client to another authorization server.
+		discovery, err := oidcclient.Discover(context.WithValue(ctx, oauth2.HTTPClient, s.httpClient), s.issuer, s.httpClient, s.metadataURL)
 		if err != nil {
 			return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
+		}
+		// Downgrade is judged against wherever the metadata actually came
+		// from, not against the issuer: with --oidc-metadata-url those differ,
+		// and it is the document's own transport that determines whether a
+		// plaintext endpoint is a downgrade.
+		metadataSource := s.issuer
+		if s.metadataURL != "" {
+			metadataSource = s.metadataURL
 		}
 		// Validate both endpoints before either is used. token_endpoint
 		// receives the refresh token and the authorization code;
@@ -222,7 +247,7 @@ func (s *managedOIDCTokenSource) oauthConfig(ctx context.Context, redirectURL st
 			if err := authhttp.CheckEndpointURL(endpoint.label, endpoint.value); err != nil {
 				return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
 			}
-			if err := authhttp.CheckNoSchemeDowngrade(endpoint.label, s.issuer, endpoint.value); err != nil {
+			if err := authhttp.CheckNoSchemeDowngrade(endpoint.label, metadataSource, endpoint.value); err != nil {
 				return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
 			}
 		}

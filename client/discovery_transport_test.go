@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 
 	"authunnel/internal/authhttp"
 )
@@ -356,6 +359,166 @@ func TestNewAuthTokenSourceGuardsInjectedClient(t *testing.T) {
 	}
 	if requests, bodies := mirror.received(); requests != 0 {
 		t.Fatalf("plaintext endpoint received %d request(s) with bodies %q, want none", requests, bodies)
+	}
+}
+
+// newTenantIssuer serves metadata only at an RFC 8414 path, which inserts the
+// well-known segment before the path component and so cannot be reached by the
+// OIDC derivation.
+func newTenantIssuer(t *testing.T, advertisedIssuer func(base string) string) (string, string, *http.Client) {
+	t.Helper()
+	const tenantPath = "/.well-known/oauth-authorization-server/tenant1"
+
+	var base string
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case tenantPath:
+			writeJSONForTest(t, w, map[string]string{
+				"issuer":                 advertisedIssuer(base),
+				"authorization_endpoint": base + "/auth",
+				"token_endpoint":         base + "/token",
+			})
+		case "/token":
+			// A working token endpoint, so a test can assert a refresh
+			// *completed* through the override rather than inferring
+			// success from which error came back.
+			writeJSONForTest(t, w, map[string]any{
+				"access_token":  "tenant-access-token",
+				"token_type":    "Bearer",
+				"refresh_token": "tenant-refresh-token",
+				"expires_in":    3600,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	base = server.URL
+	return base + "/tenant1", base + tenantPath, server.Client()
+}
+
+// TestMetadataURLReachesNonDerivedPath covers the interop gap the flag exists
+// for on the client, mirroring the server-side case.
+func TestMetadataURLReachesNonDerivedPath(t *testing.T) {
+	issuer, metadataURL, client := newTenantIssuer(t, func(base string) string { return base + "/tenant1" })
+
+	// Without the override the derived path 404s.
+	source := newTestSource(t, issuer, client, failingOpener(t))
+	if _, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback"); err == nil {
+		t.Fatal("expected discovery to fail when metadata is not at the derived path")
+	}
+
+	source = newTestSource(t, issuer, client, failingOpener(t))
+	source.metadataURL = metadataURL
+	config, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	if err != nil {
+		t.Fatalf("discovery with --oidc-metadata-url should succeed: %v", err)
+	}
+	if config.Endpoint.TokenURL == "" {
+		t.Fatal("expected the token endpoint to be resolved from the override")
+	}
+}
+
+// TestNewAuthTokenSourceAppliesMetadataURL exercises the production wiring, not
+// the test helper's.
+//
+// The other override tests set managedOIDCTokenSource.metadataURL directly, and
+// the config tests stop at parseClientConfig — so the mapping from
+// clientConfig.OIDCMetadataURL onto the token source is covered by neither, and
+// deleting it leaves them all green (verified by mutation). This test goes
+// through newAuthTokenSource against an issuer whose metadata is *only* at the
+// non-derived path, so it can only succeed if the override reaches discovery.
+func TestNewAuthTokenSourceAppliesMetadataURL(t *testing.T) {
+	issuer, metadataURL, client := newTenantIssuer(t, func(base string) string { return base + "/tenant1" })
+
+	cachePath := filepathForTest(t, "tokens.json")
+	writeTokenCacheForTest(t, cachePath, tokenCache{
+		Issuer:       issuer,
+		ClientID:     "authunnel-cli",
+		Scopes:       normalizeScopes("openid offline_access"),
+		AccessToken:  "expired-token",
+		RefreshToken: "refresh-token-1",
+		TokenType:    "Bearer",
+		Expiry:       time.Now().Add(-time.Minute),
+	})
+
+	source, err := newAuthTokenSource(clientConfig{
+		AuthMode:        authModeOIDC,
+		OIDCIssuer:      issuer,
+		OIDCMetadataURL: metadataURL,
+		OIDCClientID:    "authunnel-cli",
+		OIDCScopes:      normalizeScopes("openid offline_access"),
+		OIDCCache:       cachePath,
+		AuthHTTPClient:  client,
+		Stderr:          io.Discard,
+		// If the override does not reach discovery, the derived path 404s,
+		// the refresh fails, and the flow falls through to interactive
+		// login — which this opener turns into a failure.
+		BrowserOpener: failingOpener(t),
+	})
+	if err != nil {
+		t.Fatalf("newAuthTokenSource: %v", err)
+	}
+
+	token, err := source.AccessToken(context.Background(), false)
+	if err != nil {
+		t.Fatalf("refresh through the metadata override should succeed: %v", err)
+	}
+	if token != "tenant-access-token" {
+		t.Fatalf("token = %q, want the token issued via the non-derived metadata path", token)
+	}
+}
+
+// TestClientMetadataURLRejectsIssuerMismatch is the security test for the
+// override: relocating the document must not relocate trust. Asserts the
+// specific cause, since a network or parse failure would also produce an error
+// here and would make this pass with the binding check gone.
+func TestClientMetadataURLRejectsIssuerMismatch(t *testing.T) {
+	issuer, metadataURL, client := newTenantIssuer(t, func(string) string { return "https://attacker.example" })
+
+	source := newTestSource(t, issuer, client, failingOpener(t))
+	source.metadataURL = metadataURL
+	_, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	if err == nil {
+		t.Fatal("expected a document advertising a different issuer to be rejected")
+	}
+	if !errors.Is(err, oidc.ErrIssuerInvalid) {
+		t.Fatalf("error = %v, want %v (the issuer binding check)", err, oidc.ErrIssuerInvalid)
+	}
+}
+
+// TestDowngradeIsJudgedAgainstMetadataURLNotIssuer pins a consequence of the
+// override that is easy to get wrong: once the document can come from somewhere
+// other than the issuer, it is the *document's* transport that decides whether
+// an endpoint is downgraded. Here the issuer string is http but the metadata is
+// fetched over https, so plaintext endpoints must still be refused — judging
+// against the issuer would have let them through.
+func TestDowngradeIsJudgedAgainstMetadataURLNotIssuer(t *testing.T) {
+	plain, _ := newMetadataIssuer(t, false, sameHost("/auth"), sameHost("/token"))
+
+	// Metadata served over https, advertising the plaintext issuer string so
+	// zitadel's issuer check still passes, and plaintext endpoints.
+	var httpsBase string
+	server := newIPv4TLSTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/meta" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSONForTest(t, w, map[string]string{
+			"issuer":                 plain.URL,
+			"authorization_endpoint": plain.URL + "/auth",
+			"token_endpoint":         plain.URL + "/token",
+		})
+	}))
+	httpsBase = server.URL
+
+	source := newTestSource(t, plain.URL, server.Client(), failingOpener(t))
+	source.metadataURL = httpsBase + "/meta"
+	_, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	if err == nil {
+		t.Fatal("expected https-fetched metadata advertising plaintext endpoints to be refused")
+	}
+	if !strings.Contains(err.Error(), "non-https") {
+		t.Fatalf("error = %v, want the downgrade check judged against the metadata URL", err)
 	}
 }
 

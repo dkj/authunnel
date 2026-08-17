@@ -49,7 +49,12 @@ type clientConfig struct {
 
 	AccessToken string
 
-	OIDCIssuer       string
+	OIDCIssuer string
+	// OIDCMetadataURL overrides the well-known path derived from OIDCIssuer.
+	// It changes only where the metadata document is fetched from — the
+	// document's issuer is still checked against OIDCIssuer, which remains
+	// required.
+	OIDCMetadataURL  string
 	OIDCClientID     string
 	OIDCAudience     string
 	OIDCResource     string
@@ -90,6 +95,10 @@ Choose one authentication method (mutually exclusive):
   Managed OIDC (typical):
     --oidc-issuer <url>          OIDC issuer for managed login (required with --oidc-client-id)
     --oidc-client-id <id>        OIDC client ID (required with --oidc-issuer)
+    --oidc-metadata-url <url>    Authorization server metadata document URL, overriding the well-known
+                                 path derived from --oidc-issuer. For an authorization server publishing
+                                 RFC 8414 metadata at a path the OIDC derivation cannot construct. The
+                                 document's issuer must still match --oidc-issuer.
     --oidc-audience <string>     Auth0-style 'audience' parameter requested during managed login
     --oidc-resource <url>        RFC 8707 'resource' parameter; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)
     --oidc-scopes <scopes>       Space-delimited OIDC scopes (default: openid offline_access)
@@ -113,7 +122,7 @@ Other:
 
 Development / unsafe overrides (do not use in production):
 
-  --insecure-oidc-issuer       Allow a non-HTTPS OIDC issuer URL
+  --insecure-oidc-issuer       Allow non-HTTPS OIDC issuer and metadata URLs
   --insecure-tunnel-url        Allow a non-HTTPS tunnel endpoint URL
 `)
 }
@@ -178,6 +187,8 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.StringVar(&cfg.UnixSocketPath, "unix-socket", "proxy.sock", "Unix socket path for local SOCKS5 clients")
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
+	fs.StringVar(&cfg.OIDCMetadataURL, "oidc-metadata-url", "",
+		"Authorization server metadata document URL, overriding the well-known path derived from --oidc-issuer. For an authorization server publishing RFC 8414 metadata at a path the OIDC derivation cannot construct. The document's issuer must still match --oidc-issuer.")
 	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", "", "OIDC client ID used for managed login")
 	fs.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Auth0-style 'audience' parameter requested during managed login")
 	fs.StringVar(&cfg.OIDCResource, "oidc-resource", "", "RFC 8707 'resource' parameter requested during managed login; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)")
@@ -185,7 +196,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
 	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
 	fs.IntVar(&cfg.OIDCRedirectPort, "oidc-redirect-port", 0, "Loopback port for the OIDC callback listener; 0 chooses a random port")
-	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", false, "Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
+	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", false, "Allow non-HTTPS OIDC issuer and metadata URLs (development only; do not use in production)")
 	fs.BoolVar(&cfg.InsecureTunnelURL, "insecure-tunnel-url", false, "Allow a non-HTTPS tunnel endpoint URL (development only; do not use in production)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -212,11 +223,16 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	if cfg.OIDCRedirectPort != 0 && cfg.OIDCRedirectPort < 1024 {
 		return cfg, errors.New("--oidc-redirect-port must be 0 (random) or >= 1024; low ports are unavailable after capability hardening")
 	}
-	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCAudience != "" || cfg.OIDCResource != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
+	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCMetadataURL != "" || cfg.OIDCAudience != "" || cfg.OIDCResource != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
 		return cfg, errors.New("ACCESS_TOKEN cannot be combined with managed OIDC flags")
 	}
 	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
 		return cfg, errors.New("managed OIDC mode requires both --oidc-issuer and --oidc-client-id")
+	}
+	// The override relocates the metadata document; it does not identify the
+	// issuer, which is still what the document is checked against.
+	if cfg.OIDCMetadataURL != "" && cfg.OIDCIssuer == "" {
+		return cfg, errors.New("--oidc-metadata-url requires --oidc-issuer")
 	}
 	if cfg.AccessToken == "" && cfg.OIDCIssuer == "" {
 		return cfg, errors.New("either ACCESS_TOKEN or both --oidc-issuer and --oidc-client-id are required")
@@ -259,13 +275,34 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	default:
 		return cfg, errors.New("--tunnel-url must use one of https://, wss://, http://, or ws://")
 	}
-	if cfg.OIDCIssuer != "" {
-		issuerU, err := url.Parse(cfg.OIDCIssuer)
-		if err != nil || issuerU.Host == "" {
-			return cfg, fmt.Errorf("--oidc-issuer %q is not a valid URL", cfg.OIDCIssuer)
+	// Both URLs get the same treatment: --insecure-oidc-issuer relaxes them
+	// together, since an operator pointing at a local IdP over http needs
+	// both. It relaxes transport only — other schemes stay rejected by name
+	// rather than falling through to the generic "not a valid URL".
+	// Step 4 of the plan replaces this pair with the shared helper the server
+	// already uses; kept inline here so the two steps stay separable.
+	for _, checked := range []struct{ flag, value string }{
+		{"--oidc-issuer", cfg.OIDCIssuer},
+		{"--oidc-metadata-url", cfg.OIDCMetadataURL},
+	} {
+		if checked.value == "" {
+			continue
 		}
-		if issuerU.Scheme != "https" && !cfg.InsecureOIDCIssuer {
-			return cfg, errors.New("--oidc-issuer must use an https:// URL; use --insecure-oidc-issuer to allow plaintext (development only)")
+		u, err := url.Parse(checked.value)
+		if err != nil {
+			return cfg, fmt.Errorf("%s %q is not a valid URL", checked.flag, checked.value)
+		}
+		switch u.Scheme {
+		case "https":
+		case "http":
+			if !cfg.InsecureOIDCIssuer {
+				return cfg, fmt.Errorf("%s must use an https:// URL; use --insecure-oidc-issuer to allow plaintext (development only)", checked.flag)
+			}
+		default:
+			return cfg, fmt.Errorf("%s %q uses unsupported scheme %q; only https:// (or http:// with --insecure-oidc-issuer) is accepted", checked.flag, checked.value, u.Scheme)
+		}
+		if u.Host == "" {
+			return cfg, fmt.Errorf("%s %q is not a valid URL", checked.flag, checked.value)
 		}
 	}
 	if cfg.OIDCResource != "" {
