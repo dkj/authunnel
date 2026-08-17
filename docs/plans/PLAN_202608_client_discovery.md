@@ -392,7 +392,34 @@ treat the docs as part of the change, not as a follow-up.
      `INSECURE_OIDC_ISSUER=true` alongside the flag, since the client has no such env var. The
      flag it does name is actionable on both, and the env var stays documented in
      `docs/DEPLOYMENT.md`.
-5. Remaining docs.
+5. ✓ done — Remaining docs. Most of the list above was already folded into items 2–4, as this
+   plan required. What was left was structural rather than a backlog:
+   - **"Transport rules on the key path" was a `###` inside the server-only "Issuer metadata and
+     key discovery" section**, while documenting rules both binaries enforce, under a title that
+     no longer matched (it covers token endpoints, not just keys). Promoted to a top-level
+     "Transport rules on the auth path", with the DEPLOYMENT intro and the README doc-index entry
+     updated to say it spans both, and the README anchor repointed.
+   - **`docs/DEVELOPMENT.md` "Auth-flow invariants" would have licensed reintroducing a fixed
+     bug.** "Prefer cache, then refresh, then browser login" is exactly what item 2 had to carve
+     an exception into; as written, someone preserving the invariant would restore the
+     fall-through that turns a refusal into a doomed login prompt. The bullet now states the
+     exception and names `ErrUnsafeTransport` as how to tell the two apart, and the endpoint and
+     loopback rules are invariants there too — that list is where they belong, not only in
+     DEPLOYMENT prose.
+   - Hardening checklist gained a **client-side** entry: the server's `--insecure-oidc-issuer` says
+     nothing about the client, which is a separate process with its own flags and the side that
+     transmits the refresh token.
+   - Test-coverage list extended. The first version over-claimed — it said all redirect tests use
+     a working mirror and assert it was unreached, when only the client's token mirror did.
+     Chasing that down turned a documentation fix into a real one: the JWKS mirror recorded
+     nothing, there was no metadata-redirect test at all, and — found by removing the guard and
+     reading *why* the tests failed — both server mirrors served content that would have failed
+     anyway ("issuer does not match", "invalid signature"). They proved nothing about the guard.
+     Mirrors now serve content valid for the issuer that redirects to them, assigned after
+     construction to break the circular dependency, and a metadata-redirect test covers the third
+     fetch. With the guard removed all three now fail on "expected ... to be refused" rather than
+     on a coincidental mismatch, which is the only version of these tests worth having.
+   - All cross-document anchors verified programmatically rather than by eye.
 
 Items 3 and 4 are independent. Item 2 depends only on item 1.
 

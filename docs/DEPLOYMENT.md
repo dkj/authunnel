@@ -1,6 +1,6 @@
 # Deploying Authunnel
 
-This guide covers running the Authunnel server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, and the pre-production hardening checklist. For the security model these controls implement, see the [Security Posture](../README.md#security-posture) section of the README.
+This guide covers running the Authunnel server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, and the pre-production hardening checklist. One section — [Transport rules on the auth path](#transport-rules-on-the-auth-path) — applies to the client as well, since both binaries enforce the same rules on the endpoints an issuer advertises. For the security model these controls implement, see the [Security Posture](../README.md#security-posture) section of the README.
 
 The **server** runs on Linux and macOS. The examples below use `go run` from a source checkout. When using released binaries, invoke `authunnel-server` with the same flags and environment variables.
 
@@ -168,11 +168,12 @@ running server rather than inferred from deployment config.
 `--oidc-issuer` is required in all three. It is the value enforced as the `iss` claim on every
 token; under `pinned_jwks` it is the *only* thing binding accepted tokens to an issuer.
 
-### Transport rules on the key path
+## Transport rules on the auth path
 
-Signing keys decide whether a token is genuine, and on the client the token endpoint receives the
-refresh token, so neither side will use an endpoint reached over a weaker transport than the
-metadata that named it. Two independent rules:
+These apply to **both** binaries, which is why they sit outside the server section above.
+Signing keys decide whether a token is genuine, and on the client the token endpoint receives
+the refresh token, so neither side will use an endpoint reached over a weaker transport than
+the metadata that named it. Two independent rules:
 
 **Endpoints must be `http(s)` URLs with a host.** Applied to `jwks_uri` on the server and to
 `authorization_endpoint` and `token_endpoint` on the client, in **every** mode — including under
@@ -261,6 +262,7 @@ Before going to production, verify:
 - [ ] OIDC issuer is `https://` — `--insecure-oidc-issuer` is **not** set.
 - [ ] Issuer metadata is discovered rather than bypassed. The startup log line `token_validator_ready` reports `discovery_mode`; `derived` is the default. If it reports `pinned_jwks`, confirm the `--oidc-jwks-uri` value really belongs to the configured issuer — the server cannot verify that binding for itself in this mode, and it is logged at warn level for that reason. If it reports `metadata_url`, the binding is still verified, but check the URL is one you control.
 - [ ] Tunnel endpoint is `https://` or `wss://` — `--insecure-tunnel-url` is **not** set on the client.
+- [ ] The client's `--oidc-issuer` (and `--oidc-metadata-url`, if used) are `https://`, and `--insecure-oidc-issuer` is **not** set on the client either. The server's setting does not cover the client: it is a separate process with its own flags, and it is the side that transmits the refresh token.
 - [ ] Token-expiry enforcement is active — `--no-connection-token-expiry` is **not** set. By default, tunnels close when the access token expires and clients must refresh. Disabling this removes token expiry as a tunnel lifetime control; tunnels will still close at `--max-connection-duration` if set, but without that limit they persist until the client disconnects.
 - [ ] At least one `--allow` rule is configured. `--allow-open-egress` should only appear in deployments where arbitrary authenticated egress from the server host is explicitly acceptable.
 - [ ] The default `--ip-block` set is in effect (loopback, link-local incl. IMDS, unspecified, multicast), or any deviation via `--ip-block` / `--no-ip-block` is intentional and documented for the deployment.
