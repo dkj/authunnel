@@ -98,6 +98,12 @@ func newAuthTokenSource(cfg clientConfig) (authTokenSource, error) {
 			// client through cfg.AuthHTTPClient.
 			client = authhttp.NewBoundedClient()
 		}
+		// Applied here rather than relying on NewBoundedClient, which sets
+		// the same policy: an injected client must not be able to opt out of
+		// it. This path carries the refresh token and the authorization code,
+		// so a redirect off https would disclose a credential rather than
+		// merely weaken a fetch of public material.
+		client = authhttp.RefuseTransportDowngrade(client)
 		output := cfg.Stderr
 		if output == nil {
 			output = io.Discard
@@ -172,6 +178,15 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 			}
 			return refreshed.AccessToken, nil
 		}
+		// Falling through to interactive login is right for an expired or
+		// revoked refresh token: a fresh login fixes it. It is wrong for a
+		// refusal to use the endpoint at all — the interactive flow ends at
+		// the same token endpoint, so it would open a browser, walk the user
+		// through authenticating, and then fail identically. Surface the
+		// real reason instead.
+		if errors.Is(err, authhttp.ErrUnsafeTransport) {
+			return "", err
+		}
 	}
 
 	token, err := s.interactiveToken(ctx)
@@ -193,6 +208,23 @@ func (s *managedOIDCTokenSource) oauthConfig(ctx context.Context, redirectURL st
 		discovery, err := oidcclient.Discover(context.WithValue(ctx, oauth2.HTTPClient, s.httpClient), s.issuer, s.httpClient)
 		if err != nil {
 			return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
+		}
+		// Validate both endpoints before either is used. token_endpoint
+		// receives the refresh token and the authorization code;
+		// authorization_endpoint is handed to the OS URL dispatcher, which
+		// will launch whatever application claims the scheme, so
+		// CheckEndpointURL is the whole of the protection there — the
+		// redirect guard on s.httpClient never sees that leg.
+		for _, endpoint := range []struct{ label, value string }{
+			{"authorization_endpoint", discovery.AuthorizationEndpoint},
+			{"token_endpoint", discovery.TokenEndpoint},
+		} {
+			if err := authhttp.CheckEndpointURL(endpoint.label, endpoint.value); err != nil {
+				return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
+			}
+			if err := authhttp.CheckNoSchemeDowngrade(endpoint.label, s.issuer, endpoint.value); err != nil {
+				return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
+			}
 		}
 		s.discovery = oauth2.Endpoint{
 			AuthURL:   discovery.AuthorizationEndpoint,

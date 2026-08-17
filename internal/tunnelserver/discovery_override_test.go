@@ -318,6 +318,54 @@ func TestInjectedRedirectPolicyIsPreserved(t *testing.T) {
 	}
 }
 
+// TestPlaintextMetadataRejectsNonHTTPJWKSURI closes the gap the downgrade check
+// alone leaves: over an http metadata source nothing is a downgrade, so every
+// scheme would otherwise pass. Failing here rather than inside the transport
+// also turns an opaque "unsupported protocol scheme" at first-token time into a
+// startup error naming the field.
+func TestPlaintextMetadataRejectsNonHTTPJWKSURI(t *testing.T) {
+	for _, tt := range []struct{ name, jwksURI, want string }{
+		{name: "file scheme", jwksURI: "file:///etc/authunnel/jwks.json", want: `unsupported scheme "file"`},
+		{name: "host-less", jwksURI: "https:relative-path", want: "absolute URL with a host"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			issuer := newFakeIssuer(t, fakeIssuerConfig{
+				metadataPaths:   []string{oidcWellKnownPath},
+				jwksURIOverride: tt.jwksURI,
+			})
+
+			_, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
+				Issuer:     issuer.URL,
+				Audience:   "test-aud",
+				HTTPClient: issuer.server.Client(),
+			})
+			if err == nil {
+				t.Fatalf("expected jwks_uri %q to be rejected", tt.jwksURI)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// TestPinnedJWKSURIIsValidated covers the same rule on the pinned path. The
+// server's config layer checks this too, but the constructor is exported and
+// must not rely on its caller having done so.
+func TestPinnedJWKSURIIsValidated(t *testing.T) {
+	issuer := newFakeIssuer(t, fakeIssuerConfig{metadataPaths: []string{oidcWellKnownPath}})
+
+	_, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
+		Issuer:     issuer.URL,
+		Audience:   "test-aud",
+		JWKSURI:    "file:///etc/authunnel/jwks.json",
+		HTTPClient: issuer.server.Client(),
+	})
+	if err == nil || !strings.Contains(err.Error(), `unsupported scheme "file"`) {
+		t.Fatalf("error = %v, want the pinned JWKS URI to be rejected by scheme", err)
+	}
+}
+
 // TestMetadataURLReachesNonDerivedPath covers the interop gap the flag exists
 // for: an authorization server whose metadata sits at a path the OIDC
 // derivation cannot construct.

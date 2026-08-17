@@ -153,6 +153,13 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 	httpClient := authhttp.RefuseTransportDowngrade(cfg.HTTPClient)
 
 	jwksURI, mode := cfg.JWKSURI, DiscoveryModePinnedJWKS
+	if jwksURI != "" {
+		// The server's config layer already checks this, but the constructor
+		// is exported and must not depend on its caller having done so.
+		if err := authhttp.CheckEndpointURL("jwks_uri", jwksURI); err != nil {
+			return nil, "", err
+		}
+	}
 	if jwksURI == "" {
 		// Discover ignores an empty wellKnownUrl, so the default derived
 		// path needs no branch here. On both paths it enforces that the
@@ -167,17 +174,17 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 		if err != nil {
 			return nil, "", fmt.Errorf("discover issuer metadata: %w", err)
 		}
-		if discovery.JwksURI == "" {
-			return nil, "", errors.New("issuer discovery did not advertise jwks_uri")
+		// Two checks, because neither subsumes the other. The first is
+		// absolute — the endpoint must be a real http(s) URL, which also
+		// covers the empty case. The second is relative to how the metadata
+		// arrived: a document fetched over https must not be able to send
+		// the key fetch to a plaintext endpoint. Over an http metadata
+		// source the second passes everything, which is why the first is
+		// not redundant.
+		if err := authhttp.CheckEndpointURL("jwks_uri", discovery.JwksURI); err != nil {
+			return nil, "", err
 		}
-		// The metadata document chooses the JWKS endpoint, so a document
-		// fetched over https must not be able to send the key fetch to a
-		// plaintext one. Judged against the scheme the metadata itself was
-		// fetched over rather than a separate flag: if metadata already
-		// travelled in clear text there is no downgrade left to prevent,
-		// and that case is exactly the local development setup the config
-		// layer already gates behind --insecure-oidc-issuer.
-		if err := authhttp.CheckNoSchemeDowngrade(metadataSource, discovery.JwksURI); err != nil {
+		if err := authhttp.CheckNoSchemeDowngrade("jwks_uri", metadataSource, discovery.JwksURI); err != nil {
 			return nil, "", err
 		}
 		jwksURI, mode = discovery.JwksURI, DiscoveryModeDerived

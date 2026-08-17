@@ -7,9 +7,10 @@
 // either side's auth path open indefinitely. Tests still inject custom clients
 // through the existing constructor seams.
 //
-// The downgrade guards in downgrade.go are applied by callers rather than baked
-// into NewBoundedClient, so they hold for injected clients too. Only the
-// server-side validator calls them today; the managed client does not yet.
+// NewBoundedClient applies the redirect guard from downgrade.go by default.
+// Callers apply it explicitly as well, so the guarantee survives a caller
+// injecting its own client — the double wrap is harmless, since the outer
+// policy delegates to the inner one.
 package authhttp
 
 import (
@@ -49,8 +50,8 @@ func NewBoundedClient() *http.Client {
 		ResponseHeaderTimeout: defaultResponseHeaders,
 		ExpectContinueTimeout: time.Second,
 	}
-	return &http.Client{
+	return RefuseTransportDowngrade(&http.Client{
 		Transport: transport,
 		Timeout:   defaultClientTimeout,
-	}
+	})
 }

@@ -170,18 +170,38 @@ token; under `pinned_jwks` it is the *only* thing binding accepted tokens to an 
 
 ### Transport rules on the key path
 
-Signing keys decide whether a token is genuine, so the server refuses to fetch them over a
-weaker transport than the metadata that named them:
+Signing keys decide whether a token is genuine, and on the client the token endpoint receives the
+refresh token, so neither side will use an endpoint reached over a weaker transport than the
+metadata that named it. Two independent rules:
 
-- issuer metadata retrieved over `https` may not advertise a plaintext `jwks_uri` — startup fails;
-- a redirect may not move a metadata or JWKS fetch off `https`. Go follows cross-scheme redirects
-  silently, so this is enforced explicitly rather than inherited from the HTTP client;
-- an issuer already served over `http` — development only, behind `--insecure-oidc-issuer` — has
-  no downgrade left to prevent and is unaffected.
+**Endpoints must be `http(s)` URLs with a host.** Applied to `jwks_uri` on the server and to
+`authorization_endpoint` and `token_endpoint` on the client, in **every** mode — including under
+`--insecure-oidc-issuer`, which relaxes transport security but does not widen permitted schemes.
+This is what keeps a scheme like `file://` or a custom app scheme out of the authorization URL,
+which the client hands to the OS URL dispatcher (`open`, `xdg-open`, `ShellExecute`) — those
+launch whatever application claims the scheme, not only a browser.
 
-These rules apply to the **server's** validator. The managed client fetches its own metadata and
-token endpoints and is not covered by them; keep client-side issuer URLs on `https`, which the
-client already requires unless `--insecure-oidc-issuer` is set.
+**No downgrade relative to the metadata source.** Metadata retrieved over `https` may not
+advertise plaintext endpoints, and a redirect may not move a metadata, JWKS, or token fetch off
+`https`. Go follows cross-scheme redirects silently, so this is enforced explicitly rather than
+inherited from the HTTP client. An issuer already served over `http` — development only, behind
+`--insecure-oidc-issuer` — has no downgrade left to prevent and is unaffected; the first rule
+still applies there.
+
+The two are not interchangeable: over an `http` metadata source nothing is a downgrade, so the
+second rule passes everything and the first is the only thing filtering schemes.
+
+**When they fire** differs by rule, and not all of it is at startup. On the server, the endpoint
+checks run during discovery, so a bad or downgraded `jwks_uri` fails startup — but the redirect
+rule cannot, because the key set is fetched lazily on the first token verified (see above). A
+JWKS endpoint that redirects off `https` therefore surfaces on the first authenticated request,
+as a rejected token rather than a failed boot. Under `--oidc-jwks-uri` the pinned URL is checked
+at startup while everything about the fetch is deferred the same way.
+
+On the client a refusal is **terminal** — it does not fall back to interactive login, because the
+browser flow ends at the same token endpoint and would fail identically after walking the user
+through authenticating. The PKCE loopback callback (`http://127.0.0.1:…`) is deliberately outside
+all of this: it is RFC 8252's native-app pattern and never leaves the host.
 
 ## Egress rules and the resolved-IP deny-list
 
