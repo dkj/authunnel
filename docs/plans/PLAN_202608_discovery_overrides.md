@@ -24,8 +24,11 @@ Three consequences:
 
 ## Goals
 
-- Let the operator point at an arbitrary metadata document URL **without** weakening the
-  issuer↔metadata binding that makes discovery safe.
+- Let the operator point at an arbitrary metadata document URL, accepting a *stated* reduction
+  in the issuer↔metadata binding rather than pretending to preserve it. As first written this
+  goal claimed the binding was preserved — see "Security invariants" for why that was wrong.
+  What the override must not do is change which issuer *name* is accepted, or silently relax
+  anything the default path guarantees.
 - Let the operator bypass discovery entirely by pinning `jwks_uri`, removing the startup
   dependency on the IdP.
 - Keep the default path byte-for-byte unchanged.
@@ -62,10 +65,12 @@ the discovery URL. These overrides replace only the second job. The first is irr
 
 - under `--oidc-metadata-url` the issuer does *more* work than in the default path — it is
   both the `iss` enforcement value and the cross-check against `doc.issuer` inside
-  `client.Discover`. Dropping it would delete the mix-up defence that justifies the override.
+  `client.Discover`. Dropping it would delete the only check that catches an honestly-wrong URL.
 - under `--oidc-jwks-uri` there is no document to cross-check, so `iss` enforcement is the
   only thing binding tokens to an issuer at all. Without it the server would accept a token
-  from *any* issuer whose signature verified against the pinned key set.
+  from *any* issuer whose signature verified against the pinned key set. Note the scope of that
+  argument: it justifies keeping the flag, and does not make the mode safe against a hostile key
+  source — an attacker holding those keys satisfies the `iss` check trivially.
 
 So the existing requirement at `server/server.go:729-731` is unchanged. This is a no-op in
 code and therefore needs an explicit test — "if the JWKS is pinned, why is the issuer still
@@ -144,19 +149,39 @@ naming (`tls_key_file_unsafe`, `server_exited`):
 
 These are the load-bearing parts of the design; reviewers should check them specifically.
 
-**Metadata URL does not weaken the issuer binding.** Routing through `client.Discover` keeps
-zitadel's `doc.issuer == cfg.Issuer` check, which is what defends against a mix-up attack
-where an attacker-influenced metadata URL hands back another AS's `jwks_uri`. The operator
-chooses the *transport*; the document must still self-identify as the configured issuer.
-This is why there is no skip-issuer-check flag — that would remove the only thing making the
-override safe.
+**Metadata URL does weaken the issuer binding, and this plan originally said it did not.**
+The default path derives the well-known URL from the issuer, so the document arrives from the
+issuer's own host over TLS — an authenticated origin. `--oidc-metadata-url` replaces that with a
+host the operator names, and the only remaining check is `doc.issuer == cfg.Issuer`, comparing a
+field the document asserts about *itself*. Any host can echo the expected issuer and advertise
+attacker-controlled keys, which this server would then accept for tokens claiming that issuer.
 
-**Pinned JWKS is an operator assertion, and that is acceptable.** No metadata document exists
-to cross-check, so the issuer↔keys binding comes from the operator. It stays safe because
-every token still has `iss` verified against `cfg.Issuer` by the Zitadel verifier, `aud`
-checked at `tunnelserver.go:97`, and the claim checks at `tunnelserver.go:100` applied
-unchanged. The pinned URL is configuration from the same trust domain as `--oidc-issuer`
-itself.
+So the binding moves from *verified* to *resting on the operator's choice of URL*. That is an
+acceptable trade — it is ordinary trusted configuration, like `--oidc-issuer` itself — but it
+must be documented as a trade rather than as a preserved guarantee, because an operator deciding
+whether to use the flag is deciding exactly that.
+
+The `doc.issuer` check still earns its place: it catches an *honestly* wrong URL — a different
+tenant, a staging AS — which a legitimate server reveals by declaring its own issuer. That is
+also why there is no skip-issuer-check flag: it would remove the only error this mode still
+catches for you.
+
+**Pinned JWKS is an operator assertion, and the safety rests on that assertion alone.** No
+metadata document exists to cross-check, so the issuer↔keys binding comes entirely from the
+operator: whoever controls the pinned URL controls which keys this server accepts.
+
+An earlier version of this section said the mode "stays safe because" `iss`, `aud` and the
+claim checks still apply. That is wrong, and it is the same error as the metadata-URL invariant
+above. Those checks constrain what a token may *say*; they say nothing about who may *sign* it.
+An attacker serving the pinned URL mints tokens carrying `iss` equal to `cfg.Issuer`, `aud`
+equal to the configured audience, a plausible `sub`, and sane `iat`/`nbf`/`exp` — every check
+passes, because the checks were never the thing standing between an attacker and a valid token.
+
+What makes the mode acceptable is narrower and should be stated as such: the pinned URL is
+configuration from the same trust domain as `--oidc-issuer` itself, so an operator who can set
+it wrongly could equally have set the issuer wrongly. The claim checks still matter — they bound
+what a *legitimately keyed* token may assert — but they are downstream of the trust decision,
+not a substitute for it. This is why the mode logs at warn level.
 
 **Key rotation still works.** `rp.NewRemoteKeySet` caches and refetches on an unknown `kid`,
 so pinning `jwks_uri` does not freeze the key material — only the endpoint.
@@ -337,9 +362,11 @@ Findings from review after the above was written, all now fixed:
   issuer discovery and the issuer's JWKS", which under `pinned_jwks` describes something that
   did not happen. The audit risk is specific: a reader would assume the issuer-to-keys binding
   was *discovered* when it was *asserted*. Rewritten to distinguish the two and to state the part
-  that does not vary — the verifier pins the configured issuer, so a pinned key set widens which
-  keys are trusted, never which issuer is. This comment had been read and consciously left alone
-  earlier in the work as "still broadly accurate"; it was not.
+  that does not vary — the verifier pins the configured issuer. Note the limit of that
+  reassurance, which a later round had to correct here and in the code: pinning the issuer fixes
+  which issuer a token may *name*, not which keys may sign for it, so against attacker-supplied
+  keys it constrains nothing. This comment had been read and consciously left alone earlier in
+  the work as "still broadly accurate"; it was not.
 - **Sweep for the same class of defect** rather than waiting for it to be reported again. Two
   more found: `startupAuthTimeout`'s comment claimed to bound discovery without noting it bounds
   nothing under `--oidc-jwks-uri` and never bounded the lazy JWKS fetch in any mode; and
@@ -353,6 +380,9 @@ Findings from review after the above was written, all now fixed:
 Not done, unchanged from the non-goals: the client-side equivalent (`client/auth.go`) and
 RFC 9728 protected-resource metadata. **The client shares
 `internal/authhttp.NewBoundedClient` and fetches its own metadata and token endpoints without
-the downgrade guard, which now lives in `tunnelserver`.** Worth considering whether that guard
-belongs in `authhttp` so both sides inherit it — deliberately out of scope here rather than
-overlooked.
+the downgrade guard, which now lives in `tunnelserver`.**
+
+That gap is now planned in [PLAN_202608_client_discovery.md](PLAN_202608_client_discovery.md),
+which also records why it deserves higher priority than it looked here: the server-side downgrade
+substitutes *public* keys, while the client-side one puts a **refresh token** on the wire in
+clear text. Same mechanics, materially worse consequence.

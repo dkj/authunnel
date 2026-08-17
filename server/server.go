@@ -12,7 +12,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -55,8 +54,10 @@ const httpServerMaxHeaderBytes = 16 * 1024
 type serverConfig struct {
 	Issuer string
 	// OIDCMetadataURL overrides the well-known path derived from Issuer.
-	// Mutually exclusive with OIDCJWKSURI. Changes only where metadata is
-	// fetched from — the document's issuer is still checked against Issuer.
+	// Mutually exclusive with OIDCJWKSURI. Changes where metadata is fetched
+	// from. The document's issuer is compared against Issuer, but that field
+	// is self-asserted, so the comparison catches an honest wrong URL rather
+	// than a hostile one — this value needs the same trust as Issuer.
 	OIDCMetadataURL string
 	// OIDCJWKSURI pins the key set endpoint and skips metadata discovery
 	// entirely. Mutually exclusive with OIDCMetadataURL. Neither field
@@ -126,9 +127,10 @@ func serverUsage(w io.Writer) {
 Flags and their environment variable equivalents:
 
   --oidc-issuer <url>        OIDC issuer URL for JWT discovery and validation (env: OIDC_ISSUER).
-                             Required in every mode: it is enforced as the token 'iss' claim, and the
-                             overrides below change only where the key set is found, never which
-                             issuer is trusted.
+                             Required in every mode: it is enforced as the token 'iss' claim. The
+                             overrides below change where the key set is found — which fixes the
+                             issuer name accepted, but not which keys may sign for it, so treat
+                             them as trusted configuration.
   --oidc-metadata-url <url>  Authorization server metadata document URL, overriding the well-known
                              path derived from --oidc-issuer (env: OIDC_METADATA_URL). For an
                              authorization server publishing RFC 8414 metadata at a path the OIDC
@@ -389,38 +391,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-}
-
-// validateAuthURL applies the shared shape and scheme rules to the issuer and
-// the two discovery-override URLs.
-//
-// Schemes other than http(s) are rejected by name rather than falling through
-// to the generic "not a valid URL" message. file:// is the one operators
-// actually reach for — to load a JWKS off disk in an air-gapped or zero-egress
-// deployment — and it is refused deliberately, including under
-// --insecure-oidc-issuer: that flag relaxes transport security for a local
-// development IdP, it does not widen the set of permitted schemes. Serving a
-// JWKS from disk needs a separate flag with its own code path, because routing
-// file:// through the shared auth HTTP client would make local files reachable
-// from any redirect that client follows.
-func validateAuthURL(flagName, raw string, allowInsecure bool) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("%s %q is not a valid URL", flagName, raw)
-	}
-	switch u.Scheme {
-	case "https":
-	case "http":
-		if !allowInsecure {
-			return fmt.Errorf("%s must use an https:// URL; use --insecure-oidc-issuer or INSECURE_OIDC_ISSUER=true to allow plaintext (development only)", flagName)
-		}
-	default:
-		return fmt.Errorf("%s %q uses unsupported scheme %q; only https:// (or http:// with --insecure-oidc-issuer) is accepted", flagName, raw, u.Scheme)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("%s %q is not a valid URL", flagName, raw)
-	}
-	return nil
 }
 
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {
@@ -815,22 +785,26 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	// below replace only where the key set is *found*; the issuer is what is
 	// enforced as the `iss` claim on every token, and under --oidc-jwks-uri
 	// it is the only thing binding accepted tokens to an issuer at all.
+	//
+	// That is an argument for requiring the flag, not a claim that the mode is
+	// safe without trusting the key source: whoever controls the keys can mint
+	// a token naming any issuer, this one included.
 	if cfg.Issuer == "" {
 		return cfg, errors.New("--oidc-issuer or OIDC_ISSUER is required")
 	}
-	if err := validateAuthURL("--oidc-issuer", cfg.Issuer, cfg.InsecureOIDCIssuer); err != nil {
+	if err := authhttp.CheckConfiguredURL("--oidc-issuer", cfg.Issuer, cfg.InsecureOIDCIssuer); err != nil {
 		return cfg, err
 	}
 	if cfg.OIDCMetadataURL != "" && cfg.OIDCJWKSURI != "" {
 		return cfg, errors.New("--oidc-metadata-url and --oidc-jwks-uri are mutually exclusive; set at most one")
 	}
 	if cfg.OIDCMetadataURL != "" {
-		if err := validateAuthURL("--oidc-metadata-url", cfg.OIDCMetadataURL, cfg.InsecureOIDCIssuer); err != nil {
+		if err := authhttp.CheckConfiguredURL("--oidc-metadata-url", cfg.OIDCMetadataURL, cfg.InsecureOIDCIssuer); err != nil {
 			return cfg, err
 		}
 	}
 	if cfg.OIDCJWKSURI != "" {
-		if err := validateAuthURL("--oidc-jwks-uri", cfg.OIDCJWKSURI, cfg.InsecureOIDCIssuer); err != nil {
+		if err := authhttp.CheckConfiguredURL("--oidc-jwks-uri", cfg.OIDCJWKSURI, cfg.InsecureOIDCIssuer); err != nil {
 			return cfg, err
 		}
 	}

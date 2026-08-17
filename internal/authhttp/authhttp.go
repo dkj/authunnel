@@ -1,9 +1,16 @@
-// Package authhttp provides a small bounded *http.Client for OIDC discovery,
-// JWKS, and token endpoint traffic. Both the server-side validator and the
-// managed client share the same transport defaults so a stalled or
-// attacker-controlled issuer cannot hold either side's auth path open
-// indefinitely. Tests still inject custom clients through the existing
-// constructor seams.
+// Package authhttp provides the shared transport policy for OIDC discovery,
+// JWKS, and token endpoint traffic: a small bounded *http.Client, plus the
+// guards that keep that traffic on https.
+//
+// Both the server-side validator and the managed client share the same
+// transport defaults so a stalled or attacker-controlled issuer cannot hold
+// either side's auth path open indefinitely. Tests still inject custom clients
+// through the existing constructor seams.
+//
+// NewBoundedClient applies the redirect guard from downgrade.go by default.
+// Callers apply it explicitly as well, so the guarantee survives a caller
+// injecting its own client — the double wrap is harmless, since the outer
+// policy delegates to the inner one.
 package authhttp
 
 import (
@@ -43,8 +50,8 @@ func NewBoundedClient() *http.Client {
 		ResponseHeaderTimeout: defaultResponseHeaders,
 		ExpectContinueTimeout: time.Second,
 	}
-	return &http.Client{
+	return RefuseTransportDowngrade(&http.Client{
 		Transport: transport,
 		Timeout:   defaultClientTimeout,
-	}
+	})
 }

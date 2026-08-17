@@ -31,7 +31,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 
 ## Documentation
 
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist. Also the [transport rules on the auth path](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path), which both binaries enforce.
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building and testing from source: codebase layout, auth-flow invariants, the test suite, and the local Keycloak environment.
 - [examples/](examples/) — runnable CloudFormation templates that stand up a complete Authunnel topology on AWS, so you can see it working end to end before deploying on your own infrastructure.
 
@@ -91,7 +91,7 @@ The following properties are enforced by default with no silent bypass. Where a 
 
 - **Bearer token validation** at the WebSocket layer before any SOCKS5 connection can be attempted: signature, issuer, audience (`aud`), expiry (`exp`), non-empty subject (`sub`), not-before (`nbf` must be usable at admission time, with a 30-second clock-skew allowance), and sane issued-at (`iat` must not be meaningfully in the future). The bearer token is length-capped at 8 KiB and the `Authorization` header at 8 KiB + 64 bytes before the verifier runs, so anonymous callers cannot push oversized payloads onto the JWT parser. The `http.Server` request-header memory cap is also lowered from Go's 1 MiB default to 16 KiB as a defence-in-depth boundary against oversized non-bearer headers.
 - **Bounded issuer metadata and JWKS fetches**: both the server-side validator and the managed client share an HTTP transport with conservative dial, TLS-handshake, response-header, and overall timeouts. A stalled or unreachable issuer fails closed instead of holding startup or in-flight token validation open. Server startup wraps metadata discovery in a 30-second context, so a misconfigured issuer surfaces as a fast `create token validator` error. Under `--oidc-jwks-uri` there is no startup fetch to bound, so that check moves to the first authenticated request instead.
-- **No transport downgrade on the server's key path**: the server refuses to fetch signing keys over a weaker transport than the metadata that named them — an `https` document may not advertise a plaintext `jwks_uri`, and redirects may not move a metadata or JWKS fetch off `https`. This covers the server-side validator only; the managed client's own metadata and token fetches are not guarded. Details and scope in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#transport-rules-on-the-key-path).
+- **No transport downgrade on the auth path**: neither side will fetch credentials or signing keys over a weaker transport than the metadata that named them. An `https` metadata document may not advertise plaintext endpoints, and redirects may not move a metadata, JWKS, or token fetch off `https`. Advertised endpoints must be `http(s)` URLs with a host in every mode, including under `--insecure-oidc-issuer` — this is what keeps a scheme like `file://` out of the authorization URL that the client hands to the OS. On the client, a refusal is terminal rather than falling back to an interactive login that would fail the same way. The PKCE loopback callback stays plaintext by design (RFC 8252). Details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path).
 - **Subject pinning during token refresh**: the server rejects any refreshed token whose `sub` differs from the original tunnel's subject.
 - **Refresh deadline enforcement**: a refreshed token whose `nbf` falls after the current enforced connection deadline (`exp + --expiry-grace`) is rejected. A refresh handover cannot silently extend the policy beyond what the operator has opted into. The comparison is strict — no additional clock-skew allowance applies beyond `--expiry-grace`.
 - **Secure transport by default**: the OIDC issuer URL must be `https://`; the client's tunnel endpoint URL must be `https://` or `wss://`. Plaintext variants require explicit override flags (see the development-only overrides in the [server flag reference](docs/DEPLOYMENT.md#server-flags-and-environment-variables)).
@@ -176,6 +176,7 @@ Useful client flags:
 
 - `--oidc-issuer`
 - `--oidc-client-id`
+- `--oidc-metadata-url` to fetch the authorization server metadata document from a URL other than the well-known path derived from `--oidc-issuer`; needed for an authorization server publishing RFC 8414 metadata, which inserts the well-known segment before the path component. The document's `issuer` is compared against `--oidc-issuer`, but a document asserts that field itself, so the check catches an honestly-wrong URL rather than a hostile one. **Changing this value discards the token cache and requires a fresh login.** That is deliberate: the document names the token endpoint your credentials are posted to, and the issuer check only compares a string the document supplies about itself — it cannot prove the metadata host speaks for that issuer. Discarding the cache stops an already-issued refresh token being handed over silently. It is not a defence against an untrustworthy metadata URL: complete the fallback login and the authorization code still goes wherever that document says. Point this flag only at a URL you trust as much as the issuer itself
 - `--oidc-audience` to send the Auth0-style `audience` parameter during managed login
 - `--oidc-resource` to send the RFC 8707 `resource` parameter during managed login; required by providers that bind the token `aud` to a requested resource, such as AWS Cognito
 - `--oidc-redirect-port` to use a fixed loopback callback port instead of a random one
@@ -185,7 +186,7 @@ Useful client flags:
 - `--tunnel-url` — tunnel endpoint URL. Secure schemes `https://` and `wss://` are accepted by default; plaintext `http://` and `ws://` require `--insecure-tunnel-url`. **Required.** May also be supplied via the `AUTHUNNEL_TUNNEL_URL` environment variable (the flag takes precedence)
 - `--unix-socket`
 - `--proxycommand`
-- `--insecure-oidc-issuer` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
+- `--insecure-oidc-issuer` — allow non-HTTPS OIDC issuer and metadata URLs **(development only; do not use in production)**. Relaxes transport security only; other schemes such as `file://` stay rejected
 - `--insecure-tunnel-url` — allow a non-HTTPS tunnel endpoint URL **(development only; do not use in production)**
 
 On first use the client prints the authorization URL to `stderr` and tries to open the system browser. Subsequent runs reuse the cache or refresh token when possible.

@@ -1,6 +1,6 @@
 # Deploying Authunnel
 
-This guide covers running the Authunnel server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, and the pre-production hardening checklist. For the security model these controls implement, see the [Security Posture](../README.md#security-posture) section of the README.
+This guide covers running the Authunnel server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, and the pre-production hardening checklist. One section — [Transport rules on the auth path](#transport-rules-on-the-auth-path) — applies to the client as well, since both binaries enforce the same rules on the endpoints an issuer advertises. For the security model these controls implement, see the [Security Posture](../README.md#security-posture) section of the README.
 
 The **server** runs on Linux and macOS. The examples below use `go run` from a source checkout. When using released binaries, invoke `authunnel-server` with the same flags and environment variables.
 
@@ -87,7 +87,7 @@ For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origi
 ## Server flags and environment variables
 
 - `--oidc-issuer` or `OIDC_ISSUER` — **required in every mode.** This is the identity anchor: it is enforced as the `iss` claim on every token, and on the discovery paths the metadata document's own `issuer` must match it. The two overrides below change only *where the key set is found*; neither replaces this
-- `--oidc-metadata-url` or `OIDC_METADATA_URL` — authorization server metadata document URL, overriding the well-known path derived from the issuer. Use this for an authorization server that publishes RFC 8414 metadata at a path the OIDC derivation cannot construct (RFC 8414 inserts the well-known segment *before* the path component, so an issuer of `https://as.example/tenant1` publishes at `https://as.example/.well-known/oauth-authorization-server/tenant1`), or whose metadata sits off the issuer path entirely. The document's `issuer` is still verified against `--oidc-issuer`, so this changes the transport without weakening the binding. Mutually exclusive with `--oidc-jwks-uri`
+- `--oidc-metadata-url` or `OIDC_METADATA_URL` — authorization server metadata document URL, overriding the well-known path derived from the issuer. Use this for an authorization server that publishes RFC 8414 metadata at a path the OIDC derivation cannot construct (RFC 8414 inserts the well-known segment *before* the path component, so an issuer of `https://as.example/tenant1` publishes at `https://as.example/.well-known/oauth-authorization-server/tenant1`), or whose metadata sits off the issuer path entirely. The document's `issuer` is compared against `--oidc-issuer`, but a document asserts that field about itself, so the comparison catches an honestly-wrong URL rather than a hostile one. Unlike the derived path — which fetches from the issuer's own host over TLS, an authenticated origin — this mode rests on your choice of URL. Trust it as much as you trust `--oidc-issuer`. Mutually exclusive with `--oidc-jwks-uri`
 - `--oidc-jwks-uri` or `OIDC_JWKS_URI` — pinned JWKS endpoint. Skips metadata discovery entirely, so the server makes **no network call at startup** and comes up even when the issuer is unreachable. Two consequences to weigh: a wrong URL surfaces on the first protected request rather than at startup, and because there is no metadata document to cross-check, the issuer-to-keys binding is asserted by you rather than verified by the server. Key rotation still works — the key set refetches on an unrecognised `kid`, so only the endpoint is fixed, not the key material. Mutually exclusive with `--oidc-metadata-url`
 - `--token-audience` or `TOKEN_AUDIENCE`
 - `--listen-addr` or `LISTEN_ADDR` (default varies by TLS mode; see above)
@@ -146,7 +146,7 @@ running server rather than inferred from deployment config.
 | `discovery_mode` | Set by | Startup network call | Issuer-to-keys binding |
 | --- | --- | --- | --- |
 | `derived` (default) | nothing; derived from `--oidc-issuer` | yes | verified |
-| `metadata_url` | `--oidc-metadata-url` | yes | verified |
+| `metadata_url` | `--oidc-metadata-url` | yes | rests on the operator-supplied URL |
 | `pinned_jwks` | `--oidc-jwks-uri` | **no** | **asserted by the operator** |
 
 - **`derived`** — OIDC discovery at `<issuer>/.well-known/openid-configuration`. Correct for
@@ -155,9 +155,12 @@ running server rather than inferred from deployment config.
   publishes RFC 8414 metadata, which inserts the well-known segment *before* the path component
   (`https://as.example/tenant1` publishes at
   `https://as.example/.well-known/oauth-authorization-server/tenant1`), or when metadata sits off
-  the issuer path entirely. The document's `issuer` is still checked against `--oidc-issuer`, so
-  this changes where metadata is fetched from, never which issuer is trusted. A document
-  advertising a different issuer is refused at startup.
+  the issuer path entirely. A document advertising a *different* issuer is refused at startup —
+  which catches an honestly-wrong URL, since a legitimate server declares its own issuer. It does
+  not catch a hostile one: that field is self-asserted, so a document anywhere can echo your
+  issuer and advertise keys you would then accept for it. This mode moves the binding from
+  "fetched from the issuer's own host over TLS" to "fetched from a URL the operator chose", so
+  the URL needs the same trust as `--oidc-issuer` itself.
 - **`pinned_jwks`** — metadata discovery is skipped. The server makes no network call at startup
   and comes up with the issuer unreachable, which is the reason to use it. The costs: a wrong
   endpoint surfaces on the first authenticated request rather than at startup, and with no
@@ -168,20 +171,41 @@ running server rather than inferred from deployment config.
 `--oidc-issuer` is required in all three. It is the value enforced as the `iss` claim on every
 token; under `pinned_jwks` it is the *only* thing binding accepted tokens to an issuer.
 
-### Transport rules on the key path
+## Transport rules on the auth path
 
-Signing keys decide whether a token is genuine, so the server refuses to fetch them over a
-weaker transport than the metadata that named them:
+These apply to **both** binaries, which is why they sit outside the server section above.
+Signing keys decide whether a token is genuine, and on the client the token endpoint receives
+the refresh token, so neither side will use an endpoint reached over a weaker transport than
+the metadata that named it. Two independent rules:
 
-- issuer metadata retrieved over `https` may not advertise a plaintext `jwks_uri` — startup fails;
-- a redirect may not move a metadata or JWKS fetch off `https`. Go follows cross-scheme redirects
-  silently, so this is enforced explicitly rather than inherited from the HTTP client;
-- an issuer already served over `http` — development only, behind `--insecure-oidc-issuer` — has
-  no downgrade left to prevent and is unaffected.
+**Endpoints must be `http(s)` URLs with a host.** Applied to `jwks_uri` on the server and to
+`authorization_endpoint` and `token_endpoint` on the client, in **every** mode — including under
+`--insecure-oidc-issuer`, which relaxes transport security but does not widen permitted schemes.
+This is what keeps a scheme like `file://` or a custom app scheme out of the authorization URL,
+which the client hands to the OS URL dispatcher (`open`, `xdg-open`, `ShellExecute`) — those
+launch whatever application claims the scheme, not only a browser.
 
-These rules apply to the **server's** validator. The managed client fetches its own metadata and
-token endpoints and is not covered by them; keep client-side issuer URLs on `https`, which the
-client already requires unless `--insecure-oidc-issuer` is set.
+**No downgrade relative to the metadata source.** Metadata retrieved over `https` may not
+advertise plaintext endpoints, and a redirect may not move a metadata, JWKS, or token fetch off
+`https`. Go follows cross-scheme redirects silently, so this is enforced explicitly rather than
+inherited from the HTTP client. An issuer already served over `http` — development only, behind
+`--insecure-oidc-issuer` — has no downgrade left to prevent and is unaffected; the first rule
+still applies there.
+
+The two are not interchangeable: over an `http` metadata source nothing is a downgrade, so the
+second rule passes everything and the first is the only thing filtering schemes.
+
+**When they fire** differs by rule, and not all of it is at startup. On the server, the endpoint
+checks run during discovery, so a bad or downgraded `jwks_uri` fails startup — but the redirect
+rule cannot, because the key set is fetched lazily on the first token verified (see above). A
+JWKS endpoint that redirects off `https` therefore surfaces on the first authenticated request,
+as a rejected token rather than a failed boot. Under `--oidc-jwks-uri` the pinned URL is checked
+at startup while everything about the fetch is deferred the same way.
+
+On the client a refusal is **terminal** — it does not fall back to interactive login, because the
+browser flow ends at the same token endpoint and would fail identically after walking the user
+through authenticating. The PKCE loopback callback (`http://127.0.0.1:…`) is deliberately outside
+all of this: it is RFC 8252's native-app pattern and never leaves the host.
 
 ## Egress rules and the resolved-IP deny-list
 
@@ -239,8 +263,9 @@ Some providers require extra configuration before `offline_access` can be reques
 Before going to production, verify:
 
 - [ ] OIDC issuer is `https://` — `--insecure-oidc-issuer` is **not** set.
-- [ ] Issuer metadata is discovered rather than bypassed. The startup log line `token_validator_ready` reports `discovery_mode`; `derived` is the default. If it reports `pinned_jwks`, confirm the `--oidc-jwks-uri` value really belongs to the configured issuer — the server cannot verify that binding for itself in this mode, and it is logged at warn level for that reason. If it reports `metadata_url`, the binding is still verified, but check the URL is one you control.
+- [ ] Issuer metadata is discovered rather than bypassed. The startup log line `token_validator_ready` reports `discovery_mode`; `derived` is the default. If it reports `pinned_jwks`, confirm the `--oidc-jwks-uri` value really belongs to the configured issuer — the server cannot verify that binding for itself in this mode, and it is logged at warn level for that reason. If it reports `metadata_url`, the binding rests on that URL too: the document's `issuer` field is compared to yours, but it is self-asserted, so any host you point at can echo your issuer and advertise keys you would then accept. Confirm the URL is one you control, and treat it with the same care as `--oidc-issuer`. Only `derived` verifies the binding, by fetching from the issuer's own host over TLS.
 - [ ] Tunnel endpoint is `https://` or `wss://` — `--insecure-tunnel-url` is **not** set on the client.
+- [ ] The client's `--oidc-issuer` (and `--oidc-metadata-url`, if used) are `https://`, and `--insecure-oidc-issuer` is **not** set on the client either. The server's setting does not cover the client: it is a separate process with its own flags, and it is the side that transmits the refresh token.
 - [ ] Token-expiry enforcement is active — `--no-connection-token-expiry` is **not** set. By default, tunnels close when the access token expires and clients must refresh. Disabling this removes token expiry as a tunnel lifetime control; tunnels will still close at `--max-connection-duration` if set, but without that limit they persist until the client disconnects.
 - [ ] At least one `--allow` rule is configured. `--allow-open-egress` should only appear in deployments where arbitrary authenticated egress from the server host is explicitly acceptable.
 - [ ] The default `--ip-block` set is in effect (loopback, link-local incl. IMDS, unspecified, multicast), or any deviation via `--ip-block` / `--no-ip-block` is intentional and documented for the deployment.
