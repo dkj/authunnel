@@ -353,6 +353,9 @@ Findings from review after the above was written, all now fixed:
 Not done, unchanged from the non-goals: the client-side equivalent (`client/auth.go`) and
 RFC 9728 protected-resource metadata. **The client shares
 `internal/authhttp.NewBoundedClient` and fetches its own metadata and token endpoints without
-the downgrade guard, which now lives in `tunnelserver`.** Worth considering whether that guard
-belongs in `authhttp` so both sides inherit it — deliberately out of scope here rather than
-overlooked.
+the downgrade guard, which now lives in `tunnelserver`.**
+
+That gap is now planned in [PLAN_202608_client_discovery.md](PLAN_202608_client_discovery.md),
+which also records why it deserves higher priority than it looked here: the server-side downgrade
+substitutes *public* keys, while the client-side one puts a **refresh token** on the wire in
+clear text. Same mechanics, materially worse consequence.
