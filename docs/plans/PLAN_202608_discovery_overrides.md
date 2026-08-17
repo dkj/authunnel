@@ -234,20 +234,53 @@ already in `auth_bounds_test.go`:
 
 ## Documentation
 
-- `README.md:187` — add both flags to the server flag list.
-- `docs/DEPLOYMENT.md:102` — full flag + env documentation, with the mutual exclusion and the
+- ~~`README.md:187` — add both flags to the server flag list.~~ **Wrong as planned.** That line
+  is in the *client* flag list; README's server section explicitly defers the flag reference to
+  `docs/DEPLOYMENT.md`, and AGENTS.md scopes README to "the security posture and client usage"
+  with the server flag reference in DEPLOYMENT.md. No README change was made.
+- `server/server.go` `serverUsage` — **missed by this plan.** The server has a hand-maintained
+  `--help` block separate from the `flag` package's own descriptions; both need the new entries,
+  and `--insecure-oidc-issuer` needed its wording updated in both places.
+- `docs/DEPLOYMENT.md` — full flag + env documentation, with the mutual exclusion and the
   startup-resilience tradeoff stated explicitly.
-- `docs/DEPLOYMENT.md:173` hardening checklist — add: prefer discovery; if `--oidc-jwks-uri`
-  is set, confirm the URL belongs to the configured issuer, since the server can no longer
-  verify that for itself.
-- `docs/DEVELOPMENT.md:100,114` — no change required, but worth a note that a local
-  non-OIDC AS can now be targeted with `--oidc-metadata-url`.
+- `docs/DEPLOYMENT.md` hardening checklist — added, keyed to the `discovery_mode` field of the
+  `token_validator_ready` startup line so the check is something an operator can actually read
+  off a running server rather than infer from deployment config.
+- `docs/DEVELOPMENT.md` — note that a local non-OIDC AS can be targeted with
+  `--oidc-metadata-url`, and that neither override accepts `file://`.
 
 ## Sequencing
 
-1. `JWTValidatorConfig` refactor + call-site migration, no new behaviour. Reviewable alone.
-2. `MetadataURL` plumbing and tests.
-3. `JWKSURI` plumbing, startup log line, and tests.
-4. Docs.
+1. ✓ done — `JWTValidatorConfig` refactor + call-site migration, no new behaviour.
+2. ✓ done — `MetadataURL` plumbing and tests.
+3. ✓ done — `JWKSURI` plumbing, startup log line, and tests.
+4. ✓ done — Docs.
 
 Steps 2 and 3 are independent of each other and can land in either order.
+
+## Outcome
+
+Delivered as planned, with three deviations worth recording:
+
+- **`NewJWTTokenValidator` returns a third value**, `DiscoveryMode`, rather than the caller
+  re-deriving the mode from its own config. This keeps the "which path did we actually take"
+  answer with the code that took it, which matters because the warn-vs-info decision on the
+  startup log hangs off it.
+- **The two documentation corrections above.**
+- **`validateAuthURL` checks scheme before host.** `url.Parse("file:///path")` yields an empty
+  host, so a host-first order would report `file://` as a malformed URL and never reach the
+  scheme branch — the specific error the plan called for would have been unreachable.
+
+Verification beyond `go test ./...`, run against the built binary:
+
+- pinned JWKS with an unresolvable issuer starts and logs `discovery_mode=pinned_jwks` at warn;
+  the same config in derived mode refuses to start, so the startup-resilience claim rests on an
+  observed contrast rather than on the absence of a call;
+- RFC 8414 metadata at a non-derived path: 404 without the override, `metadata_url` with it;
+- the issuer binding was checked as a controlled pair against one metadata URL — matching
+  issuer starts, mismatched issuer fails with `issuer does not match` — so the rejection is
+  attributable to the mismatch and not to an unrelated fetch failure;
+- `file://` refused with `--insecure-oidc-issuer` set, and both overrides together refused.
+
+Not done, unchanged from the non-goals: the client-side equivalent (`client/auth.go`) and
+RFC 9728 protected-resource metadata.

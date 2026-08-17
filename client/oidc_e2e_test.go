@@ -444,7 +444,7 @@ func (p *jwtBackedOIDCProvider) signAccessToken(issuer, audience string) (string
 func newJWTValidatedTunnelServer(t *testing.T, issuer, audience string, validatorHTTPClient *http.Client, opts ...tunnelserver.HandlerOptions) (*httptest.Server, *http.Client) {
 	t.Helper()
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, validatorHTTPClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: audience, HTTPClient: validatorHTTPClient})
 	if err != nil {
 		t.Fatalf("create JWT validator: %v", err)
 	}

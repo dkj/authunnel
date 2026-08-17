@@ -57,29 +57,103 @@ type JWTTokenValidator struct {
 	verifier *op.AccessTokenVerifier
 }
 
-// NewJWTTokenValidator performs OIDC discovery once at startup, using it only
-// to locate the issuer's JWKS endpoint. All subsequent token validation is
-// done locally against that key set. Configuration errors fail at startup
-// rather than on the first protected request.
-func NewJWTTokenValidator(ctx context.Context, issuer, audience string, httpClient *http.Client) (*JWTTokenValidator, error) {
-	if issuer == "" {
-		return nil, errors.New("issuer is required")
+// DiscoveryMode names how a validator located the issuer's JWKS, for startup
+// logging. The operator gave up a verification step in anything other than
+// DiscoveryModeDerived, so the choice should be visible in the log without
+// having to diff the deployment config.
+type DiscoveryMode string
+
+const (
+	// DiscoveryModeDerived is the default: the well-known path is derived
+	// from the issuer.
+	DiscoveryModeDerived DiscoveryMode = "derived"
+	// DiscoveryModeMetadataURL fetched an operator-supplied metadata
+	// document. The document's issuer is still checked against Issuer.
+	DiscoveryModeMetadataURL DiscoveryMode = "metadata_url"
+	// DiscoveryModePinnedJWKS skipped metadata entirely. The issuer-to-keys
+	// binding is asserted by the operator rather than verified here.
+	DiscoveryModePinnedJWKS DiscoveryMode = "pinned_jwks"
+)
+
+// JWTValidatorConfig configures token validation. Issuer and Audience are
+// required in every mode.
+//
+// MetadataURL and JWKSURI change only *where the key set is found*, never
+// which issuer is trusted: Issuer remains the value enforced as the `iss`
+// claim on every token. They are mutually exclusive; the server rejects both
+// being set before reaching this constructor.
+type JWTValidatorConfig struct {
+	// Issuer is the identity anchor. It is enforced as `iss` on every token
+	// and, on the discovery paths, must equal the `issuer` advertised by the
+	// metadata document.
+	Issuer string
+	// Audience is required in every validated token.
+	Audience string
+	// MetadataURL overrides the derived well-known path. Use it for an
+	// authorization server that publishes RFC 8414 metadata at a path the
+	// OIDC derivation cannot reach, or whose metadata sits off the issuer
+	// path entirely. The document's `issuer` is still verified against
+	// Issuer, so this changes the transport without weakening the binding.
+	MetadataURL string
+	// JWKSURI pins the key set endpoint and skips metadata discovery. The
+	// constructor then makes no network call, so the server starts even
+	// with the issuer unreachable — at the cost of surfacing a wrong URL on
+	// the first protected request rather than at startup.
+	JWKSURI string
+	// HTTPClient carries the bounded transport used for metadata and JWKS
+	// fetches. Required.
+	HTTPClient *http.Client
+}
+
+// NewJWTTokenValidator resolves the issuer's JWKS endpoint once at startup and
+// builds a validator that verifies all subsequent tokens locally against that
+// key set. Configuration errors fail at startup rather than on the first
+// protected request.
+//
+// The returned DiscoveryMode records how the key set was located, for the
+// caller to log.
+func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTTokenValidator, DiscoveryMode, error) {
+	if cfg.Issuer == "" {
+		return nil, "", errors.New("issuer is required")
 	}
-	if audience == "" {
-		return nil, errors.New("token audience is required")
+	if cfg.Audience == "" {
+		return nil, "", errors.New("token audience is required")
 	}
-	discovery, err := client.Discover(ctx, issuer, httpClient)
-	if err != nil {
-		return nil, fmt.Errorf("discover issuer metadata: %w", err)
+	if cfg.MetadataURL != "" && cfg.JWKSURI != "" {
+		return nil, "", errors.New("metadata URL and JWKS URI are mutually exclusive")
 	}
-	if discovery.JwksURI == "" {
-		return nil, errors.New("issuer discovery did not advertise jwks_uri")
+	if cfg.HTTPClient == nil {
+		return nil, "", errors.New("http client is required")
 	}
-	keySet := rp.NewRemoteKeySet(httpClient, discovery.JwksURI)
+
+	jwksURI, mode := cfg.JWKSURI, DiscoveryModePinnedJWKS
+	if jwksURI == "" {
+		// Discover ignores an empty wellKnownUrl, so the default derived
+		// path needs no branch here. On both paths it enforces that the
+		// document's issuer matches cfg.Issuer — the check that keeps an
+		// operator-chosen metadata URL from silently rebinding the server
+		// to another authorization server's keys.
+		discovery, err := client.Discover(ctx, cfg.Issuer, cfg.HTTPClient, cfg.MetadataURL)
+		if err != nil {
+			return nil, "", fmt.Errorf("discover issuer metadata: %w", err)
+		}
+		if discovery.JwksURI == "" {
+			return nil, "", errors.New("issuer discovery did not advertise jwks_uri")
+		}
+		jwksURI, mode = discovery.JwksURI, DiscoveryModeDerived
+		if cfg.MetadataURL != "" {
+			mode = DiscoveryModeMetadataURL
+		}
+	}
+
+	// NewRemoteKeySet caches and refetches on an unrecognised kid, so a
+	// pinned URI still tracks issuer key rotation — only the endpoint is
+	// fixed, not the key material.
+	keySet := rp.NewRemoteKeySet(cfg.HTTPClient, jwksURI)
 	return &JWTTokenValidator{
-		audience: audience,
-		verifier: op.NewAccessTokenVerifier(issuer, keySet),
-	}, nil
+		audience: cfg.Audience,
+		verifier: op.NewAccessTokenVerifier(cfg.Issuer, keySet),
+	}, mode, nil
 }
 
 // ValidateAccessToken verifies signature, issuer and expiry via the Zitadel

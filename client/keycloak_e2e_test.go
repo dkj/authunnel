@@ -54,7 +54,7 @@ func TestKeycloakProxyCommandManagedOIDCE2E(t *testing.T) {
 	audience := getenvDefault("AUTHUNNEL_TOKEN_AUDIENCE", "authunnel-server")
 	validatorHTTPClient := &http.Client{Timeout: 10 * time.Second}
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, validatorHTTPClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: audience, HTTPClient: validatorHTTPClient})
 	if err != nil {
 		t.Fatalf("create JWT validator: %v", err)
 	}
