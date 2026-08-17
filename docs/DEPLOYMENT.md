@@ -117,6 +117,72 @@ For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origi
 
 Admission rejections are emitted as structured `warn` log records with `event=tunnel_admission_denied` and a `reason` field (`global`, `per_user`, or `rate`), so operators can distinguish abuse from undersized limits without adding a metrics stack. Pre-auth rejections are logged separately with `event=preauth_rate_limited` so the two layers can be told apart in queries. Per-user policy is keyed on the OIDC `sub` claim; tokens without a stable subject are rejected earlier by the JWT validator before admission runs.
 
+## Issuer metadata and key discovery
+
+The server needs one thing from the issuer: the JWKS endpoint that its signing keys are
+published at. Every claim check after that — signature, `iss`, `exp`, `aud`, `sub`, `iat`, `nbf`
+— is evaluated locally against the cached key set, with no per-request round trip to the issuer.
+
+That is not the same as "no runtime traffic to the issuer", and the difference matters when
+planning egress. The key set is fetched **lazily, not at startup**, and is refetched when a token
+presents a `kid` that is not in the cache:
+
+- the first authenticated request after startup triggers a JWKS fetch, in every discovery mode;
+- a token whose `kid` does not match a cached key triggers a fetch. This is what makes issuer key
+  rotation self-healing, and it is also why a stream of tokens bearing unrecognised `kid` values
+  drives repeated outbound fetches — concurrent ones are coalesced into a single in-flight
+  request, but there is no negative cache or backoff between them. `--preauth-rate` is the
+  control for that; see the flag list above;
+- otherwise verification is served entirely from cache.
+
+So the server needs outbound access to the JWKS endpoint for the life of the process, not only
+during startup. Firewall rules that permit issuer traffic only during a startup window will fail
+later, at the first rotation, in a way that looks like a token problem rather than a network one.
+
+There are three ways the JWKS endpoint is located. The mode in effect is reported as
+`discovery_mode` on the `token_validator_ready` log line at startup, so it can be confirmed on a
+running server rather than inferred from deployment config.
+
+| `discovery_mode` | Set by | Startup network call | Issuer-to-keys binding |
+| --- | --- | --- | --- |
+| `derived` (default) | nothing; derived from `--oidc-issuer` | yes | verified |
+| `metadata_url` | `--oidc-metadata-url` | yes | verified |
+| `pinned_jwks` | `--oidc-jwks-uri` | **no** | **asserted by the operator** |
+
+- **`derived`** — OIDC discovery at `<issuer>/.well-known/openid-configuration`. Correct for
+  essentially every OIDC provider.
+- **`metadata_url`** — discovery against a URL you supply. Needed when the authorization server
+  publishes RFC 8414 metadata, which inserts the well-known segment *before* the path component
+  (`https://as.example/tenant1` publishes at
+  `https://as.example/.well-known/oauth-authorization-server/tenant1`), or when metadata sits off
+  the issuer path entirely. The document's `issuer` is still checked against `--oidc-issuer`, so
+  this changes where metadata is fetched from, never which issuer is trusted. A document
+  advertising a different issuer is refused at startup.
+- **`pinned_jwks`** — metadata discovery is skipped. The server makes no network call at startup
+  and comes up with the issuer unreachable, which is the reason to use it. The costs: a wrong
+  endpoint surfaces on the first authenticated request rather than at startup, and with no
+  metadata document to cross-check, nothing verifies that those keys belong to that issuer except
+  your configuration. Logged at **warn** level for that reason. Key rotation still works — the key
+  set refetches on an unrecognised `kid`, so only the endpoint is pinned, not the key material.
+
+`--oidc-issuer` is required in all three. It is the value enforced as the `iss` claim on every
+token; under `pinned_jwks` it is the *only* thing binding accepted tokens to an issuer.
+
+### Transport rules on the key path
+
+Signing keys decide whether a token is genuine, so the server refuses to fetch them over a
+weaker transport than the metadata that named them:
+
+- issuer metadata retrieved over `https` may not advertise a plaintext `jwks_uri` — startup fails;
+- a redirect may not move a metadata or JWKS fetch off `https`. Go follows cross-scheme redirects
+  silently, so this is enforced explicitly rather than inherited from the HTTP client;
+- an issuer already served over `http` — development only, behind `--insecure-oidc-issuer` — has
+  no downgrade left to prevent and is unaffected.
+
+These rules apply to the **server's** validator. The managed client fetches its own metadata and
+token endpoints and is not covered by them; keep client-side issuer URLs on `https`, which the
+client already requires unless `--insecure-oidc-issuer` is set.
+
 ## Egress rules and the resolved-IP deny-list
 
 Rule formats: `host-glob:port`, `host-glob:lo-hi`, `CIDR:port`, `CIDR:lo-hi`, `[IPv6]:port`, `[IPv6]:lo-hi`

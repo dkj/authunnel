@@ -161,6 +161,25 @@ itself.
 **Key rotation still works.** `rp.NewRemoteKeySet` caches and refetches on an unknown `kid`,
 so pinning `jwks_uri` does not freeze the key material — only the endpoint.
 
+**No transport downgrade on the key path** — *added during review; this plan originally missed
+it.* The metadata document names the JWKS endpoint, so an https document advertising an
+`http://` `jwks_uri` would put signing keys on the wire in clear text, where a network attacker
+can substitute them and mint tokens that verify. Redirects are the same exposure by another
+route: Go follows a cross-scheme redirect silently (verified — an https endpoint redirecting to
+`http://` is followed without complaint). Two guards, both in `NewJWTTokenValidator`:
+`checkNoSchemeDowngrade` rejects a resolved `jwks_uri` less protected than the document that
+named it, and `refuseTransportDowngrade` wraps the HTTP client with a `CheckRedirect` that
+refuses to leave https on either the metadata or the JWKS fetch.
+
+The rule is judged against the scheme the *metadata itself* was fetched over rather than a new
+config flag: if metadata already travelled in clear text there is no downgrade left to prevent,
+and that case is exactly the local development setup `--insecure-oidc-issuer` already gates. That
+choice also kept the fix from re-touching every existing test, which all use `http` issuers.
+
+Note this exposure predates this plan — the previous code passed `discovery.JwksURI` to
+`NewRemoteKeySet` unchecked in the same way. The overrides widen the reachable surface (the
+operator now chooses which document is authoritative), which is what surfaced it.
+
 **Tradeoff to document, not fix.** In `pinned_jwks` mode the constructor makes no network
 call, so `startupAuthTimeout` is moot and the server starts with the IdP down — the stated
 goal. The cost is that a wrong JWKS URL surfaces on the first protected request rather than
@@ -234,10 +253,16 @@ already in `auth_bounds_test.go`:
 
 ## Documentation
 
-- ~~`README.md:187` — add both flags to the server flag list.~~ **Wrong as planned.** That line
-  is in the *client* flag list; README's server section explicitly defers the flag reference to
-  `docs/DEPLOYMENT.md`, and AGENTS.md scopes README to "the security posture and client usage"
-  with the server flag reference in DEPLOYMENT.md. No README change was made.
+- ~~`README.md:187` — add both flags to the server flag list.~~ **Wrong as planned, and the
+  correction was initially wrong too.** Line 187 is in the *client* flag list, and AGENTS.md
+  scopes README to "the security posture and client usage" with the server flag reference in
+  DEPLOYMENT.md — so no flag-list change belonged there. But README also makes *architectural
+  and security claims* that pinned-JWKS mode falsifies: "performs OIDC discovery once at
+  startup" (server flow), "uses OIDC discovery to locate the issuer's JWKS endpoint" (workflow),
+  and "server startup wraps OIDC discovery in a 30-second context, so a misconfigured issuer
+  surfaces as a fast error" (security posture). Those were updated to describe all three modes.
+  The lesson: "which file documents flags" and "which file makes claims this change falsifies"
+  are separate questions, and only the first was asked.
 - `server/server.go` `serverUsage` — **missed by this plan.** The server has a hand-maintained
   `--help` block separate from the `flag` package's own descriptions; both need the new entries,
   and `--insecure-oidc-issuer` needed its wording updated in both places.
@@ -282,5 +307,41 @@ Verification beyond `go test ./...`, run against the built binary:
   attributable to the mismatch and not to an unrelated fetch failure;
 - `file://` refused with `--insecure-oidc-issuer` set, and both overrides together refused.
 
+Findings from review after the above was written, all now fixed:
+
+- **P1, JWKS transport downgrade** — see "Security invariants". Four tests in
+  `discovery_override_test.go` cover it, using a plaintext mirror of the correct key set as the
+  redirect target so a failure is attributable to the transport rather than to a missing key,
+  plus an https-to-https control so the rejection is not just "TLS is broken in this test".
+- **P2, stale README claims** — see "Documentation".
+- **P2, injected redirect policy discarded** — `refuseTransportDowngrade` replaced
+  `base.CheckRedirect` outright, so a caller that rejected cross-host or all redirects would
+  silently start following them. It now layers: cap, then downgrade check, then delegate to the
+  inherited callback when non-nil. The composed policy is the caller's AND ours, which can only
+  be more restrictive than either alone. The cap stays unconditional so the auth path is bounded
+  even when a caller's own policy has no ceiling — a stated contract rather than an accident. No
+  caller in-tree sets `CheckRedirect` today, so this was latent, but the API is exported.
+- **P2, "no further calls to the issuer" was false** — my own DEPLOYMENT prose claimed validation
+  makes no issuer calls after startup, while a bullet twelve lines below described refetch-on-
+  unknown-`kid`. Reading `rp.NewRemoteKeySet` settled it: construction stores only the URL, the
+  first fetch happens on the first token verified, an unmatched `kid` forces a fetch, and there is
+  no TTL, negative cache, or backoff — only in-flight coalescing. Corrected, and turned into the
+  operational statement it should always have been: **the process needs outbound access to the
+  JWKS endpoint for its whole lifetime, not just at startup.** Egress rules scoped to a startup
+  window fail later, at the first rotation, looking like a token problem rather than a network
+  one. The unrecognised-`kid` path also means junk tokens drive outbound fetches, which is a
+  reason `--preauth-rate` matters; noted there. The same implication was corrected in README, in
+  `docs/Notes.md`, and in the `NewJWTTokenValidator` doc comment, which had said tokens verify
+  "locally against that key set" without noting the key set is fetched lazily.
+- **P3, README over-claiming** — the fix was not only to correct the wording. README had grown a
+  mode-by-mode description that duplicated DEPLOYMENT and would drift again on the next change.
+  The detail now lives in one place, `docs/DEPLOYMENT.md` § "Issuer metadata and key discovery",
+  with README reduced to a one-line accurate claim plus a link. The transport-downgrade bullet is
+  also now explicitly scoped to the server validator, since the managed client is not covered.
+
 Not done, unchanged from the non-goals: the client-side equivalent (`client/auth.go`) and
-RFC 9728 protected-resource metadata.
+RFC 9728 protected-resource metadata. **The client shares
+`internal/authhttp.NewBoundedClient` and fetches its own metadata and token endpoints without
+the downgrade guard, which now lives in `tunnelserver`.** Worth considering whether that guard
+belongs in `authhttp` so both sides inherit it — deliberately out of scope here rather than
+overlooked.

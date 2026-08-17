@@ -105,10 +105,16 @@ type JWTValidatorConfig struct {
 	HTTPClient *http.Client
 }
 
-// NewJWTTokenValidator resolves the issuer's JWKS endpoint once at startup and
-// builds a validator that verifies all subsequent tokens locally against that
-// key set. Configuration errors fail at startup rather than on the first
-// protected request.
+// NewJWTTokenValidator resolves the issuer's JWKS *endpoint* once at startup
+// and builds a validator whose claim checks then run locally against a cached
+// key set. Note the keys themselves are not fetched here: NewRemoteKeySet is
+// lazy, so the first fetch happens on the first token verified, and further
+// fetches happen whenever a token presents an unrecognised kid. The process
+// therefore needs outbound access to the JWKS endpoint for its whole lifetime,
+// not just during startup.
+//
+// Configuration errors fail at startup rather than on the first protected
+// request — except under JWKSURI, where there is no startup fetch to fail.
 //
 // The returned DiscoveryMode records how the key set was located, for the
 // caller to log.
@@ -126,6 +132,12 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 		return nil, "", errors.New("http client is required")
 	}
 
+	// Every metadata and JWKS fetch goes through a client that refuses to be
+	// redirected off https. Go follows a cross-scheme redirect silently, so
+	// without this an https endpoint could hand the key fetch to a plaintext
+	// one and a network attacker could substitute signing keys.
+	httpClient := refuseTransportDowngrade(cfg.HTTPClient)
+
 	jwksURI, mode := cfg.JWKSURI, DiscoveryModePinnedJWKS
 	if jwksURI == "" {
 		// Discover ignores an empty wellKnownUrl, so the default derived
@@ -133,12 +145,26 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 		// document's issuer matches cfg.Issuer — the check that keeps an
 		// operator-chosen metadata URL from silently rebinding the server
 		// to another authorization server's keys.
-		discovery, err := client.Discover(ctx, cfg.Issuer, cfg.HTTPClient, cfg.MetadataURL)
+		metadataSource := cfg.Issuer
+		if cfg.MetadataURL != "" {
+			metadataSource = cfg.MetadataURL
+		}
+		discovery, err := client.Discover(ctx, cfg.Issuer, httpClient, cfg.MetadataURL)
 		if err != nil {
 			return nil, "", fmt.Errorf("discover issuer metadata: %w", err)
 		}
 		if discovery.JwksURI == "" {
 			return nil, "", errors.New("issuer discovery did not advertise jwks_uri")
+		}
+		// The metadata document chooses the JWKS endpoint, so a document
+		// fetched over https must not be able to send the key fetch to a
+		// plaintext one. Judged against the scheme the metadata itself was
+		// fetched over rather than a separate flag: if metadata already
+		// travelled in clear text there is no downgrade left to prevent,
+		// and that case is exactly the local development setup the config
+		// layer already gates behind --insecure-oidc-issuer.
+		if err := checkNoSchemeDowngrade(metadataSource, discovery.JwksURI); err != nil {
+			return nil, "", err
 		}
 		jwksURI, mode = discovery.JwksURI, DiscoveryModeDerived
 		if cfg.MetadataURL != "" {
@@ -149,11 +175,64 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 	// NewRemoteKeySet caches and refetches on an unrecognised kid, so a
 	// pinned URI still tracks issuer key rotation — only the endpoint is
 	// fixed, not the key material.
-	keySet := rp.NewRemoteKeySet(cfg.HTTPClient, jwksURI)
+	keySet := rp.NewRemoteKeySet(httpClient, jwksURI)
 	return &JWTTokenValidator{
 		audience: cfg.Audience,
 		verifier: op.NewAccessTokenVerifier(cfg.Issuer, keySet),
 	}, mode, nil
+}
+
+// maxAuthRedirects mirrors the cap Go's default CheckRedirect applies. Setting
+// our own CheckRedirect replaces that default, so the bound has to be restated
+// here or the chain would be unbounded.
+const maxAuthRedirects = 10
+
+// refuseTransportDowngrade returns a shallow copy of base whose redirect policy
+// refuses to leave https. The copy matters: the caller's client is shared with
+// other auth traffic and must not acquire this policy as a side effect.
+//
+// The guard *layers on top of* any policy the caller already set rather than
+// replacing it — a caller that rejects cross-host redirects, or all redirects,
+// must not start following them just because it was passed here. The composed
+// policy is therefore the caller's AND ours, which can only ever be more
+// restrictive than either alone. The redirect cap is applied unconditionally
+// for the same reason: auth metadata fetching stays bounded even if the
+// caller's own policy has no ceiling.
+func refuseTransportDowngrade(base *http.Client) *http.Client {
+	guarded := *base
+	inherited := base.CheckRedirect
+	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxAuthRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxAuthRedirects)
+		}
+		if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing redirect from https to %s://%s: transport downgrade during auth metadata fetch",
+				req.URL.Scheme, req.URL.Host)
+		}
+		if inherited != nil {
+			return inherited(req, via)
+		}
+		return nil
+	}
+	return &guarded
+}
+
+// checkNoSchemeDowngrade rejects a resolved endpoint that is less protected
+// than the document that named it.
+func checkNoSchemeDowngrade(sourceURL, resolvedURL string) error {
+	source, err := url.Parse(sourceURL)
+	if err != nil {
+		return fmt.Errorf("parse metadata source %q: %w", sourceURL, err)
+	}
+	resolved, err := url.Parse(resolvedURL)
+	if err != nil {
+		return fmt.Errorf("parse jwks_uri %q: %w", resolvedURL, err)
+	}
+	if source.Scheme == "https" && resolved.Scheme != "https" {
+		return fmt.Errorf("issuer metadata fetched over https advertised a non-https jwks_uri %q; refusing to fetch signing keys over %s",
+			resolvedURL, resolved.Scheme)
+	}
+	return nil
 }
 
 // ValidateAccessToken verifies signature, issuer and expiry via the Zitadel

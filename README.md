@@ -12,7 +12,7 @@ Authunnel is an authenticated tunnel for reaching private TCP services, includin
 
 1. `ssh` launches the Authunnel client as `ProxyCommand`.
 2. The client reuses a cached token, refreshes it, or completes Authorization Code + PKCE in a browser.
-3. The Authunnel server, acting as an OAuth2 resource server, uses OIDC discovery to locate the issuer's JWKS endpoint and validates the JWT access token locally.
+3. The Authunnel server, acting as an OAuth2 resource server, locates the issuer's JWKS endpoint (by OIDC discovery unless configured otherwise) and validates the JWT access token locally.
 4. The server opens the requested `%h:%p` destination.
 5. SSH stdio is bridged over that authenticated path.
 
@@ -45,7 +45,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
     - `trace_id` — extracted from an incoming `Traceparent` header (W3C Trace Context) when present, otherwise generated; allows correlation with upstream infrastructure such as a load balancer or reverse proxy
     - `tunnel_id` — generated when a WebSocket upgrade succeeds; scoped to the lifetime of the SOCKS tunnel and inherited by all subsequent tunnel events (open, SOCKS CONNECT, close)
   - Tunnel logs include the authenticated user identity, with per-destination SOCKS CONNECT logs at debug level; all three correlation IDs are carried through so HTTP admission, tunnel lifecycle, and per-destination events can be joined
-  - OAuth2 resource-server JWT validation: OIDC discovery used only to bootstrap the JWKS endpoint, all token verification done locally
+  - OAuth2 resource-server JWT validation: the issuer's JWKS endpoint is located once at startup; claim checks run locally against a cached key set, refreshed only when a token presents an unknown key ID
   - Optional admission controls: global and per-user concurrent-tunnel caps, per-user tunnel-open rate limit, and a bounded dial timeout for outbound SOCKS CONNECT
   - WebSocket tunnel endpoint (`/protected/tunnel`) connected to an in-process SOCKS5 server
 - `client/client.go`
@@ -59,7 +59,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 ### Server flow
 
 1. Reads OIDC issuer, audience, listen address, TLS mode, and connection longevity configuration from flags or environment.
-2. Performs OIDC discovery once at startup, solely to locate the issuer's JWKS endpoint.
+2. Locates the issuer's JWKS endpoint once at startup — by OIDC discovery unless configured otherwise. The mode in effect is reported as `discovery_mode` on the `token_validator_ready` startup log line; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#issuer-metadata-and-key-discovery) for the three modes and their trade-offs.
 3. Accepts `GET /protected/tunnel`, verifies the bearer token's signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission), then checks the WebSocket upgrade headers. Unauthenticated `GET` requests under `/protected/` receive `401`; other HTTP methods receive `405` from the router.
 4. Applies admission controls (concurrent-tunnel caps and per-user rate limits) when configured, rejecting over-limit requests with `429`/`503` and a `Retry-After` header.
 5. Upgrades the connection to WebSocket.
@@ -90,7 +90,8 @@ Authunnel is deliberately simple in both functionality and implementation — a 
 The following properties are enforced by default with no silent bypass. Where a development override exists it is noted explicitly:
 
 - **Bearer token validation** at the WebSocket layer before any SOCKS5 connection can be attempted: signature, issuer, audience (`aud`), expiry (`exp`), non-empty subject (`sub`), not-before (`nbf` must be usable at admission time, with a 30-second clock-skew allowance), and sane issued-at (`iat` must not be meaningfully in the future). The bearer token is length-capped at 8 KiB and the `Authorization` header at 8 KiB + 64 bytes before the verifier runs, so anonymous callers cannot push oversized payloads onto the JWT parser. The `http.Server` request-header memory cap is also lowered from Go's 1 MiB default to 16 KiB as a defence-in-depth boundary against oversized non-bearer headers.
-- **Bounded OIDC discovery and JWKS fetches**: both the server-side validator and the managed client share an HTTP transport with conservative dial, TLS-handshake, response-header, and overall timeouts. A stalled or unreachable issuer fails closed instead of holding startup or in-flight token validation open. Server startup wraps OIDC discovery in a 30-second context, so a misconfigured issuer surfaces as a fast `create token validator` error.
+- **Bounded issuer metadata and JWKS fetches**: both the server-side validator and the managed client share an HTTP transport with conservative dial, TLS-handshake, response-header, and overall timeouts. A stalled or unreachable issuer fails closed instead of holding startup or in-flight token validation open. Server startup wraps metadata discovery in a 30-second context, so a misconfigured issuer surfaces as a fast `create token validator` error. Under `--oidc-jwks-uri` there is no startup fetch to bound, so that check moves to the first authenticated request instead.
+- **No transport downgrade on the server's key path**: the server refuses to fetch signing keys over a weaker transport than the metadata that named them — an `https` document may not advertise a plaintext `jwks_uri`, and redirects may not move a metadata or JWKS fetch off `https`. This covers the server-side validator only; the managed client's own metadata and token fetches are not guarded. Details and scope in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#transport-rules-on-the-key-path).
 - **Subject pinning during token refresh**: the server rejects any refreshed token whose `sub` differs from the original tunnel's subject.
 - **Refresh deadline enforcement**: a refreshed token whose `nbf` falls after the current enforced connection deadline (`exp + --expiry-grace`) is rejected. A refresh handover cannot silently extend the policy beyond what the operator has opted into. The comparison is strict — no additional clock-skew allowance applies beyond `--expiry-grace`.
 - **Secure transport by default**: the OIDC issuer URL must be `https://`; the client's tunnel endpoint URL must be `https://` or `wss://`. Plaintext variants require explicit override flags (see the development-only overrides in the [server flag reference](docs/DEPLOYMENT.md#server-flags-and-environment-variables)).

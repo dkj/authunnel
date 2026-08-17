@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,6 +37,14 @@ type fakeIssuerConfig struct {
 	// rfc8414Shape emits only the fields a pure OAuth2 authorization server
 	// publishes, with none of the OIDC-specific extras.
 	rfc8414Shape bool
+	// useTLS serves over https, so downgrade rules apply.
+	useTLS bool
+	// jwksURIOverride replaces the advertised jwks_uri, letting a test point
+	// the key fetch at a different scheme or host.
+	jwksURIOverride string
+	// jwksRedirectTo, when set, makes /keys redirect there instead of
+	// serving the key set.
+	jwksRedirectTo string
 }
 
 type fakeIssuer struct {
@@ -62,9 +71,13 @@ func newFakeIssuer(t *testing.T, cfg fakeIssuerConfig) *fakeIssuer {
 		metadataPaths[p] = true
 	}
 
-	fake.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/keys":
+			if cfg.jwksRedirectTo != "" {
+				http.Redirect(w, r, cfg.jwksRedirectTo, http.StatusFound)
+				return
+			}
 			writeDiscoveryTestJSON(t, w, jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
 				Key:       &privateKey.PublicKey,
 				KeyID:     fake.keyID,
@@ -81,9 +94,13 @@ func newFakeIssuer(t *testing.T, cfg fakeIssuerConfig) *fakeIssuer {
 			if issuer == "" {
 				issuer = fake.URL
 			}
+			jwksURI := cfg.jwksURIOverride
+			if jwksURI == "" {
+				jwksURI = fake.URL + "/keys"
+			}
 			doc := map[string]any{
 				"issuer":                 issuer,
-				"jwks_uri":               fake.URL + "/keys",
+				"jwks_uri":               jwksURI,
 				"authorization_endpoint": fake.URL + "/authorize",
 				"token_endpoint":         fake.URL + "/token",
 			}
@@ -96,7 +113,12 @@ func newFakeIssuer(t *testing.T, cfg fakeIssuerConfig) *fakeIssuer {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
+	})
+	if cfg.useTLS {
+		fake.server = httptest.NewTLSServer(handler)
+	} else {
+		fake.server = httptest.NewServer(handler)
+	}
 	t.Cleanup(fake.server.Close)
 	fake.URL = fake.server.URL
 	return fake
@@ -138,6 +160,161 @@ func writeDiscoveryTestJSON(t *testing.T, w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		t.Fatalf("encode JSON: %v", err)
+	}
+}
+
+// newPlaintextJWKSMirror serves src's key set over plain http. Tests use it as
+// a redirect target so the *only* thing wrong with the key fetch is the
+// transport — the keys themselves are correct, so a test that fails here has
+// caught the downgrade rather than a missing key.
+func newPlaintextJWKSMirror(t *testing.T, src *fakeIssuer) string {
+	t.Helper()
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDiscoveryTestJSON(t, w, jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
+			Key:       &src.privateKey.PublicKey,
+			KeyID:     src.keyID,
+			Algorithm: string(jose.RS256),
+			Use:       "sig",
+		}}})
+	}))
+	t.Cleanup(mirror.Close)
+	return mirror.URL + "/keys"
+}
+
+// TestHTTPSMetadataRejectsPlaintextJWKS covers the downgrade an https metadata
+// document can otherwise force: it names the JWKS endpoint, so without a check
+// it can send the key fetch to plaintext, where a network attacker can
+// substitute signing keys and mint tokens that verify.
+func TestHTTPSMetadataRejectsPlaintextJWKS(t *testing.T) {
+	issuer := newFakeIssuer(t, fakeIssuerConfig{useTLS: true, metadataPaths: []string{oidcWellKnownPath}})
+	plaintextJWKS := newPlaintextJWKSMirror(t, issuer)
+	downgraded := newFakeIssuer(t, fakeIssuerConfig{
+		useTLS:          true,
+		metadataPaths:   []string{oidcWellKnownPath},
+		jwksURIOverride: plaintextJWKS,
+	})
+
+	_, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
+		Issuer:     downgraded.URL,
+		Audience:   "test-aud",
+		HTTPClient: downgraded.server.Client(),
+	})
+	if err == nil {
+		t.Fatal("expected an https metadata document advertising a plaintext jwks_uri to be rejected")
+	}
+	if !strings.Contains(err.Error(), "non-https jwks_uri") {
+		t.Fatalf("error = %v, want the jwks_uri scheme check", err)
+	}
+}
+
+// TestHTTPSMetadataAcceptsHTTPSJWKS is the control for the test above: the same
+// TLS setup with an https jwks_uri must still work, so the rejection there is
+// attributable to the scheme and not to TLS handling in general.
+func TestHTTPSMetadataAcceptsHTTPSJWKS(t *testing.T) {
+	issuer := newFakeIssuer(t, fakeIssuerConfig{useTLS: true, metadataPaths: []string{oidcWellKnownPath}})
+
+	validator, mode, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
+		Issuer:     issuer.URL,
+		Audience:   "test-aud",
+		HTTPClient: issuer.server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("create validator over https: %v", err)
+	}
+	if mode != DiscoveryModeDerived {
+		t.Fatalf("discovery mode = %q, want %q", mode, DiscoveryModeDerived)
+	}
+	if _, err := validator.ValidateAccessToken(context.Background(), issuer.signToken(t, "test-aud")); err != nil {
+		t.Fatalf("validate token: %v", err)
+	}
+}
+
+// TestJWKSRedirectDowngradeIsRefused covers the second half of the same
+// exposure: the advertised jwks_uri passes the scheme check, then redirects to
+// plaintext. Go follows cross-scheme redirects silently, so this needs its own
+// guard rather than falling out of the URL check.
+func TestJWKSRedirectDowngradeIsRefused(t *testing.T) {
+	issuer := newFakeIssuer(t, fakeIssuerConfig{useTLS: true, metadataPaths: []string{oidcWellKnownPath}})
+	mirror := newPlaintextJWKSMirror(t, issuer)
+
+	redirecting := newFakeIssuer(t, fakeIssuerConfig{
+		useTLS:         true,
+		metadataPaths:  []string{oidcWellKnownPath},
+		jwksRedirectTo: mirror,
+	})
+
+	// Discovery succeeds: the advertised jwks_uri is https. The downgrade
+	// only appears when the key set is actually fetched.
+	validator, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
+		Issuer:     redirecting.URL,
+		Audience:   "test-aud",
+		HTTPClient: redirecting.server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+	_, err = validator.ValidateAccessToken(context.Background(), redirecting.signToken(t, "test-aud"))
+	if err == nil {
+		t.Fatal("expected a jwks fetch redirected from https to http to be refused")
+	}
+	if !strings.Contains(err.Error(), "transport downgrade") {
+		t.Fatalf("error = %v, want the redirect downgrade guard", err)
+	}
+}
+
+// TestPlaintextMetadataAllowsPlaintextJWKS documents that the rule is about
+// *downgrade*, not about https absolutely: an issuer already served over http
+// — the local development setup the config layer gates behind
+// --insecure-oidc-issuer — has no downgrade left to prevent.
+func TestPlaintextMetadataAllowsPlaintextJWKS(t *testing.T) {
+	issuer := newFakeIssuer(t, fakeIssuerConfig{metadataPaths: []string{oidcWellKnownPath}})
+
+	validator, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
+		Issuer:     issuer.URL,
+		Audience:   "test-aud",
+		HTTPClient: issuer.server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("plaintext development issuer should still work: %v", err)
+	}
+	if _, err := validator.ValidateAccessToken(context.Background(), issuer.signToken(t, "test-aud")); err != nil {
+		t.Fatalf("validate token: %v", err)
+	}
+}
+
+// TestInjectedRedirectPolicyIsPreserved covers the composition contract: the
+// downgrade guard layers on top of a caller's own redirect policy instead of
+// replacing it. A caller that refuses redirects must not start following them
+// merely because its client was passed to the validator.
+func TestInjectedRedirectPolicyIsPreserved(t *testing.T) {
+	// Redirect to another https endpoint, so the downgrade guard has no
+	// reason to fire — only the caller's own policy can reject this.
+	sameSchemeTarget := newFakeIssuer(t, fakeIssuerConfig{useTLS: true, metadataPaths: []string{oidcWellKnownPath}})
+	redirecting := newFakeIssuer(t, fakeIssuerConfig{
+		useTLS:         true,
+		metadataPaths:  []string{oidcWellKnownPath},
+		jwksRedirectTo: sameSchemeTarget.URL + "/keys",
+	})
+
+	callerClient := redirecting.server.Client()
+	callerClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return errors.New("caller policy: redirects are not permitted")
+	}
+
+	validator, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
+		Issuer:     redirecting.URL,
+		Audience:   "test-aud",
+		HTTPClient: callerClient,
+	})
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+	_, err = validator.ValidateAccessToken(context.Background(), redirecting.signToken(t, "test-aud"))
+	if err == nil {
+		t.Fatal("expected the caller's redirect policy to still reject the jwks redirect")
+	}
+	if !strings.Contains(err.Error(), "caller policy") {
+		t.Fatalf("error = %v, want the caller's own policy to have been consulted", err)
 	}
 }
 
