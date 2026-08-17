@@ -1,9 +1,15 @@
-// Package authhttp provides a small bounded *http.Client for OIDC discovery,
-// JWKS, and token endpoint traffic. Both the server-side validator and the
-// managed client share the same transport defaults so a stalled or
-// attacker-controlled issuer cannot hold either side's auth path open
-// indefinitely. Tests still inject custom clients through the existing
-// constructor seams.
+// Package authhttp provides the shared transport policy for OIDC discovery,
+// JWKS, and token endpoint traffic: a small bounded *http.Client, plus the
+// guards that keep that traffic on https.
+//
+// Both the server-side validator and the managed client share the same
+// transport defaults so a stalled or attacker-controlled issuer cannot hold
+// either side's auth path open indefinitely. Tests still inject custom clients
+// through the existing constructor seams.
+//
+// The downgrade guards in downgrade.go are applied by callers rather than baked
+// into NewBoundedClient, so they hold for injected clients too. Only the
+// server-side validator calls them today; the managed client does not yet.
 package authhttp
 
 import (

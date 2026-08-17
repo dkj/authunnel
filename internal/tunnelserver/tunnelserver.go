@@ -23,6 +23,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 
+	"authunnel/internal/authhttp"
 	"authunnel/internal/wsconn"
 )
 
@@ -149,7 +150,7 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 	// redirected off https. Go follows a cross-scheme redirect silently, so
 	// without this an https endpoint could hand the key fetch to a plaintext
 	// one and a network attacker could substitute signing keys.
-	httpClient := refuseTransportDowngrade(cfg.HTTPClient)
+	httpClient := authhttp.RefuseTransportDowngrade(cfg.HTTPClient)
 
 	jwksURI, mode := cfg.JWKSURI, DiscoveryModePinnedJWKS
 	if jwksURI == "" {
@@ -176,7 +177,7 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 		// travelled in clear text there is no downgrade left to prevent,
 		// and that case is exactly the local development setup the config
 		// layer already gates behind --insecure-oidc-issuer.
-		if err := checkNoSchemeDowngrade(metadataSource, discovery.JwksURI); err != nil {
+		if err := authhttp.CheckNoSchemeDowngrade(metadataSource, discovery.JwksURI); err != nil {
 			return nil, "", err
 		}
 		jwksURI, mode = discovery.JwksURI, DiscoveryModeDerived
@@ -193,59 +194,6 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 		audience: cfg.Audience,
 		verifier: op.NewAccessTokenVerifier(cfg.Issuer, keySet),
 	}, mode, nil
-}
-
-// maxAuthRedirects mirrors the cap Go's default CheckRedirect applies. Setting
-// our own CheckRedirect replaces that default, so the bound has to be restated
-// here or the chain would be unbounded.
-const maxAuthRedirects = 10
-
-// refuseTransportDowngrade returns a shallow copy of base whose redirect policy
-// refuses to leave https. The copy matters: the caller's client is shared with
-// other auth traffic and must not acquire this policy as a side effect.
-//
-// The guard *layers on top of* any policy the caller already set rather than
-// replacing it — a caller that rejects cross-host redirects, or all redirects,
-// must not start following them just because it was passed here. The composed
-// policy is therefore the caller's AND ours, which can only ever be more
-// restrictive than either alone. The redirect cap is applied unconditionally
-// for the same reason: auth metadata fetching stays bounded even if the
-// caller's own policy has no ceiling.
-func refuseTransportDowngrade(base *http.Client) *http.Client {
-	guarded := *base
-	inherited := base.CheckRedirect
-	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= maxAuthRedirects {
-			return fmt.Errorf("stopped after %d redirects", maxAuthRedirects)
-		}
-		if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
-			return fmt.Errorf("refusing redirect from https to %s://%s: transport downgrade during auth metadata fetch",
-				req.URL.Scheme, req.URL.Host)
-		}
-		if inherited != nil {
-			return inherited(req, via)
-		}
-		return nil
-	}
-	return &guarded
-}
-
-// checkNoSchemeDowngrade rejects a resolved endpoint that is less protected
-// than the document that named it.
-func checkNoSchemeDowngrade(sourceURL, resolvedURL string) error {
-	source, err := url.Parse(sourceURL)
-	if err != nil {
-		return fmt.Errorf("parse metadata source %q: %w", sourceURL, err)
-	}
-	resolved, err := url.Parse(resolvedURL)
-	if err != nil {
-		return fmt.Errorf("parse jwks_uri %q: %w", resolvedURL, err)
-	}
-	if source.Scheme == "https" && resolved.Scheme != "https" {
-		return fmt.Errorf("issuer metadata fetched over https advertised a non-https jwks_uri %q; refusing to fetch signing keys over %s",
-			resolvedURL, resolved.Scheme)
-	}
-	return nil
 }
 
 // ValidateAccessToken verifies signature, issuer and expiry via the Zitadel
