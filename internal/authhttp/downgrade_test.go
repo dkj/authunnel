@@ -52,6 +52,64 @@ func TestCheckEndpointURL(t *testing.T) {
 	}
 }
 
+func TestCheckConfiguredURL(t *testing.T) {
+	tests := []struct {
+		name           string
+		raw            string
+		allowPlaintext bool
+		wantErr        string
+	}{
+		{name: "https", raw: "https://issuer.example"},
+		{name: "http rejected by default", raw: "http://issuer.example", wantErr: "must use an https:// URL"},
+		{name: "http with override", raw: "http://issuer.example", allowPlaintext: true},
+
+		// The override relaxes the transport, not the scheme allowlist.
+		{name: "file rejected", raw: "file:///etc/jwks.json", wantErr: `unsupported scheme "file"`},
+		{name: "file rejected under override", raw: "file:///etc/jwks.json", allowPlaintext: true, wantErr: `unsupported scheme "file"`},
+
+		{name: "host-less", raw: "https:relative", wantErr: "absolute URL with a host"},
+		{name: "host-less under override", raw: "https:relative", allowPlaintext: true, wantErr: "absolute URL with a host"},
+		{name: "empty", raw: "", wantErr: "is required"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckConfiguredURL("--oidc-issuer", tt.raw, tt.allowPlaintext)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("CheckConfiguredURL(%q, %v) = %v, want nil", tt.raw, tt.allowPlaintext, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("CheckConfiguredURL(%q, %v) = %v, want error containing %q", tt.raw, tt.allowPlaintext, err, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), "--oidc-issuer") {
+				t.Fatalf("error should name the flag to fix, got %v", err)
+			}
+		})
+	}
+}
+
+// TestRefusalMessagesAreOperatorReadable pins the refusef design. Wrapping the
+// sentinel with %w would append ": unsafe auth transport" to every message an
+// operator sees at startup, which says nothing they can act on.
+func TestRefusalMessagesAreOperatorReadable(t *testing.T) {
+	for _, err := range []error{
+		CheckConfiguredURL("--oidc-issuer", "http://issuer.example", false),
+		CheckConfiguredURL("--oidc-jwks-uri", "file:///etc/jwks.json", true),
+		CheckEndpointURL("token_endpoint", "file:///tmp/token"),
+		CheckNoSchemeDowngrade("jwks_uri", "https://as.example", "http://as.example/keys"),
+	} {
+		if strings.Contains(err.Error(), ErrUnsafeTransport.Error()) {
+			t.Fatalf("message leaks the sentinel text: %v", err)
+		}
+		if !errors.Is(err, ErrUnsafeTransport) {
+			t.Fatalf("error %v no longer matches the sentinel", err)
+		}
+	}
+}
+
 func TestCheckNoSchemeDowngrade(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -124,13 +182,17 @@ func TestRefusalsWrapErrUnsafeTransport(t *testing.T) {
 		const unparseable = "http://[::1" // missing ']' in host
 
 		for name, err := range map[string]error{
-			"missing endpoint":     CheckEndpointURL("token_endpoint", ""),
-			"bad scheme":           CheckEndpointURL("token_endpoint", "file:///x"),
-			"host-less":            CheckEndpointURL("token_endpoint", "https:relative"),
-			"unparseable endpoint": CheckEndpointURL("token_endpoint", unparseable),
-			"downgraded":           CheckNoSchemeDowngrade("jwks_uri", "https://as.example", "http://as.example/keys"),
-			"unparseable source":   CheckNoSchemeDowngrade("jwks_uri", unparseable, "https://as.example/keys"),
-			"unparseable resolved": CheckNoSchemeDowngrade("jwks_uri", "https://as.example", unparseable),
+			"missing endpoint":      CheckEndpointURL("token_endpoint", ""),
+			"bad scheme":            CheckEndpointURL("token_endpoint", "file:///x"),
+			"host-less":             CheckEndpointURL("token_endpoint", "https:relative"),
+			"unparseable endpoint":  CheckEndpointURL("token_endpoint", unparseable),
+			"downgraded":            CheckNoSchemeDowngrade("jwks_uri", "https://as.example", "http://as.example/keys"),
+			"unparseable source":    CheckNoSchemeDowngrade("jwks_uri", unparseable, "https://as.example/keys"),
+			"unparseable resolved":  CheckNoSchemeDowngrade("jwks_uri", "https://as.example", unparseable),
+			"configured missing":    CheckConfiguredURL("--oidc-issuer", "", false),
+			"configured plaintext":  CheckConfiguredURL("--oidc-issuer", "http://issuer.example", false),
+			"configured bad scheme": CheckConfiguredURL("--oidc-issuer", "file:///x", true),
+			"configured host-less":  CheckConfiguredURL("--oidc-issuer", "https:relative", false),
 		} {
 			if err == nil {
 				t.Fatalf("%s: expected an error", name)

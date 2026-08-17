@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"authunnel/internal/authhttp"
 	"authunnel/internal/safefs"
 	"authunnel/internal/security"
 	"authunnel/internal/wsconn"
@@ -275,12 +276,9 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	default:
 		return cfg, errors.New("--tunnel-url must use one of https://, wss://, http://, or ws://")
 	}
-	// Both URLs get the same treatment: --insecure-oidc-issuer relaxes them
-	// together, since an operator pointing at a local IdP over http needs
-	// both. It relaxes transport only — other schemes stay rejected by name
-	// rather than falling through to the generic "not a valid URL".
-	// Step 4 of the plan replaces this pair with the shared helper the server
-	// already uses; kept inline here so the two steps stay separable.
+	// One rule for both, shared with the server so the two cannot drift:
+	// https required unless --insecure-oidc-issuer, other schemes rejected by
+	// name rather than as a generic "not a valid URL".
 	for _, checked := range []struct{ flag, value string }{
 		{"--oidc-issuer", cfg.OIDCIssuer},
 		{"--oidc-metadata-url", cfg.OIDCMetadataURL},
@@ -288,21 +286,8 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 		if checked.value == "" {
 			continue
 		}
-		u, err := url.Parse(checked.value)
-		if err != nil {
-			return cfg, fmt.Errorf("%s %q is not a valid URL", checked.flag, checked.value)
-		}
-		switch u.Scheme {
-		case "https":
-		case "http":
-			if !cfg.InsecureOIDCIssuer {
-				return cfg, fmt.Errorf("%s must use an https:// URL; use --insecure-oidc-issuer to allow plaintext (development only)", checked.flag)
-			}
-		default:
-			return cfg, fmt.Errorf("%s %q uses unsupported scheme %q; only https:// (or http:// with --insecure-oidc-issuer) is accepted", checked.flag, checked.value, u.Scheme)
-		}
-		if u.Host == "" {
-			return cfg, fmt.Errorf("%s %q is not a valid URL", checked.flag, checked.value)
+		if err := authhttp.CheckConfiguredURL(checked.flag, checked.value, cfg.InsecureOIDCIssuer); err != nil {
+			return cfg, err
 		}
 	}
 	if cfg.OIDCResource != "" {

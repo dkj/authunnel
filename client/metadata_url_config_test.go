@@ -117,6 +117,25 @@ func TestParseClientConfigRejectsFileMetadataURL(t *testing.T) {
 	}
 }
 
+// TestParseClientConfigRejectsFileIssuer covers what sharing the server's
+// validator picked up for the client: --oidc-issuer previously reported a
+// file:// value as a generic "not a valid URL" (it has no host), rather than
+// naming the scheme. Both flags now use one rule.
+func TestParseClientConfigRejectsFileIssuer(t *testing.T) {
+	_, err := parseClientConfig(
+		[]string{
+			"--tunnel-url", "https://tunnel.example/protected/tunnel",
+			"--oidc-issuer", "file:///etc/authunnel/issuer",
+			"--oidc-client-id", "authunnel-cli",
+			"--insecure-oidc-issuer",
+		},
+		func(string) string { return "" },
+	)
+	if err == nil || !strings.Contains(err.Error(), `"file"`) {
+		t.Fatalf("expected the file scheme to be rejected by name, got: %v", err)
+	}
+}
+
 func TestParseClientConfigRejectsMalformedMetadataURL(t *testing.T) {
 	for _, value := range []string{"https://", "not-a-url", "ftp://as.example/meta"} {
 		if _, err := parseClientConfig(

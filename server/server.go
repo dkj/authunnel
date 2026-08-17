@@ -12,7 +12,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -389,38 +388,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-}
-
-// validateAuthURL applies the shared shape and scheme rules to the issuer and
-// the two discovery-override URLs.
-//
-// Schemes other than http(s) are rejected by name rather than falling through
-// to the generic "not a valid URL" message. file:// is the one operators
-// actually reach for — to load a JWKS off disk in an air-gapped or zero-egress
-// deployment — and it is refused deliberately, including under
-// --insecure-oidc-issuer: that flag relaxes transport security for a local
-// development IdP, it does not widen the set of permitted schemes. Serving a
-// JWKS from disk needs a separate flag with its own code path, because routing
-// file:// through the shared auth HTTP client would make local files reachable
-// from any redirect that client follows.
-func validateAuthURL(flagName, raw string, allowInsecure bool) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("%s %q is not a valid URL", flagName, raw)
-	}
-	switch u.Scheme {
-	case "https":
-	case "http":
-		if !allowInsecure {
-			return fmt.Errorf("%s must use an https:// URL; use --insecure-oidc-issuer or INSECURE_OIDC_ISSUER=true to allow plaintext (development only)", flagName)
-		}
-	default:
-		return fmt.Errorf("%s %q uses unsupported scheme %q; only https:// (or http:// with --insecure-oidc-issuer) is accepted", flagName, raw, u.Scheme)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("%s %q is not a valid URL", flagName, raw)
-	}
-	return nil
 }
 
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {
@@ -818,19 +785,19 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	if cfg.Issuer == "" {
 		return cfg, errors.New("--oidc-issuer or OIDC_ISSUER is required")
 	}
-	if err := validateAuthURL("--oidc-issuer", cfg.Issuer, cfg.InsecureOIDCIssuer); err != nil {
+	if err := authhttp.CheckConfiguredURL("--oidc-issuer", cfg.Issuer, cfg.InsecureOIDCIssuer); err != nil {
 		return cfg, err
 	}
 	if cfg.OIDCMetadataURL != "" && cfg.OIDCJWKSURI != "" {
 		return cfg, errors.New("--oidc-metadata-url and --oidc-jwks-uri are mutually exclusive; set at most one")
 	}
 	if cfg.OIDCMetadataURL != "" {
-		if err := validateAuthURL("--oidc-metadata-url", cfg.OIDCMetadataURL, cfg.InsecureOIDCIssuer); err != nil {
+		if err := authhttp.CheckConfiguredURL("--oidc-metadata-url", cfg.OIDCMetadataURL, cfg.InsecureOIDCIssuer); err != nil {
 			return cfg, err
 		}
 	}
 	if cfg.OIDCJWKSURI != "" {
-		if err := validateAuthURL("--oidc-jwks-uri", cfg.OIDCJWKSURI, cfg.InsecureOIDCIssuer); err != nil {
+		if err := authhttp.CheckConfiguredURL("--oidc-jwks-uri", cfg.OIDCJWKSURI, cfg.InsecureOIDCIssuer); err != nil {
 			return cfg, err
 		}
 	}

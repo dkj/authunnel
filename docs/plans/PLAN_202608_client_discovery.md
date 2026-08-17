@@ -369,7 +369,29 @@ treat the docs as part of the change, not as a follow-up.
    One consequence worth noting: the downgrade check is now judged against the metadata URL when
    set, not the issuer, since it is the document's own transport that decides whether an endpoint
    is a downgrade. `TestDowngradeIsJudgedAgainstMetadataURLNotIssuer` pins it.
-4. Shared URL validation helper for config-time checks.
+4. ✓ done — Shared URL validation helper for config-time checks.
+   - **Home: `internal/authhttp`**, the decision this plan deferred until the shape was visible.
+     It earns its place by sharing code, not just space: `CheckConfiguredURL` and
+     `CheckEndpointURL` now both build on one unexported `parseAuthURL` holding the single
+     definition of a usable auth URL, so the rule cannot drift between configured and discovered
+     values. A separate `internal/authurl` would have split the auth-URL rules across two
+     packages and required moving the item-2 code as well.
+   - `server/validateAuthURL` deleted (three call sites) and the client's inline copy from item 3
+     replaced (two call sites). The client gains `file://`-rejected-by-name on `--oidc-issuer`,
+     which it did not have.
+   - **Error messages no longer append the sentinel.** Wrapping with `%w` had been putting
+     ": unsafe auth transport" on the end of every message, including startup config errors an
+     operator reads — noise on a line that already says what to fix. Refusals are now built by
+     `refusef`, which returns a type whose `Is` matches `ErrUnsafeTransport` without contributing
+     text. Identity for code, message for people; a test pins both halves.
+   - One regression caught during implementation rather than review: sharing the core initially
+     gave `CheckEndpointURL` a scheme message mentioning `--insecure-oidc-issuer`, which is
+     meaningless for a discovered endpoint. The shared message is now neutral and
+     `CheckConfiguredURL` adds the flag hint itself.
+   - Small deliberate loss: the server's plaintext-rejection message no longer names
+     `INSECURE_OIDC_ISSUER=true` alongside the flag, since the client has no such env var. The
+     flag it does name is actionable on both, and the env var stays documented in
+     `docs/DEPLOYMENT.md`.
 5. Remaining docs.
 
 Items 3 and 4 are independent. Item 2 depends only on item 1.
