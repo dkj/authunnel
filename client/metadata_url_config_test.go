@@ -38,9 +38,10 @@ func TestParseClientConfigDefaultsMetadataURLEmpty(t *testing.T) {
 	}
 }
 
-// TestParseClientConfigMetadataURLRequiresIssuer pins that the override
-// relocates the document without identifying the issuer — the document is still
-// checked against --oidc-issuer, so it cannot stand in for it.
+// TestParseClientConfigMetadataURLRequiresIssuer pins that the override cannot
+// stand in for the issuer. The document declares an issuer, but it declares it
+// about itself, so it identifies nothing — --oidc-issuer is what the comparison
+// is against, and it stays required.
 func TestParseClientConfigMetadataURLRequiresIssuer(t *testing.T) {
 	_, err := parseClientConfig(
 		[]string{

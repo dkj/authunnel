@@ -54,8 +54,15 @@ type browserOpener func(context.Context, string) error
 type managedOIDCTokenSource struct {
 	issuer string
 	// metadataURL, when set, replaces the well-known path derived from
-	// issuer. It relocates the document only: zitadel still checks the
-	// document's issuer against issuer.
+	// issuer.
+	//
+	// Discovery compares the document's `issuer` field against issuer, but
+	// that field is supplied by the document about itself and proves nothing
+	// about the host serving it. Treat the check as catching an honest wrong
+	// URL — staging for production, one tenant for another, which a
+	// legitimate AS reveals by declaring its own issuer — not as a boundary.
+	// A hostile or mistyped URL can echo the expected issuer and name any
+	// endpoints it likes; only trusting this value prevents that.
 	metadataURL  string
 	clientID     string
 	audience     string
@@ -75,17 +82,44 @@ type managedOIDCTokenSource struct {
 
 // tokenCache is intentionally a single JSON document so developers can inspect
 // and delete it easily during debugging. Cache entries are scoped to issuer,
-// client ID, audience, resource, and scopes to avoid cross-provider token reuse.
+// metadata URL, client ID, audience, resource, and scopes to avoid reusing a
+// credential in a context it was not obtained for.
 //
-// The metadata URL is deliberately *not* part of that key. It selects where the
-// document is fetched from, not which issuer minted the token — and since the
-// document's issuer is verified against the configured issuer either way, a
-// token obtained through an override is the same token. Adding it would discard
-// every cached token the first time an operator set the flag, forcing an
-// interactive login, and again whenever they switched between the override and
-// the derived path, for no gain in isolation.
+// The metadata URL belongs in that identity, and an earlier version of this
+// comment argued the opposite — that the override only relocates the document,
+// so a token obtained through it is "the same token". That reasoning asks
+// whether the credential is still *valid*, which is the wrong question. The
+// question is who receives it. The metadata document names the token endpoint
+// the refresh token is posted to, and the only check on that document is that
+// its `issuer` field equals the configured issuer — a plain string comparison
+// against a value the document supplies about itself. Nothing binds the
+// metadata host to the issuer it claims, so a mistyped or hostile metadata URL
+// can echo the right issuer and name any token endpoint it likes.
+//
+// Left out of the identity, adding or changing --oidc-metadata-url would keep an
+// existing refresh token valid and post it to whatever that new document
+// advertises, with no user interaction. Including it means the cache is
+// discarded instead and the user re-authenticates.
+//
+// What that does and does not buy, precisely: it prevents the **silent reuse of
+// an already-issued refresh token**. It is not a general defence against a
+// hostile metadata URL. If the user goes on to complete the fallback login, the
+// authorization code and its PKCE verifier are still sent to the token endpoint
+// that document names — and a document can pair the *real* authorization
+// endpoint with an attacker's token endpoint, so the user sees a genuine IdP
+// page and the code that comes back is a real, redeemable one. Nothing here
+// stops that; only trusting the metadata URL does.
+//
+// The cost is one interactive login the first time an operator sets the flag,
+// and again if they change it. That is the correct trade. Caches written before
+// this field existed unmarshal with an empty MetadataURL and still match a
+// source that uses the derived path, so no one is logged out by the upgrade.
 type tokenCache struct {
-	Issuer       string    `json:"issuer"`
+	Issuer string `json:"issuer"`
+	// MetadataURL records which metadata document produced the endpoints these
+	// tokens were obtained through. Omitted when discovery used the derived
+	// well-known path, so caches written before this field existed still match.
+	MetadataURL  string    `json:"metadata_url,omitempty"`
 	ClientID     string    `json:"client_id"`
 	Audience     string    `json:"audience,omitempty"`
 	Resource     string    `json:"resource,omitempty"`
@@ -185,7 +219,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 	if cache.RefreshToken != "" {
 		refreshed, err := s.refreshToken(ctx, cache)
 		if err == nil {
-			nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.resource, s.scopes, refreshed)
+			nextCache := s.cacheFor(refreshed)
 			if err := s.saveCache(nextCache); err != nil {
 				return "", err
 			}
@@ -206,7 +240,7 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 	if err != nil {
 		return "", err
 	}
-	nextCache := tokenCacheFromOAuth2Token(s.issuer, s.clientID, s.audience, s.resource, s.scopes, token)
+	nextCache := s.cacheFor(token)
 	if err := s.saveCache(nextCache); err != nil {
 		return "", err
 	}
@@ -219,9 +253,10 @@ func (s *managedOIDCTokenSource) AccessToken(ctx context.Context, useCache bool)
 func (s *managedOIDCTokenSource) oauthConfig(ctx context.Context, redirectURL string) (*oauth2.Config, error) {
 	if s.discovery.AuthURL == "" || s.discovery.TokenURL == "" {
 		// Discover ignores an empty wellKnownUrl, so the derived path needs
-		// no branch. On both paths it checks the document's issuer against
-		// s.issuer, which is what keeps an operator-chosen metadata URL from
-		// rebinding the client to another authorization server.
+		// no branch. On both paths it compares the document's issuer against
+		// s.issuer — a consistency check against an honest wrong URL, not a
+		// defence against a hostile one, since the document asserts that
+		// field about itself. See the metadataURL field comment.
 		discovery, err := oidcclient.Discover(context.WithValue(ctx, oauth2.HTTPClient, s.httpClient), s.issuer, s.httpClient, s.metadataURL)
 		if err != nil {
 			return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
@@ -283,7 +318,10 @@ func (s *managedOIDCTokenSource) loadCache() (tokenCache, error) {
 	if err := json.Unmarshal(data, &cache); err != nil {
 		return tokenCache{}, fmt.Errorf("parse OIDC token cache: %w", err)
 	}
-	if cache.Issuer != s.issuer || cache.ClientID != s.clientID || cache.Audience != s.audience || cache.Resource != s.resource || normalizeScopes(cache.Scopes) != s.scopes {
+	// MetadataURL is part of the identity, not an incidental detail: it
+	// determines the token endpoint these credentials get posted to. See the
+	// tokenCache doc comment.
+	if cache.Issuer != s.issuer || cache.MetadataURL != s.metadataURL || cache.ClientID != s.clientID || cache.Audience != s.audience || cache.Resource != s.resource || normalizeScopes(cache.Scopes) != s.scopes {
 		return tokenCache{}, nil
 	}
 	return cache, nil
@@ -468,13 +506,18 @@ func tokenUsable(token *oauth2.Token, now time.Time) bool {
 	return token.Expiry.After(now.Add(tokenReuseWindow))
 }
 
-func tokenCacheFromOAuth2Token(issuer, clientID, audience, resource, scopes string, token *oauth2.Token) tokenCache {
+// cacheFor builds a cache entry stamped with this source's full identity.
+// A method rather than a function taking each field: the identity is what
+// loadCache compares against, and enumerating it at every call site is how a
+// new field gets added to the struct and missed at one of them.
+func (s *managedOIDCTokenSource) cacheFor(token *oauth2.Token) tokenCache {
 	cache := tokenCache{
-		Issuer:       issuer,
-		ClientID:     clientID,
-		Audience:     audience,
-		Resource:     resource,
-		Scopes:       scopes,
+		Issuer:       s.issuer,
+		MetadataURL:  s.metadataURL,
+		ClientID:     s.clientID,
+		Audience:     s.audience,
+		Resource:     s.resource,
+		Scopes:       s.scopes,
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,
 		TokenType:    token.TokenType,

@@ -56,16 +56,26 @@ const (
 // For audit purposes, note how the key set was reached, because it differs by
 // DiscoveryMode and the validator cannot tell afterwards:
 //
-//   - under DiscoveryModeDerived and DiscoveryModeMetadataURL the JWKS endpoint
-//     came from a metadata document that was itself verified to belong to the
-//     configured issuer, so the issuer-to-keys binding was *discovered*;
-//   - under DiscoveryModePinnedJWKS the endpoint came straight from operator
-//     configuration with no metadata document involved, so that binding is
-//     *asserted* by the operator and nothing here corroborates it.
+//   - under DiscoveryModeDerived the well-known path is constructed from the
+//     issuer URL, so the document was fetched from the issuer's own host over
+//     TLS. That is a real binding: the origin is authenticated, not merely
+//     claimed;
+//   - under DiscoveryModeMetadataURL the document came from a host the operator
+//     named. Discovery compares the document's `issuer` field to the configured
+//     issuer, but a document asserts that field about itself, so it binds
+//     nothing — the operator's choice of URL is the binding;
+//   - under DiscoveryModePinnedJWKS there is no document at all, so the
+//     issuer-to-keys binding is asserted by the operator outright.
+//
+// Only the first is verified. An earlier version of this comment grouped the
+// first two together as "discovered", which overstates the second.
 //
 // What does not vary: the verifier pins the configured issuer, so every token's
-// `iss` claim is enforced against it in all three modes. A pinned key set widens
-// which keys are trusted, never which issuer is.
+// `iss` claim is enforced against it in all three modes. Note what that does and
+// does not bound — it fixes *which issuer* a token may name, not *which keys*
+// may sign for it. A metadata document that names attacker-controlled keys
+// still yields tokens this validator accepts, because they can claim the
+// configured issuer truthfully as far as the verifier can tell.
 type JWTTokenValidator struct {
 	audience string
 	verifier *op.AccessTokenVerifier
@@ -82,7 +92,8 @@ const (
 	// from the issuer.
 	DiscoveryModeDerived DiscoveryMode = "derived"
 	// DiscoveryModeMetadataURL fetched an operator-supplied metadata
-	// document. The document's issuer is still checked against Issuer.
+	// document. Its issuer field is compared to Issuer, but self-asserted,
+	// so the operator's choice of URL is what the keys rest on.
 	DiscoveryModeMetadataURL DiscoveryMode = "metadata_url"
 	// DiscoveryModePinnedJWKS skipped metadata entirely. The issuer-to-keys
 	// binding is asserted by the operator rather than verified here.
@@ -92,10 +103,13 @@ const (
 // JWTValidatorConfig configures token validation. Issuer and Audience are
 // required in every mode.
 //
-// MetadataURL and JWKSURI change only *where the key set is found*, never
-// which issuer is trusted: Issuer remains the value enforced as the `iss`
-// claim on every token. They are mutually exclusive; the server rejects both
-// being set before reaching this constructor.
+// MetadataURL and JWKSURI change where the key set is found. Issuer remains the
+// value enforced as the `iss` claim on every token, so they cannot change which
+// issuer *name* is accepted — but they do change which keys sign for it, which
+// is the same thing from an attacker's point of view. Treat both as trusted
+// configuration, not as relocations of something already verified. They are
+// mutually exclusive; the server rejects both being set before reaching this
+// constructor.
 type JWTValidatorConfig struct {
 	// Issuer is the identity anchor. It is enforced as `iss` on every token
 	// and, on the discovery paths, must equal the `issuer` advertised by the
@@ -106,8 +120,14 @@ type JWTValidatorConfig struct {
 	// MetadataURL overrides the derived well-known path. Use it for an
 	// authorization server that publishes RFC 8414 metadata at a path the
 	// OIDC derivation cannot reach, or whose metadata sits off the issuer
-	// path entirely. The document's `issuer` is still verified against
-	// Issuer, so this changes the transport without weakening the binding.
+	// path entirely.
+	//
+	// Discovery compares the document's `issuer` against Issuer, but that
+	// field is self-asserted: a document at any host can echo the expected
+	// issuer and advertise attacker-controlled keys, which this server would
+	// then accept for tokens claiming that issuer. The check catches an
+	// honest wrong URL, not a hostile one. This value must be trusted as much
+	// as Issuer itself.
 	MetadataURL string
 	// JWKSURI pins the key set endpoint and skips metadata discovery. The
 	// constructor then makes no network call, so the server starts even
@@ -162,10 +182,10 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 	}
 	if jwksURI == "" {
 		// Discover ignores an empty wellKnownUrl, so the default derived
-		// path needs no branch here. On both paths it enforces that the
-		// document's issuer matches cfg.Issuer — the check that keeps an
-		// operator-chosen metadata URL from silently rebinding the server
-		// to another authorization server's keys.
+		// path needs no branch here. On both paths it compares the
+		// document's issuer against cfg.Issuer — a consistency check that
+		// catches an honestly-misconfigured URL, not a defence against a
+		// hostile one. See the MetadataURL field comment.
 		metadataSource := cfg.Issuer
 		if cfg.MetadataURL != "" {
 			metadataSource = cfg.MetadataURL

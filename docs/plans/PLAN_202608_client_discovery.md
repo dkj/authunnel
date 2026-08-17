@@ -140,8 +140,9 @@ suggests. `defaultBrowserOpener` passes the URL to `open` (`client/browser_other
 dispatchers** that launch whatever application is registered for the scheme, not browsers.
 The existing `#nosec G204` justification at `client/browser_other.go:26-29` reads "the url itself
 is the OIDC auth URL constructed from the configured IDP; trusting the IDP is an inherent
-assumption of the OIDC flow." That is sound for https metadata from a verified issuer and
-unsound over http, where the supplier is whoever is on the network path. **Update that comment
+assumption of the OIDC flow." That is sound only for a document fetched from the issuer's own
+host over TLS. It is unsound over http, where the supplier is whoever is on the network path,
+and unsound under `--oidc-metadata-url`, where the supplier is whoever the URL points at. **Update that comment
 as part of this work** — the annotation currently asserts a property the allowlist will be the
 thing actually providing.
 
@@ -174,19 +175,32 @@ server accepts, which is precisely what item 1 must not do.
 
 Same flag name, same semantics, same mutual-exclusion-free simplicity as the server minus the
 pinning half. `oidcclient.Discover` already takes the variadic `wellKnownUrl`, so this is one
-argument at `client/auth.go:193` plus config plumbing. The document's `issuer` is still verified
-against `--oidc-issuer` by zitadel, so it changes where metadata is fetched, never which issuer
-is trusted.
+argument at `client/auth.go:193` plus config plumbing. zitadel still compares the document's
+`issuer` against `--oidc-issuer`, which catches an honestly-wrong URL — but that field is
+self-asserted, so the override does move trust onto the URL the operator supplies. Document it
+as a trade, not as a relocation of something already verified.
 
 Carry it in `managedOIDCTokenSource` alongside `issuer` (`client/auth.go:55`).
 
-**Cache implication to decide during implementation:** `tokenCache` scopes entries by issuer,
-client ID, audience, resource, and scopes (`client/auth.go:75-85`) — deliberately, to avoid
-cross-provider reuse. The metadata URL does *not* belong in that key: it changes where endpoints
-are found, not which issuer minted the token, and adding it would invalidate every cached token
-the first time an operator sets the flag. Verify this reasoning holds before implementing; if a
-metadata URL can ever change which token you get back for the same issuer, it belongs in the key
-after all.
+**Cache identity — the metadata URL is part of it. `tokenCache` scopes entries by issuer,
+metadata URL, client ID, audience, resource, and scopes.**
+
+~~An earlier version of this paragraph concluded the opposite~~ — that the metadata URL "does not
+belong in that key" because it changes where endpoints are found, not which issuer minted the
+token. **That conclusion shipped, and it was a credential-disclosure bug.** It is recorded here
+rather than deleted because the reasoning is seductive and a maintainer who re-derives it will
+reintroduce the disclosure.
+
+The error was asking whether the cached credential is still *valid* rather than *who receives
+it*. The metadata document names the token endpoint the refresh token is posted to, and the only
+check on that document compares a self-asserted `issuer` field. So without the URL in the key,
+adding or mistyping `--oidc-metadata-url` posts an existing refresh token to whatever endpoint
+the new document names, with no user interaction.
+
+The rule, and the reason for it: **cache identity must include everything that determines where
+a credential gets sent, not only what determines whether it is still valid.** The one-login cost
+of a changed metadata URL is the intended price. See the outcome notes for item 3 and the
+`tokenCache` doc comment in `client/auth.go`.
 
 ### 4. Share the URL validation helper
 
@@ -253,9 +267,24 @@ the point of recording it — the idea is cheap to have and easy to implement ba
 
 ## Security invariants
 
-- **Issuer identity is unchanged.** `--oidc-issuer` remains required and remains the value
-  zitadel checks the metadata document against. `--oidc-metadata-url` moves the fetch, never the
-  trust anchor — identical to the server.
+- **`--oidc-issuer` remains required, but it is not the client's trust anchor.** Calling this
+  "identical to the server" — as an earlier draft did — repeats the mistake that produced the
+  cache bug: treating a self-asserted field as verification.
+
+  On the server the issuer *is* irreducible: it is enforced as `iss` on every token, so without
+  it the server would accept tokens from anyone. On the client nothing enforces it — the client
+  validates no tokens, and with `--oidc-metadata-url` set the issuer's only remaining jobs are
+  the `doc.Issuer != issuer` comparison and the cache identity. The client would function
+  without it.
+
+  It stays required because it is the only guard left against an *honest wrong* metadata URL —
+  staging instead of production, tenant A instead of B — which a legitimate AS reveals by
+  declaring its own issuer. Without it, that mistake survives a full browser login and surfaces
+  as a 401 from the authunnel server, remotely and after user interaction, rather than as a local
+  error before anything happens. It costs the operator nothing to supply: the client and server
+  must agree on the issuer anyway, since the server enforces it per token.
+
+  So: a consistency check that fails early, not a boundary. Do not lean on it as one.
 - **No auth traffic *that this client makes over HTTP* leaves https once it has started there.**
   Scope matters here, because one part of the flow is deliberately plaintext. The invariant
   covers the metadata and token fetches issued by our `*http.Client`, and the advertised
@@ -359,12 +388,37 @@ treat the docs as part of the change, not as a follow-up.
      `AUTHUNNEL_TUNNEL_URL` come from the environment. Adding one here alone would invite "why
      does this have an env var and the issuer does not". The plan assumed symmetry with the
      server, which does use env for everything.
-   - **The metadata URL stays out of the token cache key**, as reasoned above and confirmed
-     against `loadCache` (`client/auth.go:261`), which discards the cache on any mismatch of
-     issuer, client ID, audience, resource, or scopes. A token obtained through the override is
-     the same token — the document's issuer is verified against the configured issuer either way
-     — so keying on it would discard every cached token the first time an operator set the flag.
-     Recorded as a deliberate exclusion in the `tokenCache` doc comment.
+   - **The metadata URL is part of the token cache identity.** This plan originally reasoned the
+     opposite, and step 3 implemented and documented that: the override "only relocates the
+     document", so a token obtained through it is "the same token". **That was wrong, and it was a
+     credential-disclosure bug** — caught in review, not by me.
+
+     The error was asking whether the cached credential is still *valid* rather than *who
+     receives it*. The metadata document names the token endpoint the refresh token is posted to,
+     and the only check on that document is `discoveryConfig.Issuer != issuer` — a string
+     comparison against a value the document asserts about itself. Nothing binds the metadata
+     host to the issuer it claims. So with the URL left out of the cache key, adding or mistyping
+     `--oidc-metadata-url` would take an existing refresh token and post it to whatever endpoint
+     the new document named, with no user interaction. A mutation test makes it concrete: remove
+     the field from the comparison and the collector receives
+     `grant_type=refresh_token&refresh_token=super-secret-refresh-token`.
+
+     Note this is the *same* failure mode this plan used to reject endpoint pinning — "a wrong
+     value receives the refresh token rather than failing closed" — one level of indirection
+     removed. I wrote that argument and then shipped a flag with the property it warns about.
+
+     Fixed by adding `MetadataURL` to `tokenCache` and to the `loadCache` comparison: a changed
+     source discards the cache, so an already-issued refresh token is never handed over
+     silently. Scope that claim carefully — it prevents *silent reuse of a cached refresh
+     token*, not disclosure in general. A user who completes the fallback login still sends
+     the authorization code and PKCE verifier to the token endpoint the document names, and a
+     document can pair the real authorization endpoint with an attacker's token endpoint, so
+     the code that leaks is a genuine redeemable one. The only defence there is trusting the
+     metadata URL. Omitted from JSON when
+     empty, so caches written before the field existed still match a derived-path source and
+     nobody is logged out by the upgrade. `tokenCacheFromOAuth2Token` became the method
+     `cacheFor`, because enumerating identity fields at each call site is how a new one gets
+     added to the struct and missed at a call site.
 
    One consequence worth noting: the downgrade check is now judged against the metadata URL when
    set, not the issuer, since it is the document's own transport that decides whether an endpoint

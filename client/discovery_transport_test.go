@@ -432,7 +432,10 @@ func TestNewAuthTokenSourceAppliesMetadataURL(t *testing.T) {
 
 	cachePath := filepathForTest(t, "tokens.json")
 	writeTokenCacheForTest(t, cachePath, tokenCache{
-		Issuer:       issuer,
+		Issuer: issuer,
+		// Stamped with the same metadata URL the source uses: this entry was
+		// obtained through that document, so reusing it is legitimate.
+		MetadataURL:  metadataURL,
 		ClientID:     "authunnel-cli",
 		Scopes:       normalizeScopes("openid offline_access"),
 		AccessToken:  "expired-token",
@@ -468,10 +471,12 @@ func TestNewAuthTokenSourceAppliesMetadataURL(t *testing.T) {
 	}
 }
 
-// TestClientMetadataURLRejectsIssuerMismatch is the security test for the
-// override: relocating the document must not relocate trust. Asserts the
-// specific cause, since a network or parse failure would also produce an error
-// here and would make this pass with the binding check gone.
+// TestClientMetadataURLRejectsIssuerMismatch pins what the issuer comparison
+// does catch: an honestly wrong metadata URL, which a legitimate server reveals
+// by declaring its own issuer. It is not a defence against a hostile URL — that
+// field is self-asserted and can echo anything — so do not read this test as
+// proving the override preserves trust. Asserts the specific cause, since a
+// network or parse failure would also produce an error here.
 func TestClientMetadataURLRejectsIssuerMismatch(t *testing.T) {
 	issuer, metadataURL, client := newTenantIssuer(t, func(string) string { return "https://attacker.example" })
 

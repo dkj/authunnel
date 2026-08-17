@@ -52,9 +52,16 @@ type clientConfig struct {
 
 	OIDCIssuer string
 	// OIDCMetadataURL overrides the well-known path derived from OIDCIssuer.
-	// It changes only where the metadata document is fetched from — the
-	// document's issuer is still checked against OIDCIssuer, which remains
-	// required.
+	// It changes only where the metadata document is fetched from.
+	//
+	// OIDCIssuer stays required even though, with this set, the client could
+	// technically run without it: every endpoint comes from the document, and
+	// the client validates no tokens. It is kept as a consistency check — the
+	// document declares its own issuer, so an honest-but-wrong metadata URL
+	// (staging for production, one tenant for another) fails here instead of
+	// after a browser login, as a 401 from the authunnel server. It is not a
+	// trust anchor: the issuer in the document is self-asserted and proves
+	// nothing about the host serving it.
 	OIDCMetadataURL  string
 	OIDCClientID     string
 	OIDCAudience     string

@@ -502,11 +502,12 @@ func TestMetadataURLReachesNonDerivedPath(t *testing.T) {
 	}
 }
 
-// TestMetadataURLRejectsIssuerMismatch is the load-bearing security test for
-// the override: an operator may choose where metadata is fetched from, but the
-// document must still self-identify as the configured issuer. Without this, a
-// metadata URL pointing at another authorization server would silently rebind
-// the server to that server's keys.
+// TestMetadataURLRejectsIssuerMismatch pins the one thing the issuer comparison
+// does buy: an *honestly* wrong metadata URL — a different tenant, a staging
+// AS — is refused, because a legitimate server declares its own issuer. It is
+// not a defence against a hostile URL, which can echo the expected issuer; see
+// the MetadataURL field comment. Assert the specific cause, since a network or
+// parse failure would also produce an error here.
 func TestMetadataURLRejectsIssuerMismatch(t *testing.T) {
 	const tenantPath = "/.well-known/oauth-authorization-server/tenant1"
 	issuer := newFakeIssuer(t, fakeIssuerConfig{
