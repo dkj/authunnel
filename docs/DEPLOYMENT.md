@@ -86,7 +86,9 @@ For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origi
 
 ## Server flags and environment variables
 
-- `--oidc-issuer` or `OIDC_ISSUER`
+- `--oidc-issuer` or `OIDC_ISSUER` — **required in every mode.** This is the identity anchor: it is enforced as the `iss` claim on every token, and on the discovery paths the metadata document's own `issuer` must match it. The two overrides below change only *where the key set is found*; neither replaces this
+- `--oidc-metadata-url` or `OIDC_METADATA_URL` — authorization server metadata document URL, overriding the well-known path derived from the issuer. Use this for an authorization server that publishes RFC 8414 metadata at a path the OIDC derivation cannot construct (RFC 8414 inserts the well-known segment *before* the path component, so an issuer of `https://as.example/tenant1` publishes at `https://as.example/.well-known/oauth-authorization-server/tenant1`), or whose metadata sits off the issuer path entirely. The document's `issuer` is still verified against `--oidc-issuer`, so this changes the transport without weakening the binding. Mutually exclusive with `--oidc-jwks-uri`
+- `--oidc-jwks-uri` or `OIDC_JWKS_URI` — pinned JWKS endpoint. Skips metadata discovery entirely, so the server makes **no network call at startup** and comes up even when the issuer is unreachable. Two consequences to weigh: a wrong URL surfaces on the first protected request rather than at startup, and because there is no metadata document to cross-check, the issuer-to-keys binding is asserted by you rather than verified by the server. Key rotation still works — the key set refetches on an unrecognised `kid`, so only the endpoint is fixed, not the key material. Mutually exclusive with `--oidc-metadata-url`
 - `--token-audience` or `TOKEN_AUDIENCE`
 - `--listen-addr` or `LISTEN_ADDR` (default varies by TLS mode; see above)
 - `--log-level` or `LOG_LEVEL` with default `info`
@@ -99,7 +101,7 @@ For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origi
 - `--allow-open-egress` or `ALLOW_OPEN_EGRESS=true` — explicit opt-in for running with no allowlist; mutually exclusive with `--allow`. Use only when arbitrary authenticated egress from the server host is acceptable for the deployment
 - `--ip-block` or `IP_BLOCK` (comma-separated in env) — resolved-IP deny-list applied after `--allow`; repeatable. Accepts CIDR (`127.0.0.0/8`), bare IP (`127.0.0.1`), or bracketed IPv6 (`[::1]`, `[fe80::/10]`). When unset and `--no-ip-block` is not set, defaults to the built-in protected set (loopback, IPv4/IPv6 link-local incl. IMDS `169.254.169.254`, unspecified, multicast). Applies in both restrictive and open-egress modes; deny wins over `--allow`
 - `--no-ip-block` or `NO_IP_BLOCK=true` — disable the resolved-IP deny-list entirely; mutually exclusive with `--ip-block`. Use only when the deployment legitimately needs to reach default-protected addresses (e.g. tunnelling to a localhost service) and a tighter `--ip-block` list is not sufficient
-- `--insecure-oidc-issuer` or `INSECURE_OIDC_ISSUER=true` — allow a non-HTTPS OIDC issuer URL **(development only; do not use in production)**
+- `--insecure-oidc-issuer` or `INSECURE_OIDC_ISSUER=true` — allow non-HTTPS OIDC issuer, metadata and JWKS URLs **(development only; do not use in production)**. This relaxes transport security only; it does not widen the set of permitted URL schemes, so `file://` is still refused. Loading a JWKS from disk is not supported — routing `file://` through the shared auth HTTP client would make local files reachable from any redirect that client follows
 - `--max-connection-duration` or `MAX_CONNECTION_DURATION` — hard maximum tunnel lifetime (e.g. `4h`, `30m`); default `0` (unlimited)
 - `--no-connection-token-expiry` or `NO_CONNECTION_TOKEN_EXPIRY=true` — do not tie tunnel lifetime to access token expiry; by default expiry IS enforced and clients can refresh tokens to extend. Setting this **and** leaving `--max-connection-duration` at `0` removes every enforced lifetime cap; the server logs a `connection_lifetime_unbounded` warning at startup so the posture is visible in logs
 - `--expiry-warning` or `EXPIRY_WARNING` — warning period before either longevity limit; default `3m`
@@ -114,6 +116,72 @@ For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origi
 - `--preauth-trust-forwarded-for` or `PREAUTH_TRUST_FORWARDED_FOR` — how the pre-auth limiter derives the client IP from `X-Forwarded-For`: `off` (default; bucket by the TCP peer), `leftmost`, `rightmost` (recommended for a single reverse proxy), or `single-hop` (require exactly one entry). Decoupled from the listening mode and off by default even under `--plaintext-behind-reverse-proxy`, so a client-supplied header cannot mint new buckets; valid in TLS modes too. In any trusting mode a request whose header violates the expectation is rejected with `400`, and the trusted client IP is logged as `forwarded_client_ip`.
 
 Admission rejections are emitted as structured `warn` log records with `event=tunnel_admission_denied` and a `reason` field (`global`, `per_user`, or `rate`), so operators can distinguish abuse from undersized limits without adding a metrics stack. Pre-auth rejections are logged separately with `event=preauth_rate_limited` so the two layers can be told apart in queries. Per-user policy is keyed on the OIDC `sub` claim; tokens without a stable subject are rejected earlier by the JWT validator before admission runs.
+
+## Issuer metadata and key discovery
+
+The server needs one thing from the issuer: the JWKS endpoint that its signing keys are
+published at. Every claim check after that — signature, `iss`, `exp`, `aud`, `sub`, `iat`, `nbf`
+— is evaluated locally against the cached key set, with no per-request round trip to the issuer.
+
+That is not the same as "no runtime traffic to the issuer", and the difference matters when
+planning egress. The key set is fetched **lazily, not at startup**, and is refetched when a token
+presents a `kid` that is not in the cache:
+
+- the first authenticated request after startup triggers a JWKS fetch, in every discovery mode;
+- a token whose `kid` does not match a cached key triggers a fetch. This is what makes issuer key
+  rotation self-healing, and it is also why a stream of tokens bearing unrecognised `kid` values
+  drives repeated outbound fetches — concurrent ones are coalesced into a single in-flight
+  request, but there is no negative cache or backoff between them. `--preauth-rate` is the
+  control for that; see the flag list above;
+- otherwise verification is served entirely from cache.
+
+So the server needs outbound access to the JWKS endpoint for the life of the process, not only
+during startup. Firewall rules that permit issuer traffic only during a startup window will fail
+later, at the first rotation, in a way that looks like a token problem rather than a network one.
+
+There are three ways the JWKS endpoint is located. The mode in effect is reported as
+`discovery_mode` on the `token_validator_ready` log line at startup, so it can be confirmed on a
+running server rather than inferred from deployment config.
+
+| `discovery_mode` | Set by | Startup network call | Issuer-to-keys binding |
+| --- | --- | --- | --- |
+| `derived` (default) | nothing; derived from `--oidc-issuer` | yes | verified |
+| `metadata_url` | `--oidc-metadata-url` | yes | verified |
+| `pinned_jwks` | `--oidc-jwks-uri` | **no** | **asserted by the operator** |
+
+- **`derived`** — OIDC discovery at `<issuer>/.well-known/openid-configuration`. Correct for
+  essentially every OIDC provider.
+- **`metadata_url`** — discovery against a URL you supply. Needed when the authorization server
+  publishes RFC 8414 metadata, which inserts the well-known segment *before* the path component
+  (`https://as.example/tenant1` publishes at
+  `https://as.example/.well-known/oauth-authorization-server/tenant1`), or when metadata sits off
+  the issuer path entirely. The document's `issuer` is still checked against `--oidc-issuer`, so
+  this changes where metadata is fetched from, never which issuer is trusted. A document
+  advertising a different issuer is refused at startup.
+- **`pinned_jwks`** — metadata discovery is skipped. The server makes no network call at startup
+  and comes up with the issuer unreachable, which is the reason to use it. The costs: a wrong
+  endpoint surfaces on the first authenticated request rather than at startup, and with no
+  metadata document to cross-check, nothing verifies that those keys belong to that issuer except
+  your configuration. Logged at **warn** level for that reason. Key rotation still works — the key
+  set refetches on an unrecognised `kid`, so only the endpoint is pinned, not the key material.
+
+`--oidc-issuer` is required in all three. It is the value enforced as the `iss` claim on every
+token; under `pinned_jwks` it is the *only* thing binding accepted tokens to an issuer.
+
+### Transport rules on the key path
+
+Signing keys decide whether a token is genuine, so the server refuses to fetch them over a
+weaker transport than the metadata that named them:
+
+- issuer metadata retrieved over `https` may not advertise a plaintext `jwks_uri` — startup fails;
+- a redirect may not move a metadata or JWKS fetch off `https`. Go follows cross-scheme redirects
+  silently, so this is enforced explicitly rather than inherited from the HTTP client;
+- an issuer already served over `http` — development only, behind `--insecure-oidc-issuer` — has
+  no downgrade left to prevent and is unaffected.
+
+These rules apply to the **server's** validator. The managed client fetches its own metadata and
+token endpoints and is not covered by them; keep client-side issuer URLs on `https`, which the
+client already requires unless `--insecure-oidc-issuer` is set.
 
 ## Egress rules and the resolved-IP deny-list
 
@@ -171,6 +239,7 @@ Some providers require extra configuration before `offline_access` can be reques
 Before going to production, verify:
 
 - [ ] OIDC issuer is `https://` — `--insecure-oidc-issuer` is **not** set.
+- [ ] Issuer metadata is discovered rather than bypassed. The startup log line `token_validator_ready` reports `discovery_mode`; `derived` is the default. If it reports `pinned_jwks`, confirm the `--oidc-jwks-uri` value really belongs to the configured issuer — the server cannot verify that binding for itself in this mode, and it is logged at warn level for that reason. If it reports `metadata_url`, the binding is still verified, but check the URL is one you control.
 - [ ] Tunnel endpoint is `https://` or `wss://` — `--insecure-tunnel-url` is **not** set on the client.
 - [ ] Token-expiry enforcement is active — `--no-connection-token-expiry` is **not** set. By default, tunnels close when the access token expires and clients must refresh. Disabling this removes token expiry as a tunnel lifetime control; tunnels will still close at `--max-connection-duration` if set, but without that limit they persist until the client disconnects.
 - [ ] At least one `--allow` rule is configured. `--allow-open-egress` should only appear in deployments where arbitrary authenticated egress from the server host is explicitly acceptable.

@@ -5,7 +5,7 @@
 Current auth model:
 
 - The client is a public OIDC client and uses Authorization Code + PKCE.
-- The server is an OAuth2 resource server: it uses OIDC discovery only to bootstrap the JWKS endpoint location, then validates JWT access tokens locally.
+- The server is an OAuth2 resource server: it uses issuer metadata only to bootstrap the JWKS endpoint location (or takes that endpoint directly via `--oidc-jwks-uri`), then runs JWT claim checks locally against a cached key set.
 - The server requires a configured token audience in the access-token `aud` claim.
 - No separate resource-server client secret is needed for Authunnel startup.
 

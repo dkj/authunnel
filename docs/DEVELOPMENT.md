@@ -90,6 +90,16 @@ cd server
 CGO_ENABLED=0 go run . --allow-open-egress
 ```
 
+Keycloak publishes OIDC discovery at the derived well-known path, so no discovery
+override is needed here. To test against an authorization server that only
+publishes RFC 8414 metadata, or one whose metadata sits off the issuer path, add
+`--oidc-metadata-url` pointing at the document — the server still requires its
+`issuer` to match `OIDC_ISSUER`. `--oidc-jwks-uri` skips metadata discovery
+altogether, which is useful for reproducing a start-up-with-IdP-down scenario.
+Both accept `http://` under `INSECURE_OIDC_ISSUER=true`, but neither accepts
+`file://`. The startup log line `token_validator_ready` reports which mode
+resolved.
+
 ### 3) Start Authunnel client in managed mode
 
 ```bash

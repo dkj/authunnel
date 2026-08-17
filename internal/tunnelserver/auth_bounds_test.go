@@ -136,7 +136,7 @@ func TestNewJWTTokenValidatorDiscoveryTimesOut(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := NewJWTTokenValidator(ctx, issuer, "test-aud", client)
+	_, _, err := NewJWTTokenValidator(ctx, JWTValidatorConfig{Issuer: issuer, Audience: "test-aud", HTTPClient: client})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -160,7 +160,7 @@ func TestNewJWTTokenValidatorRespectsContextDeadline(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := NewJWTTokenValidator(ctx, issuer, "test-aud", client)
+	_, _, err := NewJWTTokenValidator(ctx, JWTValidatorConfig{Issuer: issuer, Audience: "test-aud", HTTPClient: client})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -202,7 +202,7 @@ func TestJWTTokenValidatorJWKSFetchTimesOut(t *testing.T) {
 	issuerURL = issuer.URL
 
 	client := &http.Client{Timeout: 500 * time.Millisecond}
-	validator, err := NewJWTTokenValidator(context.Background(), issuerURL, "test-aud", client)
+	validator, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{Issuer: issuerURL, Audience: "test-aud", HTTPClient: client})
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
 	}

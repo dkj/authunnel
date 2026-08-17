@@ -328,7 +328,7 @@ func TestCheckTokenRejectsInvalidAuthorizationScheme(t *testing.T) {
 func TestJWTTokenValidatorAcceptsConfiguredAudience(t *testing.T) {
 	issuer, serverClient, token := newJWTTestIssuer(t, "authunnel-server")
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, "authunnel-server", serverClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: "authunnel-server", HTTPClient: serverClient})
 	if err != nil {
 		t.Fatalf("expected validator construction to succeed, got error: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestJWTTokenValidatorAcceptsConfiguredAudience(t *testing.T) {
 func TestJWTTokenValidatorRejectsWrongAudience(t *testing.T) {
 	issuer, serverClient, token := newJWTTestIssuer(t, "wrong-audience")
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, "authunnel-server", serverClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: "authunnel-server", HTTPClient: serverClient})
 	if err != nil {
 		t.Fatalf("expected validator construction to succeed, got error: %v", err)
 	}
@@ -1934,7 +1934,7 @@ func TestMaxDurationActuallyClosesConnection(t *testing.T) {
 	const audience = "authunnel-server"
 	issuer, issuerClient, token := newJWTTestIssuer(t, audience)
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: audience, HTTPClient: issuerClient})
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
 	}
@@ -2059,7 +2059,7 @@ func TestMaxDurationSendsWarningBeforeDisconnect(t *testing.T) {
 	const audience = "authunnel-server"
 	issuer, issuerClient, token := newJWTTestIssuer(t, audience)
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: audience, HTTPClient: issuerClient})
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
 	}
@@ -2189,7 +2189,7 @@ func TestTokenExpiryActuallyClosesConnection(t *testing.T) {
 	// handshake to complete, short enough to verify enforcement.
 	issuer, issuerClient, token := newJWTTestIssuerWithExpiry(t, audience, 2*time.Second)
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: audience, HTTPClient: issuerClient})
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
 	}
@@ -2303,7 +2303,7 @@ func TestTokenRefreshExtendsTunnelBeyondOriginalExpiry(t *testing.T) {
 	// Initial token expires in 2s.
 	issuer, issuerClient, initialToken, mint := newJWTTestIssuerFull(t, audience, 2*time.Second)
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: audience, HTTPClient: issuerClient})
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
 	}
@@ -2457,7 +2457,7 @@ func TestExpiryGraceKeepsTunnelAliveForCachedTokenRefresh(t *testing.T) {
 	// Initial token expires in 2s.
 	issuer, issuerClient, initialToken, mint := newJWTTestIssuerFull(t, audience, 2*time.Second)
 
-	validator, err := tunnelserver.NewJWTTokenValidator(context.Background(), issuer, audience, issuerClient)
+	validator, _, err := tunnelserver.NewJWTTokenValidator(context.Background(), tunnelserver.JWTValidatorConfig{Issuer: issuer, Audience: audience, HTTPClient: issuerClient})
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
 	}

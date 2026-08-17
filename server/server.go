@@ -35,10 +35,15 @@ var version = "dev"
 const maxTunnelOpenRate = 10_000
 const maxExpiryGrace = time.Hour
 
-// startupAuthTimeout bounds OIDC discovery during server startup. It sits
-// above the per-call HTTP timeout in authhttp.NewBoundedClient so the
+// startupAuthTimeout bounds the issuer metadata fetch during server startup. It
+// sits above the per-call HTTP timeout in authhttp.NewBoundedClient so the
 // underlying HTTP transport is the closer error source, while staying well
 // under any plausible operator patience for a stalled issuer.
+//
+// It bounds nothing under --oidc-jwks-uri, which makes no startup fetch at all.
+// Note it does not bound the JWKS fetch in any mode either: the key set is
+// fetched lazily on the first token verified, long after this context is
+// cancelled, and is bounded by the HTTP client's own timeouts instead.
 const startupAuthTimeout = 30 * time.Second
 
 // httpServerMaxHeaderBytes lowers the request-header memory cap from Go's
@@ -48,7 +53,16 @@ const startupAuthTimeout = 30 * time.Second
 const httpServerMaxHeaderBytes = 16 * 1024
 
 type serverConfig struct {
-	Issuer        string
+	Issuer string
+	// OIDCMetadataURL overrides the well-known path derived from Issuer.
+	// Mutually exclusive with OIDCJWKSURI. Changes only where metadata is
+	// fetched from — the document's issuer is still checked against Issuer.
+	OIDCMetadataURL string
+	// OIDCJWKSURI pins the key set endpoint and skips metadata discovery
+	// entirely. Mutually exclusive with OIDCMetadataURL. Neither field
+	// replaces Issuer, which stays required in every mode because it is the
+	// value enforced as the `iss` claim on each token.
+	OIDCJWKSURI   string
 	TokenAudience string
 	ListenAddr    string
 	// TLS files mode
@@ -59,7 +73,9 @@ type serverConfig struct {
 	ACMECacheDir string
 	// Plaintext mode (behind a TLS-terminating reverse proxy)
 	PlaintextBehindProxy bool
-	// Development override: allow non-HTTPS OIDC issuer
+	// Development override: allow non-HTTPS issuer, metadata and JWKS URLs.
+	// Relaxes transport security only — it does not widen the set of
+	// permitted URL schemes, so file:// stays refused.
 	InsecureOIDCIssuer bool
 	LogLevel           slog.Level
 	AllowRules         tunnelserver.Allowlist
@@ -109,7 +125,20 @@ func serverUsage(w io.Writer) {
 
 Flags and their environment variable equivalents:
 
-  --oidc-issuer <url>        OIDC issuer URL for JWT discovery and validation (env: OIDC_ISSUER)
+  --oidc-issuer <url>        OIDC issuer URL for JWT discovery and validation (env: OIDC_ISSUER).
+                             Required in every mode: it is enforced as the token 'iss' claim, and the
+                             overrides below change only where the key set is found, never which
+                             issuer is trusted.
+  --oidc-metadata-url <url>  Authorization server metadata document URL, overriding the well-known
+                             path derived from --oidc-issuer (env: OIDC_METADATA_URL). For an
+                             authorization server publishing RFC 8414 metadata at a path the OIDC
+                             derivation cannot construct. The document's issuer must still match
+                             --oidc-issuer. Mutually exclusive with --oidc-jwks-uri.
+  --oidc-jwks-uri <url>      Pinned JWKS endpoint; skips metadata discovery entirely (env:
+                             OIDC_JWKS_URI). The server then makes no network call at startup and
+                             comes up with the issuer unreachable, but a wrong URL surfaces on the
+                             first protected request, and the issuer-to-keys binding is asserted by
+                             you rather than verified. Mutually exclusive with --oidc-metadata-url.
   --token-audience <string>  Audience required in validated access tokens (env: TOKEN_AUDIENCE)
   --listen-addr <addr>       Listen address (env: LISTEN_ADDR, default: :8443 for TLS-files, :443 for ACME, :8080 for plaintext-behind-reverse-proxy)
   --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)
@@ -202,7 +231,9 @@ Other:
 
 Development / unsafe overrides (do not use in production):
 
-  --insecure-oidc-issuer     Allow a non-HTTPS OIDC issuer URL (env: INSECURE_OIDC_ISSUER=true)
+  --insecure-oidc-issuer     Allow non-HTTPS OIDC issuer, metadata and JWKS URLs (env:
+                             INSECURE_OIDC_ISSUER=true). Relaxes transport security only; it does
+                             not widen the permitted URL schemes, so file:// is still refused.
 `)
 }
 
@@ -265,12 +296,28 @@ func main() {
 
 	authHTTPClient := authhttp.NewBoundedClient()
 	discoveryCtx, cancelDiscovery := context.WithTimeout(context.Background(), startupAuthTimeout)
-	validator, err := tunnelserver.NewJWTTokenValidator(discoveryCtx, cfg.Issuer, cfg.TokenAudience, authHTTPClient)
+	validator, discoveryMode, err := tunnelserver.NewJWTTokenValidator(discoveryCtx, tunnelserver.JWTValidatorConfig{
+		Issuer:      cfg.Issuer,
+		Audience:    cfg.TokenAudience,
+		MetadataURL: cfg.OIDCMetadataURL,
+		JWKSURI:     cfg.OIDCJWKSURI,
+		HTTPClient:  authHTTPClient,
+	})
 	cancelDiscovery()
 	if err != nil {
 		logger.Error("create token validator", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	// A pinned JWKS means the server never verified for itself that these
+	// keys belong to the configured issuer, so say so at warn level rather
+	// than burying it in an info line.
+	validatorReady := logger.Info
+	if discoveryMode == tunnelserver.DiscoveryModePinnedJWKS {
+		validatorReady = logger.Warn
+	}
+	validatorReady("token_validator_ready",
+		slog.String("issuer", cfg.Issuer),
+		slog.String("discovery_mode", string(discoveryMode)))
 
 	admitter := tunnelserver.NewAdmitter(tunnelserver.AdmissionConfig{
 		GlobalMax:    cfg.MaxConcurrentTunnels,
@@ -344,16 +391,50 @@ func main() {
 	}
 }
 
+// validateAuthURL applies the shared shape and scheme rules to the issuer and
+// the two discovery-override URLs.
+//
+// Schemes other than http(s) are rejected by name rather than falling through
+// to the generic "not a valid URL" message. file:// is the one operators
+// actually reach for — to load a JWKS off disk in an air-gapped or zero-egress
+// deployment — and it is refused deliberately, including under
+// --insecure-oidc-issuer: that flag relaxes transport security for a local
+// development IdP, it does not widen the set of permitted schemes. Serving a
+// JWKS from disk needs a separate flag with its own code path, because routing
+// file:// through the shared auth HTTP client would make local files reachable
+// from any redirect that client follows.
+func validateAuthURL(flagName, raw string, allowInsecure bool) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s %q is not a valid URL", flagName, raw)
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !allowInsecure {
+			return fmt.Errorf("%s must use an https:// URL; use --insecure-oidc-issuer or INSECURE_OIDC_ISSUER=true to allow plaintext (development only)", flagName)
+		}
+	default:
+		return fmt.Errorf("%s %q uses unsupported scheme %q; only https:// (or http:// with --insecure-oidc-issuer) is accepted", flagName, raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s %q is not a valid URL", flagName, raw)
+	}
+	return nil
+}
+
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {
 	cfg := serverConfig{
-		Issuer:        getenv("OIDC_ISSUER"),
-		TokenAudience: getenv("TOKEN_AUDIENCE"),
-		TLSCertPath:   getenv("TLS_CERT_FILE"),
-		TLSKeyPath:    getenv("TLS_KEY_FILE"),
-		ACMECacheDir:  "/var/cache/authunnel/acme",
-		LogLevel:      slog.LevelInfo,
-		ExpiryWarning: 3 * time.Minute,
-		DialTimeout:   10 * time.Second,
+		Issuer:          getenv("OIDC_ISSUER"),
+		OIDCMetadataURL: getenv("OIDC_METADATA_URL"),
+		OIDCJWKSURI:     getenv("OIDC_JWKS_URI"),
+		TokenAudience:   getenv("TOKEN_AUDIENCE"),
+		TLSCertPath:     getenv("TLS_CERT_FILE"),
+		TLSKeyPath:      getenv("TLS_KEY_FILE"),
+		ACMECacheDir:    "/var/cache/authunnel/acme",
+		LogLevel:        slog.LevelInfo,
+		ExpiryWarning:   3 * time.Minute,
+		DialTimeout:     10 * time.Second,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
@@ -508,6 +589,10 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	var showVersion bool
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.Issuer, "oidc-issuer", cfg.Issuer, "OIDC issuer used for JWT discovery and validation")
+	fs.StringVar(&cfg.OIDCMetadataURL, "oidc-metadata-url", cfg.OIDCMetadataURL,
+		"Authorization server metadata document URL, overriding the well-known path derived from --oidc-issuer; the document's issuer must still match (env: OIDC_METADATA_URL)")
+	fs.StringVar(&cfg.OIDCJWKSURI, "oidc-jwks-uri", cfg.OIDCJWKSURI,
+		"Pinned JWKS endpoint; skips metadata discovery entirely, so the issuer-to-keys binding is asserted by you rather than verified. Mutually exclusive with --oidc-metadata-url (env: OIDC_JWKS_URI)")
 	fs.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "Audience required in validated access tokens")
 	fs.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "Path to the TLS certificate PEM file")
 	fs.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "Path to the TLS private key PEM file")
@@ -515,7 +600,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	fs.BoolVar(&cfg.PlaintextBehindProxy, "plaintext-behind-reverse-proxy", cfg.PlaintextBehindProxy,
 		"Serve plain HTTP, trusting a TLS-terminating reverse proxy for transport security; X-Forwarded-Proto and X-Forwarded-Host are used for WebSocket origin checks")
 	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", cfg.InsecureOIDCIssuer,
-		"Allow a non-HTTPS OIDC issuer URL (development only; do not use in production)")
+		"Allow non-HTTPS OIDC issuer, metadata and JWKS URLs (development only; do not use in production)")
 	fs.BoolVar(&cfg.AllowOpenEgress, "allow-open-egress", cfg.AllowOpenEgress,
 		"Explicit opt-in for running without an allowlist; mutually exclusive with --allow")
 	fs.BoolVar(&cfg.NoIPBlock, "no-ip-block", cfg.NoIPBlock,
@@ -726,15 +811,28 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		}
 	}
 
+	// --oidc-issuer stays required in every mode. The discovery overrides
+	// below replace only where the key set is *found*; the issuer is what is
+	// enforced as the `iss` claim on every token, and under --oidc-jwks-uri
+	// it is the only thing binding accepted tokens to an issuer at all.
 	if cfg.Issuer == "" {
 		return cfg, errors.New("--oidc-issuer or OIDC_ISSUER is required")
 	}
-	issuerU, err := url.Parse(cfg.Issuer)
-	if err != nil || issuerU.Host == "" {
-		return cfg, fmt.Errorf("--oidc-issuer %q is not a valid URL", cfg.Issuer)
+	if err := validateAuthURL("--oidc-issuer", cfg.Issuer, cfg.InsecureOIDCIssuer); err != nil {
+		return cfg, err
 	}
-	if issuerU.Scheme != "https" && !cfg.InsecureOIDCIssuer {
-		return cfg, errors.New("--oidc-issuer must use an https:// URL; use --insecure-oidc-issuer or INSECURE_OIDC_ISSUER=true to allow plaintext (development only)")
+	if cfg.OIDCMetadataURL != "" && cfg.OIDCJWKSURI != "" {
+		return cfg, errors.New("--oidc-metadata-url and --oidc-jwks-uri are mutually exclusive; set at most one")
+	}
+	if cfg.OIDCMetadataURL != "" {
+		if err := validateAuthURL("--oidc-metadata-url", cfg.OIDCMetadataURL, cfg.InsecureOIDCIssuer); err != nil {
+			return cfg, err
+		}
+	}
+	if cfg.OIDCJWKSURI != "" {
+		if err := validateAuthURL("--oidc-jwks-uri", cfg.OIDCJWKSURI, cfg.InsecureOIDCIssuer); err != nil {
+			return cfg, err
+		}
 	}
 	if cfg.TokenAudience == "" {
 		return cfg, errors.New("--token-audience or TOKEN_AUDIENCE is required")
