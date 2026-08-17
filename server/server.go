@@ -35,10 +35,15 @@ var version = "dev"
 const maxTunnelOpenRate = 10_000
 const maxExpiryGrace = time.Hour
 
-// startupAuthTimeout bounds OIDC discovery during server startup. It sits
-// above the per-call HTTP timeout in authhttp.NewBoundedClient so the
+// startupAuthTimeout bounds the issuer metadata fetch during server startup. It
+// sits above the per-call HTTP timeout in authhttp.NewBoundedClient so the
 // underlying HTTP transport is the closer error source, while staying well
 // under any plausible operator patience for a stalled issuer.
+//
+// It bounds nothing under --oidc-jwks-uri, which makes no startup fetch at all.
+// Note it does not bound the JWKS fetch in any mode either: the key set is
+// fetched lazily on the first token verified, long after this context is
+// cancelled, and is bounded by the HTTP client's own timeouts instead.
 const startupAuthTimeout = 30 * time.Second
 
 // httpServerMaxHeaderBytes lowers the request-header memory cap from Go's
@@ -68,7 +73,9 @@ type serverConfig struct {
 	ACMECacheDir string
 	// Plaintext mode (behind a TLS-terminating reverse proxy)
 	PlaintextBehindProxy bool
-	// Development override: allow non-HTTPS OIDC issuer
+	// Development override: allow non-HTTPS issuer, metadata and JWKS URLs.
+	// Relaxes transport security only — it does not widen the set of
+	// permitted URL schemes, so file:// stays refused.
 	InsecureOIDCIssuer bool
 	LogLevel           slog.Level
 	AllowRules         tunnelserver.Allowlist

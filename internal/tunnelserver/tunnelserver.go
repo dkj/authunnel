@@ -49,9 +49,22 @@ const (
 	maxAuthorizationHeaderBytes = maxBearerTokenBytes + 64
 )
 
-// JWTTokenValidator validates bearer access tokens against issuer discovery and
-// the issuer's JWKS, then applies an explicit audience check for the protected
-// resource.
+// JWTTokenValidator validates bearer access tokens against a JWKS, then applies
+// an explicit audience check for the protected resource.
+//
+// For audit purposes, note how the key set was reached, because it differs by
+// DiscoveryMode and the validator cannot tell afterwards:
+//
+//   - under DiscoveryModeDerived and DiscoveryModeMetadataURL the JWKS endpoint
+//     came from a metadata document that was itself verified to belong to the
+//     configured issuer, so the issuer-to-keys binding was *discovered*;
+//   - under DiscoveryModePinnedJWKS the endpoint came straight from operator
+//     configuration with no metadata document involved, so that binding is
+//     *asserted* by the operator and nothing here corroborates it.
+//
+// What does not vary: the verifier pins the configured issuer, so every token's
+// `iss` claim is enforced against it in all three modes. A pinned key set widens
+// which keys are trusted, never which issuer is.
 type JWTTokenValidator struct {
 	audience string
 	verifier *op.AccessTokenVerifier

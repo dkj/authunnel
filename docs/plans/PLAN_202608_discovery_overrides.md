@@ -333,6 +333,17 @@ Findings from review after the above was written, all now fixed:
   reason `--preauth-rate` matters; noted there. The same implication was corrected in README, in
   `docs/Notes.md`, and in the `NewJWTTokenValidator` doc comment, which had said tokens verify
   "locally against that key set" without noting the key set is fetched lazily.
+- **P2, stale `JWTTokenValidator` type comment** — it still said tokens are validated "against
+  issuer discovery and the issuer's JWKS", which under `pinned_jwks` describes something that
+  did not happen. The audit risk is specific: a reader would assume the issuer-to-keys binding
+  was *discovered* when it was *asserted*. Rewritten to distinguish the two and to state the part
+  that does not vary — the verifier pins the configured issuer, so a pinned key set widens which
+  keys are trusted, never which issuer is. This comment had been read and consciously left alone
+  earlier in the work as "still broadly accurate"; it was not.
+- **Sweep for the same class of defect** rather than waiting for it to be reported again. Two
+  more found: `startupAuthTimeout`'s comment claimed to bound discovery without noting it bounds
+  nothing under `--oidc-jwks-uri` and never bounded the lazy JWKS fetch in any mode; and
+  `InsecureOIDCIssuer`'s field comment still described it as issuer-only.
 - **P3, README over-claiming** — the fix was not only to correct the wording. README had grown a
   mode-by-mode description that duplicated DEPLOYMENT and would drift again on the next change.
   The detail now lives in one place, `docs/DEPLOYMENT.md` § "Issuer metadata and key discovery",
