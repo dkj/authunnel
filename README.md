@@ -31,7 +31,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 
 ## Documentation
 
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist. Also the [transport rules on the auth path](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path), which both binaries enforce.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist. Also two things that span both binaries: the [transport rules on the auth path](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path), and [protected-resource metadata](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients), which is how a client can be configured with nothing but `--tunnel-url`.
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building and testing from source: codebase layout, auth-flow invariants, the test suite, and the local Keycloak environment.
 - [examples/](examples/) — runnable CloudFormation templates that stand up a complete Authunnel topology on AWS, so you can see it working end to end before deploying on your own infrastructure.
 
@@ -51,7 +51,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 - `client/client.go`
   - **ProxyCommand mode**: stdio bridge for direct SSH integration
   - **Unix socket mode**: local SOCKS5 endpoint for generic client tooling
-  - **Managed OIDC mode**: public-client PKCE login with token cache + refresh
+  - **Managed OIDC mode**: public-client PKCE login with token cache + refresh, configured from the server's RFC 9728 protected-resource metadata unless overridden by flags
   - Control-message listener for server-initiated longevity warnings; automatic token refresh when the server signals imminent token expiry
 
 ## How It Works
@@ -60,26 +60,28 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 
 1. Reads OIDC issuer, audience, listen address, TLS mode, and connection longevity configuration from flags or environment.
 2. Locates the issuer's JWKS endpoint once at startup — by OIDC discovery unless configured otherwise. The mode in effect is reported as `discovery_mode` on the `token_validator_ready` startup log line; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#issuer-metadata-and-key-discovery) for the three modes and their trade-offs.
-3. Accepts `GET /protected/tunnel`, verifies the bearer token's signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission), then checks the WebSocket upgrade headers. Unauthenticated `GET` requests under `/protected/` receive `401`; other HTTP methods receive `405` from the router.
-4. Applies admission controls (concurrent-tunnel caps and per-user rate limits) when configured, rejecting over-limit requests with `429`/`503` and a `Retry-After` header.
-5. Upgrades the connection to WebSocket.
-6. Hands each upgraded connection to the SOCKS5 server implementation.
-7. If connection longevity is configured, manages tunnel lifetime: warns clients before expiry and disconnects when limits are reached. When token-expiry enforcement is active, the server accepts refreshed tokens from the client to extend the tunnel.
-8. Emits structured JSON logs for request lifecycle, auth failures, tunnel open/close events, token refresh outcomes, and debug-level SOCKS CONNECT destinations.
+3. Publishes RFC 9728 protected-resource metadata at `GET /.well-known/oauth-protected-resource`, unauthenticated, naming the issuer it validates against so clients need no OIDC configuration of their own. Disabled by `--no-resource-metadata`.
+4. Accepts `GET /protected/tunnel`, verifies the bearer token's signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission), then checks the WebSocket upgrade headers. Unauthenticated `GET` requests under `/protected/` receive `401`; other HTTP methods receive `405` from the router.
+5. Applies admission controls (concurrent-tunnel caps and per-user rate limits) when configured, rejecting over-limit requests with `429`/`503` and a `Retry-After` header.
+6. Upgrades the connection to WebSocket.
+7. Hands each upgraded connection to the SOCKS5 server implementation.
+8. If connection longevity is configured, manages tunnel lifetime: warns clients before expiry and disconnects when limits are reached. When token-expiry enforcement is active, the server accepts refreshed tokens from the client to extend the tunnel.
+9. Emits structured JSON logs for request lifecycle, auth failures, tunnel open/close events, token refresh outcomes, and debug-level SOCKS CONNECT destinations.
 
 ### Client flow
 
 1. Either:
    - uses a bearer token supplied via the `ACCESS_TOKEN` environment variable, or
-   - runs managed OIDC mode when `--oidc-issuer` and `--oidc-client-id` are configured.
-2. In managed mode the client:
+   - runs managed OIDC mode, which is the default whenever `ACCESS_TOKEN` is unset.
+2. In managed mode, any OIDC value not passed as a flag is read from the tunnel server's RFC 9728 protected-resource metadata, so `--tunnel-url` on its own is a complete configuration. The fetch happens only when something essential is missing, and never on a cache hit — a configuration that supplies everything makes no extra request. A value you pass always wins over the published one. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients).
+3. In managed mode the client:
    - reuses a cached token when it remains valid for more than 60 seconds,
    - otherwise refreshes it when a refresh token is available,
    - otherwise launches a browser to the IdP and listens on `127.0.0.1` for the callback.
-3. The client opens an authenticated WebSocket connection to the Authunnel server.
-4. A background control-message listener handles server-initiated longevity messages. When the server warns that the access token is about to expire, the client automatically obtains a fresh token (via its existing refresh logic) and sends it to the server to extend the tunnel.
-5. In ProxyCommand mode it performs a SOCKS5 CONNECT for `%h:%p` and bridges `stdin/stdout`.
-6. In unix-socket mode it exposes a local SOCKS5 endpoint and opens a dedicated tunnel per local connection.
+4. The client opens an authenticated WebSocket connection to the Authunnel server.
+5. A background control-message listener handles server-initiated longevity messages. When the server warns that the access token is about to expire, the client automatically obtains a fresh token (via its existing refresh logic) and sends it to the server to extend the tunnel.
+6. In ProxyCommand mode it performs a SOCKS5 CONNECT for `%h:%p` and bridges `stdin/stdout`.
+7. In unix-socket mode it exposes a local SOCKS5 endpoint and opens a dedicated tunnel per local connection.
 
 ## Security Posture
 
@@ -91,11 +93,60 @@ The following properties are enforced by default with no silent bypass. Where a 
 
 - **Bearer token validation** at the WebSocket layer before any SOCKS5 connection can be attempted: signature, issuer, audience (`aud`), expiry (`exp`), non-empty subject (`sub`), not-before (`nbf` must be usable at admission time, with a 30-second clock-skew allowance), and sane issued-at (`iat` must not be meaningfully in the future). The bearer token is length-capped at 8 KiB and the `Authorization` header at 8 KiB + 64 bytes before the verifier runs, so anonymous callers cannot push oversized payloads onto the JWT parser. The `http.Server` request-header memory cap is also lowered from Go's 1 MiB default to 16 KiB as a defence-in-depth boundary against oversized non-bearer headers.
 - **Bounded issuer metadata and JWKS fetches**: both the server-side validator and the managed client share an HTTP transport with conservative dial, TLS-handshake, response-header, and overall timeouts. A stalled or unreachable issuer fails closed instead of holding startup or in-flight token validation open. Server startup wraps metadata discovery in a 30-second context, so a misconfigured issuer surfaces as a fast `create token validator` error. Under `--oidc-jwks-uri` there is no startup fetch to bound, so that check moves to the first authenticated request instead.
+- **No internal-address pivot from discovered configuration**: addresses named by a *remote* metadata document — the issuer, the authorization-server metadata URL, and the endpoints it advertises — are refused when they resolve into the built-in protected set (loopback, IPv4/IPv6 link-local including cloud IMDS, unspecified, multicast). Enforced at each layer that can see something the others cannot: a resolution check on the value itself (the only protection for the authorization URL handed to the OS), a per-request destination check, and — on a directly-dialled connection — a dial-time check that connects to the address it verified, so a name cannot resolve differently a moment later. Through an HTTP proxy the address checks describe a lookup the connection will not use, so what protects you there is TLS: the client issues `CONNECT` and then validates the origin's certificate against the name it asked for, which a rebound internal service cannot present. **Proxied `https` is therefore allowed and bound by the certificate; proxied plaintext is refused**, because it has nothing to be checked against. Plaintext discovery already requires `--insecure-oidc-issuer`, so in a normal deployment this costs nothing — zero-configuration discovery works behind a proxy. One limit: a TLS-terminating proxy whose CA you installed *is* the origin as far as validation goes, and no check here substitutes for that proxy's own egress policy. Private networks (RFC1918, CGNAT, IPv6 ULA) are deliberately *not* refused — an authorization server on an internal network is an ordinary deployment. The guard applies only to discovered values, and is relaxed only when the tunnel URL names this machine *by spelling* — a **loopback** literal, or `localhost` per RFC 6761 — which is the local-development case. That set is narrower than the refused set on purpose: link-local (including cloud IMDS), multicast and unspecified addresses are refused as destinations but are *not* this machine, and treating them as local would mean a tunnel URL pointing at the metadata service switched off the guard protecting it. That decision resolves nothing on purpose: the tunnel host's DNS belongs to the party the guard constrains, so a hostname answering with both a public and a loopback address would otherwise switch the guard off. A development host reached through a private alias should pass `--oidc-issuer` instead.
+- **No origin change on the auth path**: a metadata fetch or a token request refuses to follow a redirect off the origin it started on. Validating where a fetch begins is worth nothing if it may end somewhere else — an open redirect on the expected host would otherwise let a third party supply the document, and on the token endpoint a 307 preserves the body, so a cross-origin hop would forward a refresh token or an authorization code.
 - **No transport downgrade on the auth path**: neither side will fetch credentials or signing keys over a weaker transport than the metadata that named them. An `https` metadata document may not advertise plaintext endpoints, and redirects may not move a metadata, JWKS, or token fetch off `https`. Advertised endpoints must be `http(s)` URLs with a host in every mode, including under `--insecure-oidc-issuer` — this is what keeps a scheme like `file://` out of the authorization URL that the client hands to the OS. On the client, a refusal is terminal rather than falling back to an interactive login that would fail the same way. The PKCE loopback callback stays plaintext by design (RFC 8252). Details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path).
 - **Subject pinning during token refresh**: the server rejects any refreshed token whose `sub` differs from the original tunnel's subject.
 - **Refresh deadline enforcement**: a refreshed token whose `nbf` falls after the current enforced connection deadline (`exp + --expiry-grace`) is rejected. A refresh handover cannot silently extend the policy beyond what the operator has opted into. The comparison is strict — no additional clock-skew allowance applies beyond `--expiry-grace`.
 - **Secure transport by default**: the OIDC issuer URL must be `https://`; the client's tunnel endpoint URL must be `https://` or `wss://`. Plaintext variants require explicit override flags (see the development-only overrides in the [server flag reference](docs/DEPLOYMENT.md#server-flags-and-environment-variables)).
 - **Explicit egress posture at startup**: the server refuses to start without either `--allow` rules or `--allow-open-egress`. This prevents a misconfigured deployment from silently becoming an open TCP pivot.
+
+### A trade to understand: where the client's OIDC configuration comes from
+
+By default a client takes the authorization server's identity from the tunnel server
+it is connecting to. That is what makes `--tunnel-url` a complete configuration, and
+it is a real change in what the tunnel URL controls:
+
+- **What it removes.** Every value an operator would otherwise transcribe into an
+  `ssh_config` line per user, per host block — and with it the class of failure where
+  a wrong issuer or client ID survives a browser login and comes back as an
+  uninformative `401` from the tunnel server.
+- **What it costs.** A hostile `--tunnel-url` can name an authorization server of its
+  choosing and so send the user to a credential-phishing page. Note the starting
+  point: whoever controls that URL already receives every access token this client
+  obtains, so the escalation is from harvesting the tunnel's token to phishing the
+  IdP password — serious, but from a position that is already lost.
+- **What bounds it.** The document is fetched from the tunnel URL's own origin, over
+  the transport that URL specifies, and it must declare **exactly** the identifier the
+  client is using — scheme, host, path and query — so a host serving several protected
+  resources cannot hand one client another resource's configuration. Under `https` that
+  means only the holder of a certificate for the tunnel host can supply it. The addresses
+  such a document names are also held to the resolved-IP deny-list: a tunnel server
+  reached over a public address may not aim the client's own auth traffic at loopback,
+  a link-local address, or a cloud instance-metadata service.
+  Discovery can also only ever cause an *interactive* login to a newly-named
+  authorization server, which the user sees — never a silent hand-off of an
+  already-issued refresh token, because a cached credential whose recorded issuer,
+  client, or metadata URL no longer matches is discarded rather than reused.
+- **How to decline it, and exactly what that pins.** Pass `--oidc-issuer`: the client
+  then refuses a document naming a different issuer, and — the part worth stating,
+  because it was missing at first — it also refuses to take the *location* of that
+  issuer's metadata from the tunnel server unless the published location is on the
+  issuer's own origin. Without that second rule, a hostile server could echo your
+  issuer, relocate its metadata document, and choose the authorization and token
+  endpoints anyway. So a pinned issuer pins where the login goes.
+  Discovery-input filtering follows the same line: the transport, address and downgrade
+  rules apply to what the *tunnel server* chose, so a configured issuer stays unfiltered
+  whether or not some other flag was also supplied — omitting only `--oidc-client-id`
+  does not turn your own loopback issuer into remote input.
+  What it does **not** pin is what the token is *for*: the audience and RFC 8707
+  resource are still taken from the document when you do not supply them, so an
+  operator who does not trust the tunnel URL should pass `--oidc-audience` or
+  `--oidc-resource` too. To refuse the lookup
+  as a standing rule rather than as a side effect of having configured everything,
+  add `--no-resource-metadata` on the client: the configuration must then be complete,
+  checked at startup. Server-side, the flag of the same name switches publication off
+  entirely.
 
 ### Operator-controlled
 
@@ -106,6 +157,7 @@ The following are disabled or unlimited by default and must be explicitly config
 - **Resolved-IP deny-list** (`--ip-block`, `--no-ip-block`): on by default with a built-in protected set — loopback, IPv4/IPv6 link-local (incl. cloud IMDS `169.254.169.254`), unspecified, and multicast. Applied independently of the egress posture: the deny-list runs after the allow check in both restrictive and open modes, so a hostname rule that resolves to a protected address is rejected regardless. RFC1918, CGNAT, and IPv6 ULA are not in the default set. `--ip-block` replaces the default with an operator-supplied list (CIDR, bare IP, or bracketed IPv6); `--no-ip-block` disables the guard entirely.
 - **Connection longevity** (`--max-connection-duration`, `--expiry-grace`, `--no-connection-token-expiry`): by default tunnel lifetime is tied to the access token's `exp`. These flags let operators tune for specific IdP behaviors or impose hard ceilings. Some IdPs (e.g. Auth0) cache access tokens; `--expiry-grace` extends the enforcement deadline beyond `exp` to give the client time to obtain a genuinely new token.
 - **Admission limits** (`--max-concurrent-tunnels`, `--max-tunnels-per-user`, `--tunnel-open-rate`, `--dial-timeout`): zero or default by default. Configure for production to bound resource use and prevent a single credential from monopolising tunnel capacity or tying up goroutines on blackholed destinations.
+- **Published client configuration** (`--client-id`, `--client-scopes`, `--client-audience`, `--client-resource`, `--no-resource-metadata`): the protected-resource document is published by default and names the issuer; the hints that let a client run with no OIDC flags at all are opt-in per value. Setting them is what turns `--tunnel-url` into a complete client configuration. See the trade described above before deciding.
 - **Pre-auth IP rate limit** (`--preauth-rate`, `--preauth-burst`): off by default, matching the explicit-posture style of the egress flags. When enabled, runs before bearer-token parsing on every authenticated route (`/protected`, `/protected/`, any `/protected/*`, and `/protected/tunnel`) so a flood of anonymous or junk-JWT requests is rejected with `429` before any validator or JWKS work happens. Recommended for direct internet exposure; deployments behind a load balancer that already rate-limits anonymous traffic can leave it off. Buckets key on the TCP peer by default; `--preauth-trust-forwarded-for` opts into trusting `X-Forwarded-For` behind a known proxy (see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
 ### Known non-goals
@@ -158,10 +210,12 @@ Host internal-host
   User myuser
   ProxyCommand /path/to/authunnel-client \
     --tunnel-url https://localhost:8443/protected/tunnel \
-    --oidc-issuer https://<issuer> \
-    --oidc-client-id authunnel-cli \
     --proxycommand %h %p
 ```
+
+The issuer, client ID, scopes and audience come from the server. Pass them explicitly
+(`--oidc-issuer`, `--oidc-client-id`, …) if the server is run with
+`--no-resource-metadata`, or to override what it publishes.
 
 On Windows with OpenSSH, use the full path with backslashes and quote it if it contains spaces:
 
@@ -169,24 +223,27 @@ On Windows with OpenSSH, use the full path with backslashes and quote it if it c
 Host internal-host
   HostName internal-host
   User myuser
-  ProxyCommand "C:\path\to\authunnel-client.exe" --tunnel-url https://... --oidc-issuer https://<issuer> --oidc-client-id authunnel-cli --proxycommand %h %p
+  ProxyCommand "C:\path\to\authunnel-client.exe" --tunnel-url https://... --proxycommand %h %p
 ```
 
-Useful client flags:
+Useful client flags. Every OIDC flag is optional — each overrides the corresponding
+value the tunnel server publishes, and is needed only when the server publishes
+nothing:
 
 - `--oidc-issuer`
 - `--oidc-client-id`
-- `--oidc-metadata-url` to fetch the authorization server metadata document from a URL other than the well-known path derived from `--oidc-issuer`; needed for an authorization server publishing RFC 8414 metadata, which inserts the well-known segment before the path component. The document's `issuer` is compared against `--oidc-issuer`, but a document asserts that field itself, so the check catches an honestly-wrong URL rather than a hostile one. **Changing this value discards the token cache and requires a fresh login.** That is deliberate: the document names the token endpoint your credentials are posted to, and the issuer check only compares a string the document supplies about itself — it cannot prove the metadata host speaks for that issuer. Discarding the cache stops an already-issued refresh token being handed over silently. It is not a defence against an untrustworthy metadata URL: complete the fallback login and the authorization code still goes wherever that document says. Point this flag only at a URL you trust as much as the issuer itself
+- `--oidc-metadata-url` to fetch the authorization server metadata document from a URL other than the well-known path derived from `--oidc-issuer`; needed for an authorization server publishing RFC 8414 metadata, which inserts the well-known segment before the path component. Usable with or without `--oidc-issuer`. **With** an issuer, the document's `issuer` field is compared against it — but a document asserts that field itself, so the check catches an honestly-wrong URL rather than a hostile one. **Without** one, the document's issuer is adopted and that check is gone, so a URL pointing at the wrong tenant is discovered as correct and fails after a browser login instead. **Changing this value discards the token cache and requires a fresh login.** That is deliberate: the document names the token endpoint your credentials are posted to, and the issuer check only compares a string the document supplies about itself — it cannot prove the metadata host speaks for that issuer. Discarding the cache stops an already-issued refresh token being handed over silently. It is not a defence against an untrustworthy metadata URL: complete the fallback login and the authorization code still goes wherever that document says. Point this flag only at a URL you trust as much as the issuer itself
 - `--oidc-audience` to send the Auth0-style `audience` parameter during managed login
 - `--oidc-resource` to send the RFC 8707 `resource` parameter during managed login; required by providers that bind the token `aud` to a requested resource, such as AWS Cognito
 - `--oidc-redirect-port` to use a fixed loopback callback port instead of a random one
-- `--oidc-scopes` with default `openid offline_access`
+- `--oidc-scopes`, defaulting to the scopes the tunnel server publishes, or `openid offline_access` when it publishes none
 - `--oidc-cache` with default `${XDG_CONFIG_HOME:-~/.config}/authunnel/tokens.json` (macOS/Linux) or `%AppData%\authunnel\tokens.json` (Windows)
 - `--oidc-no-browser` to print the URL without attempting automatic browser launch
+- `--no-resource-metadata` to refuse the tunnel-server lookup outright. `--oidc-client-id` and one of `--oidc-issuer` / `--oidc-metadata-url` are then required, and a missing one is a startup error rather than a failure at first use. Distinct from simply supplying everything, which also results in no lookup: this is a prohibition that survives someone shortening the `ProxyCommand` line, and it is visible in that line. Same flag name as the server's, same document, opposite direction — there it means do not publish, here it means do not read
 - `--tunnel-url` — tunnel endpoint URL. Secure schemes `https://` and `wss://` are accepted by default; plaintext `http://` and `ws://` require `--insecure-tunnel-url`. **Required.** May also be supplied via the `AUTHUNNEL_TUNNEL_URL` environment variable (the flag takes precedence)
 - `--unix-socket`
 - `--proxycommand`
-- `--insecure-oidc-issuer` — allow non-HTTPS OIDC issuer and metadata URLs **(development only; do not use in production)**. Relaxes transport security only; other schemes such as `file://` stay rejected
+- `--insecure-oidc-issuer` — allow non-HTTPS OIDC issuer and metadata URLs, discovered as well as configured **(development only; do not use in production)**. Relaxes transport security only; other schemes such as `file://` stay rejected
 - `--insecure-tunnel-url` — allow a non-HTTPS tunnel endpoint URL **(development only; do not use in production)**
 
 On first use the client prints the authorization URL to `stderr` and tries to open the system browser. Subsequent runs reuse the cache or refresh token when possible.
@@ -235,8 +292,6 @@ inline substitution and just invoke the client directly.
 cd client
 CGO_ENABLED=0 SSL_CERT_FILE=../cert.pem go run . \
   --tunnel-url https://<host>:8443/protected/tunnel \
-  --oidc-issuer https://<issuer> \
-  --oidc-client-id authunnel-cli \
   --unix-socket /tmp/authunnel/proxy.sock
 ```
 

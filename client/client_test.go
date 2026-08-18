@@ -348,10 +348,20 @@ func drainBinaryFrames(t *testing.T, conn *wsconn.MultiplexConn) {
 type fakeTokenSource struct {
 	token string
 	err   error
+	// afterRejection is what TokenAfterRejection returns; "" means "the
+	// configuration has not changed", which is the default and the case where a
+	// caller must surface the server's original rejection.
+	afterRejection string
+	rejectionCalls int
 }
 
 func (f *fakeTokenSource) AccessToken(_ context.Context, _ bool) (string, error) {
 	return f.token, f.err
+}
+
+func (f *fakeTokenSource) TokenAfterRejection(context.Context) (string, error) {
+	f.rejectionCalls++
+	return f.afterRejection, nil
 }
 
 // TestHandleControlMessagesRefreshesOnTokenWarning verifies the client-side

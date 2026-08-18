@@ -18,12 +18,12 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/zitadel/oidc/v3/pkg/client"
 	"github.com/zitadel/oidc/v3/pkg/client/rp"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"authunnel/internal/authhttp"
+	"authunnel/internal/authmeta"
 	"authunnel/internal/wsconn"
 )
 
@@ -190,7 +190,7 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 		if cfg.MetadataURL != "" {
 			metadataSource = cfg.MetadataURL
 		}
-		discovery, err := client.Discover(ctx, cfg.Issuer, httpClient, cfg.MetadataURL)
+		discovery, err := authmeta.FetchAuthorizationServer(ctx, httpClient, cfg.Issuer, cfg.MetadataURL)
 		if err != nil {
 			return nil, "", fmt.Errorf("discover issuer metadata: %w", err)
 		}
@@ -351,6 +351,11 @@ type HandlerOptions struct {
 	// reverse proxy may reach this server over a secured connection.
 	PreAuth                 *PreAuthLimiter
 	PreAuthForwardedForMode ForwardedForMode
+
+	// ResourceMetadata publishes RFC 9728 protected-resource metadata at the
+	// well-known location and adds a WWW-Authenticate challenge pointing at it
+	// to unauthenticated 401 responses. A nil value disables both.
+	ResourceMetadata *ResourceMetadataConfig
 }
 
 // NewHandler installs the small HTTP surface used by the server:
@@ -380,6 +385,34 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		}
 		_, _ = w.Write([]byte("OK " + time.Now().String()))
 	})
+
+	if opt.ResourceMetadata != nil {
+		serveMetadata := func(w http.ResponseWriter, r *http.Request) {
+			opt.ResourceMetadata.serveResourceMetadata(w, r, opt.TrustForwardedProto)
+		}
+		// Both shapes, because RFC 9728 §3.1 forms the URL by inserting the
+		// well-known segment *before* the resource's path: a client using
+		// https://host/protected/tunnel derives the subtree form, while one
+		// using a resource identifier with no path derives the exact one. A
+		// deployment behind a path-rewriting proxy can present either.
+		//
+		// The subtree serves the same document whatever trails it. The document
+		// names this server's canonical tunnel path regardless, so the reply
+		// cannot be steered by the path a caller invents.
+		mux.HandleFunc("GET "+authmeta.ProtectedResourcePath, serveMetadata)
+		mux.HandleFunc("GET "+authmeta.ProtectedResourcePath+"/", serveMetadata)
+	}
+
+	// setChallenge adds the RFC 6750 challenge to a 401. Called only on the
+	// paths that are about to write one: WWW-Authenticate is defined for 401,
+	// and putting it on a 200 or a WebSocket upgrade would be noise asserting
+	// something untrue.
+	setChallenge := func(w http.ResponseWriter, r *http.Request) {
+		if opt.ResourceMetadata == nil {
+			return
+		}
+		w.Header().Set("WWW-Authenticate", opt.ResourceMetadata.challenge(r, opt.TrustForwardedProto))
+	}
 
 	// applyPreAuthGate runs the per-IP pre-auth limiter (when configured)
 	// before any token parsing or path-aware logic. Every protected route
@@ -413,7 +446,7 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		if !applyPreAuthGate(w, r) {
 			return
 		}
-		if _, ok := validateRequestToken(w, r, validator); !ok {
+		if _, ok := validateRequestToken(w, r, validator, setChallenge); !ok {
 			return
 		}
 		if r.URL.Path != "/protected" && r.URL.Path != "/protected/" {
@@ -442,7 +475,7 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 		if !applyPreAuthGate(w, r) {
 			return
 		}
-		claims, ok := validateRequestToken(w, r, validator)
+		claims, ok := validateRequestToken(w, r, validator, setChallenge)
 		if !ok {
 			return
 		}
@@ -834,7 +867,9 @@ func checkWebSocketRequest(w http.ResponseWriter, r *http.Request, trustForwarde
 // verification to the configured validator. The caller decides which routes
 // require protection and how to continue once validation succeeds.
 func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator) bool {
-	_, ok := validateRequestToken(w, r, validator)
+	// No challenge: this helper has no access to the handler options that decide
+	// whether metadata is published or where it lives.
+	_, ok := validateRequestToken(w, r, validator, nil)
 	return ok
 }
 
@@ -842,10 +877,16 @@ func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator
 // need the validated claims for downstream logging. The public CheckToken
 // helper intentionally keeps the older bool-only contract for existing tests
 // and handlers that only need admission control.
-func validateRequestToken(w http.ResponseWriter, r *http.Request, validator TokenValidator) (*oidc.AccessTokenClaims, bool) {
+func validateRequestToken(w http.ResponseWriter, r *http.Request, validator TokenValidator, setChallenge func(http.ResponseWriter, *http.Request)) (*oidc.AccessTokenClaims, bool) {
+	unauthorized := func(message string) {
+		if setChallenge != nil {
+			setChallenge(w, r)
+		}
+		http.Error(w, message, http.StatusUnauthorized)
+	}
 	auth := r.Header.Get("authorization")
 	if auth == "" {
-		http.Error(w, "auth header missing", http.StatusUnauthorized)
+		unauthorized("auth header missing")
 		return nil, false
 	}
 	// Bound the bytes that flow into the JWT verifier before any parsing. The
@@ -853,11 +894,11 @@ func validateRequestToken(w http.ResponseWriter, r *http.Request, validator Toke
 	// protects against an oversized Bearer body. Both reuse the existing
 	// fixed message so callers cannot probe the new boundary by message shape.
 	if len(auth) > maxAuthorizationHeaderBytes {
-		http.Error(w, "invalid header", http.StatusUnauthorized)
+		unauthorized("invalid header")
 		return nil, false
 	}
 	if !strings.HasPrefix(auth, oidc.PrefixBearer) {
-		http.Error(w, "invalid header", http.StatusUnauthorized)
+		unauthorized("invalid header")
 		return nil, false
 	}
 	if validator == nil {
@@ -867,7 +908,7 @@ func validateRequestToken(w http.ResponseWriter, r *http.Request, validator Toke
 
 	token := strings.TrimPrefix(auth, oidc.PrefixBearer)
 	if len(token) > maxBearerTokenBytes {
-		http.Error(w, "invalid header", http.StatusUnauthorized)
+		unauthorized("invalid header")
 		return nil, false
 	}
 	claims, err := validator.ValidateAccessToken(r.Context(), token)

@@ -14,13 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 
 	"authunnel/internal/authhttp"
+	"authunnel/internal/authmeta"
 	"authunnel/internal/safefs"
 	"authunnel/internal/security"
 	"authunnel/internal/wsconn"
@@ -50,18 +50,22 @@ type clientConfig struct {
 
 	AccessToken string
 
+	// Every OIDC value below is optional. What is not supplied is discovered
+	// from the tunnel server's RFC 9728 protected-resource metadata; see
+	// ResourceURL. What is supplied always wins over what is discovered.
 	OIDCIssuer string
 	// OIDCMetadataURL overrides the well-known path derived from OIDCIssuer.
-	// It changes only where the metadata document is fetched from.
+	// It changes only where the metadata document is fetched from, and it makes
+	// OIDCIssuer unnecessary: with no issuer configured, the one the document
+	// declares is adopted.
 	//
-	// OIDCIssuer stays required even though, with this set, the client could
-	// technically run without it: every endpoint comes from the document, and
-	// the client validates no tokens. It is kept as a consistency check — the
-	// document declares its own issuer, so an honest-but-wrong metadata URL
-	// (staging for production, one tenant for another) fails here instead of
-	// after a browser login, as a 401 from the authunnel server. It is not a
-	// trust anchor: the issuer in the document is self-asserted and proves
-	// nothing about the host serving it.
+	// What that gives up is the consistency check the issuer used to provide.
+	// The document declares its own issuer, so with a value to compare against,
+	// an honest-but-wrong metadata URL (staging for production, one tenant for
+	// another) fails locally instead of after a browser login. With nothing to
+	// compare against, it does not. Note this was never a trust anchor either
+	// way: the issuer in the document is self-asserted and proves nothing about
+	// the host serving it.
 	OIDCMetadataURL  string
 	OIDCClientID     string
 	OIDCAudience     string
@@ -70,6 +74,30 @@ type clientConfig struct {
 	OIDCCache        string
 	OIDCNoBrowser    bool
 	OIDCRedirectPort int
+
+	// NoResourceMetadata refuses the lookup outright: this client will not ask
+	// the tunnel server for configuration, and every OIDC value it needs must be
+	// supplied here.
+	//
+	// Not the same thing as supplying everything, which also results in no
+	// lookup. That is an *outcome* of the configuration being complete; this is a
+	// *prohibition*, so it still holds after someone shortens the ProxyCommand
+	// line, and it is visible in that line rather than inferred from the absence
+	// of a gap. It also moves the failure earlier: with the lookup refused,
+	// completeness is knowable at parse time, so an incomplete configuration
+	// fails before ssh has spawned anything instead of mid-connection.
+	//
+	// The name mirrors the server's --no-resource-metadata deliberately: same
+	// document, opposite direction. There it means do not publish; here it means
+	// do not read.
+	NoResourceMetadata bool
+
+	// ResourceURL is the tunnel endpoint's resource identifier, derived from
+	// TunnelURL, and set only when some essential OIDC value is missing and the
+	// lookup has not been refused. It is what the client fetches
+	// protected-resource metadata from, so its emptiness is what guarantees a
+	// fully-configured invocation makes no additional request.
+	ResourceURL string
 
 	TunnelURL        string
 	UnixSocketPath   string
@@ -91,6 +119,13 @@ type clientConfig struct {
 func clientUsage(w io.Writer) {
 	fmt.Fprintf(w, `Usage: authunnel-client [flags] [host port]
 
+Connection (required):
+
+  --tunnel-url <url>           Tunnel endpoint URL. Secure schemes: https:// or
+                               wss://. Plaintext http:// or ws:// requires
+                               --insecure-tunnel-url
+  AUTHUNNEL_TUNNEL_URL         Same, via environment variable (flag takes precedence)
+
 Choose one operating mode (mutually exclusive):
 
   --proxycommand               SSH ProxyCommand mode; requires host and port arguments
@@ -98,31 +133,38 @@ Choose one operating mode (mutually exclusive):
   --unix-socket <path>         Expose a local SOCKS5 unix socket (default: proxy.sock)
                                (default mode when --proxycommand is not set)
 
-Choose one authentication method (mutually exclusive):
+Authentication:
 
-  Managed OIDC (typical):
-    --oidc-issuer <url>          OIDC issuer for managed login (required with --oidc-client-id)
-    --oidc-client-id <id>        OIDC client ID (required with --oidc-issuer)
+  Managed OIDC is used unless ACCESS_TOKEN is set, and needs no configuration of its own:
+  whatever is not given below is read from the tunnel server's RFC 9728 protected-resource
+  metadata, which names its authorization server and may publish the client ID, scopes and
+  audience to use. A value you do give always wins over the published one.
+
+  Supply these to override what the server publishes, when it publishes nothing
+  (--no-resource-metadata on the server side), or alongside --no-resource-metadata here to
+  refuse the lookup entirely:
+
+    --oidc-issuer <url>          OIDC issuer for managed login
+    --oidc-client-id <id>        OIDC client ID
     --oidc-metadata-url <url>    Authorization server metadata document URL, overriding the well-known
                                  path derived from --oidc-issuer. For an authorization server publishing
-                                 RFC 8414 metadata at a path the OIDC derivation cannot construct. The
-                                 document's issuer must still match --oidc-issuer.
+                                 RFC 8414 metadata at a path the OIDC derivation cannot construct. Usable
+                                 without --oidc-issuer, in which case the document's own issuer is
+                                 adopted rather than checked.
     --oidc-audience <string>     Auth0-style 'audience' parameter requested during managed login
     --oidc-resource <url>        RFC 8707 'resource' parameter; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)
-    --oidc-scopes <scopes>       Space-delimited OIDC scopes (default: openid offline_access)
+    --oidc-scopes <scopes>       Space-delimited OIDC scopes (default: the scopes the server publishes,
+                                 else openid offline_access)
     --oidc-cache <path>          Token cache path for managed OIDC login
     --oidc-no-browser            Print the authorization URL without opening a browser
     --oidc-redirect-port <port>  Loopback port for OIDC callback; 0 = random port
+    --no-resource-metadata       Never read configuration from the tunnel server; --oidc-client-id
+                                 and one of --oidc-issuer / --oidc-metadata-url are then required,
+                                 and a missing one fails at startup rather than at first use
 
-  Manual token (not recommended; for testing only):
+  Manual token (not recommended; for testing only), mutually exclusive with the above:
+
     ACCESS_TOKEN                 Bearer token via environment variable
-
-Connection (one of these is required):
-
-  --tunnel-url <url>           Tunnel endpoint URL. Secure schemes: https:// or
-                               wss://. Plaintext http:// or ws:// requires
-                               --insecure-tunnel-url
-  AUTHUNNEL_TUNNEL_URL         Same, via environment variable (flag takes precedence)
 
 Other:
 
@@ -130,12 +172,66 @@ Other:
 
 Development / unsafe overrides (do not use in production):
 
-  --insecure-oidc-issuer       Allow non-HTTPS OIDC issuer and metadata URLs
+  --insecure-oidc-issuer       Allow non-HTTPS OIDC issuer and metadata URLs, discovered as well
+                               as configured
   --insecure-tunnel-url        Allow a non-HTTPS tunnel endpoint URL
 `)
 }
 
+// resourceURLForTunnel turns the tunnel URL into the resource identifier the
+// protected-resource metadata is looked up under, and which the cached
+// credentials for that tunnel are scoped to.
+//
+// The websocket schemes are rewritten to their HTTP equivalents because that is
+// what they already are on the wire — github.com/coder/websocket sends the
+// upgrade request over http(s) — and RFC 9728's derivation is defined for http
+// and https.
+//
+// **The query is part of the identifier and is kept.** It had been dropped here,
+// with a comment claiming the derivation dropped it anyway; that stopped being
+// true when the derivation was corrected to carry it, and the consequence was
+// worse than an inconsistency. The WebSocket dial sends the query, so
+// `?tenant=a` and `?tenant=b` are two resources as far as the server is
+// concerned, while this function collapsed them to one identifier — one set of
+// discovered configuration and, because the identifier is the cache key, one set
+// of cached credentials. A token obtained for one tenant would be presented for
+// the other.
+//
+// The fragment is dropped rather than refused, because this is where the client
+// sanitises its *own* input: a fragment is never sent on the wire, so one in
+// --tunnel-url is inert, and failing discovery over it would be a worse answer
+// than ignoring it. A fragment arriving in a *document* is refused instead — see
+// authmeta.NormalizeResourceIdentifier.
+func resourceURLForTunnel(tunnelURL string) (string, error) {
+	u, err := url.Parse(tunnelURL)
+	if err != nil {
+		return "", fmt.Errorf("--tunnel-url %q is not a valid URL", tunnelURL)
+	}
+	switch u.Scheme {
+	case "wss":
+		u.Scheme = "https"
+	case "ws":
+		u.Scheme = "http"
+	}
+	// Built from the escaped path so an encoded separator survives: assigning
+	// url.URL.Path would re-encode from the decoded form, turning
+	// /tenant%2Fone/tunnel into /tenant/one/tunnel and merging two resources a
+	// path-routing proxy keeps apart — into one discovery result and one cache
+	// entry. The fragment is dropped by omission, which is the intent.
+	resourceURL, err := url.Parse(u.Scheme + "://" + u.Host + u.EscapedPath())
+	if err != nil {
+		return "", fmt.Errorf("--tunnel-url %q is not a valid URL", tunnelURL)
+	}
+	resourceURL.RawQuery = u.RawQuery
+	return resourceURL.String(), nil
+}
+
 func main() {
+	// Before anything can log: errors reaching this terminal include text chosen by
+	// the tunnel server and by whatever authorization server it named, and some of
+	// that text is formatted by dependencies rather than here. See safeLogWriter.
+	installSafeLogging()
+
 	cfg, err := parseClientConfig(os.Args[1:], os.Getenv)
 	if errors.Is(err, flag.ErrHelp) {
 		os.Exit(0)
@@ -200,10 +296,15 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", "", "OIDC client ID used for managed login")
 	fs.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Auth0-style 'audience' parameter requested during managed login")
 	fs.StringVar(&cfg.OIDCResource, "oidc-resource", "", "RFC 8707 'resource' parameter requested during managed login; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)")
-	fs.StringVar(&cfg.OIDCScopes, "oidc-scopes", "openid offline_access", "Space-delimited OIDC scopes for managed login")
+	// Empty rather than the default value, so "not set" stays distinguishable
+	// from "set to the default": the resource server's scopes_supported must be
+	// able to win over the fallback but not over an explicit choice.
+	fs.StringVar(&cfg.OIDCScopes, "oidc-scopes", "", "Space-delimited OIDC scopes for managed login (default: the scopes the tunnel server publishes, else \"openid offline_access\")")
 	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
 	fs.BoolVar(&cfg.OIDCNoBrowser, "oidc-no-browser", false, "Print the OIDC authorization URL without attempting to open a browser")
 	fs.IntVar(&cfg.OIDCRedirectPort, "oidc-redirect-port", 0, "Loopback port for the OIDC callback listener; 0 chooses a random port")
+	fs.BoolVar(&cfg.NoResourceMetadata, "no-resource-metadata", false,
+		"Do not read OIDC configuration from the tunnel server's protected-resource metadata; every value must then be passed as a flag")
 	fs.BoolVar(&cfg.InsecureOIDCIssuer, "insecure-oidc-issuer", false, "Allow non-HTTPS OIDC issuer and metadata URLs (development only; do not use in production)")
 	fs.BoolVar(&cfg.InsecureTunnelURL, "insecure-tunnel-url", false, "Allow a non-HTTPS tunnel endpoint URL (development only; do not use in production)")
 	if err := fs.Parse(args); err != nil {
@@ -231,35 +332,36 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	if cfg.OIDCRedirectPort != 0 && cfg.OIDCRedirectPort < 1024 {
 		return cfg, errors.New("--oidc-redirect-port must be 0 (random) or >= 1024; low ports are unavailable after capability hardening")
 	}
-	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCMetadataURL != "" || cfg.OIDCAudience != "" || cfg.OIDCResource != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || oidcScopesSet) {
+	// --no-resource-metadata is in this list even though it creates no precedence
+	// ambiguity — manual mode never looks anything up — because a flag that
+	// cannot take effect is a configuration error, not a no-op. Same rule the
+	// server applies to a --client-* hint it would never publish.
+	if cfg.AccessToken != "" && (hasOIDC || cfg.OIDCMetadataURL != "" || cfg.OIDCAudience != "" || cfg.OIDCResource != "" || cfg.OIDCRedirectPort != 0 || cfg.OIDCCache != "" || cfg.OIDCNoBrowser || cfg.NoResourceMetadata || oidcScopesSet) {
 		return cfg, errors.New("ACCESS_TOKEN cannot be combined with managed OIDC flags")
 	}
-	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
-		return cfg, errors.New("managed OIDC mode requires both --oidc-issuer and --oidc-client-id")
-	}
-	// The override relocates the metadata document; it does not identify the
-	// issuer, which is still what the document is checked against.
-	if cfg.OIDCMetadataURL != "" && cfg.OIDCIssuer == "" {
-		return cfg, errors.New("--oidc-metadata-url requires --oidc-issuer")
-	}
-	if cfg.AccessToken == "" && cfg.OIDCIssuer == "" {
-		return cfg, errors.New("either ACCESS_TOKEN or both --oidc-issuer and --oidc-client-id are required")
+	// Managed OIDC needs a client identity and somewhere to find the
+	// authorization server's metadata. Neither is required as a flag, because
+	// both are already known to the server being connected to: when either is
+	// missing the tunnel server is asked for it, and --tunnel-url (checked below)
+	// is the only mandatory flag.
+	incomplete := cfg.OIDCClientID == "" || (cfg.OIDCIssuer == "" && cfg.OIDCMetadataURL == "")
+	needsDiscovery := cfg.AccessToken == "" && !cfg.NoResourceMetadata && incomplete
+	// Derived from needsDiscovery rather than restating its condition, so there is
+	// one definition of "the tunnel server will be asked". Restated, the two could
+	// disagree — and the disagreement would be invisible, since a configuration
+	// that is complete produces no lookup either way. This phrasing also means a
+	// test that the flag rejects an incomplete configuration is a test that the
+	// flag suppresses the lookup: break the suppression and this stops firing.
+	if cfg.AccessToken == "" && incomplete && !needsDiscovery {
+		return cfg, errors.New("--no-resource-metadata requires --oidc-client-id and one of --oidc-issuer or --oidc-metadata-url: with the tunnel server lookup refused, nothing else can supply them")
 	}
 
 	if cfg.AccessToken != "" {
 		cfg.AuthMode = authModeManual
 	} else {
 		cfg.AuthMode = authModeOIDC
-		cfg.OIDCScopes = normalizeScopes(cfg.OIDCScopes)
-		if cfg.OIDCScopes == "" {
-			cfg.OIDCScopes = normalizeScopes("openid offline_access")
-		}
-		if cfg.OIDCCache == "" {
-			cachePath, err := defaultOIDCCachePath()
-			if err != nil {
-				return cfg, err
-			}
-			cfg.OIDCCache = cachePath
+		if err := applyManagedOIDCDefaults(&cfg, needsDiscovery); err != nil {
+			return cfg, err
 		}
 	}
 
@@ -283,32 +385,17 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	default:
 		return cfg, errors.New("--tunnel-url must use one of https://, wss://, http://, or ws://")
 	}
-	// One rule for both, shared with the server so the two cannot drift:
-	// https required unless --insecure-oidc-issuer, other schemes rejected by
-	// name rather than as a generic "not a valid URL".
-	for _, checked := range []struct{ flag, value string }{
-		{"--oidc-issuer", cfg.OIDCIssuer},
-		{"--oidc-metadata-url", cfg.OIDCMetadataURL},
-	} {
-		if checked.value == "" {
-			continue
-		}
-		if err := authhttp.CheckConfiguredURL(checked.flag, checked.value, cfg.InsecureOIDCIssuer); err != nil {
+	if err := validateOIDCValues(cfg); err != nil {
+		return cfg, err
+	}
+	if needsDiscovery {
+		// Derived after --tunnel-url has been validated, so this cannot produce
+		// a resource identifier from a URL the client would have refused.
+		resourceURL, err := resourceURLForTunnel(cfg.TunnelURL)
+		if err != nil {
 			return cfg, err
 		}
-	}
-	if cfg.OIDCResource != "" {
-		// RFC 8707 resource indicators: the value MUST be an absolute URI and
-		// MUST NOT contain a fragment. Validate up front so a malformed value
-		// surfaces as a clear startup error rather than a confusing failure at
-		// the provider partway through the browser login.
-		if strings.ContainsRune(cfg.OIDCResource, '#') {
-			return cfg, fmt.Errorf("--oidc-resource %q must not contain a fragment (RFC 8707 resource indicators)", cfg.OIDCResource)
-		}
-		resourceU, err := url.Parse(cfg.OIDCResource)
-		if err != nil || !resourceU.IsAbs() {
-			return cfg, fmt.Errorf("--oidc-resource %q must be an absolute URI, for example https://api.example (RFC 8707 resource indicators)", cfg.OIDCResource)
-		}
+		cfg.ResourceURL = resourceURL
 	}
 
 	if cfg.ProxyCommandMode {
@@ -325,6 +412,59 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	}
 
 	return cfg, nil
+}
+
+// applyManagedOIDCDefaults fills in what managed mode needs and the operator did
+// not supply. Called only in managed mode, after needsDiscovery is known.
+func applyManagedOIDCDefaults(cfg *clientConfig, needsDiscovery bool) error {
+	cfg.OIDCScopes = normalizeScopes(cfg.OIDCScopes)
+	// The scope default is applied here only when nothing will be discovered.
+	// Applying it unconditionally would make the fallback indistinguishable from
+	// an explicit choice, and the resource server's scopes_supported could then
+	// never win — the resolver applies the same default itself when the document
+	// offers none.
+	if cfg.OIDCScopes == "" && !needsDiscovery {
+		cfg.OIDCScopes = normalizeScopes(defaultOIDCScopes)
+	}
+	if cfg.OIDCCache == "" {
+		cachePath, err := defaultOIDCCachePath()
+		if err != nil {
+			return err
+		}
+		cfg.OIDCCache = cachePath
+	}
+	return nil
+}
+
+// validateOIDCValues applies the shape rules to whatever OIDC values were
+// configured. Everything here is optional, so each check is skipped when its
+// value is absent; the equivalents for *discovered* values live in
+// internal/authmeta, deliberately holding remote input to the same rules.
+func validateOIDCValues(cfg clientConfig) error {
+	// One rule for both URLs, shared with the server so the two cannot drift:
+	// https required unless --insecure-oidc-issuer, other schemes rejected by
+	// name rather than as a generic "not a valid URL".
+	for _, checked := range []struct{ flag, value string }{
+		{"--oidc-issuer", cfg.OIDCIssuer},
+		{"--oidc-metadata-url", cfg.OIDCMetadataURL},
+	} {
+		if checked.value == "" {
+			continue
+		}
+		if err := authhttp.CheckConfiguredURL(checked.flag, checked.value, cfg.InsecureOIDCIssuer); err != nil {
+			return err
+		}
+	}
+	if cfg.OIDCResource != "" {
+		// RFC 8707 resource indicators: the value MUST be an absolute URI and
+		// MUST NOT contain a fragment. Validated up front so a malformed value
+		// surfaces as a clear startup error rather than a confusing failure at
+		// the provider partway through the browser login.
+		if err := authmeta.ValidateResourceIndicator(cfg.OIDCResource); err != nil {
+			return fmt.Errorf("--oidc-resource: %w", err)
+		}
+	}
+	return nil
 }
 
 // runUnixSocketMode exposes a local unix-domain SOCKS5 endpoint, with each accepted
@@ -399,7 +539,7 @@ func handleSOCKSClient(ctx context.Context, cfg clientConfig, source authTokenSo
 		return fmt.Errorf("resolve access token: %w", err)
 	}
 
-	wsConn, _, err := dialTunnel(ctx, cfg, token)
+	wsConn, _, err := dialTunnelWithRecovery(ctx, cfg, source, token)
 	if err != nil {
 		_ = localConn.Close()
 		return fmt.Errorf("websocket dial failed: %w", err)
@@ -431,7 +571,7 @@ func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authToken
 		return fmt.Errorf("resolve access token: %w", err)
 	}
 
-	wsConn, _, err := dialTunnel(ctx, cfg, token)
+	wsConn, _, err := dialTunnelWithRecovery(ctx, cfg, source, token)
 	if err != nil {
 		return fmt.Errorf("websocket dial failed: %w", err)
 	}
@@ -452,6 +592,60 @@ func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authToken
 	stdioConn := &stdioConn{in: cfg.Stdin, out: cfg.Stdout}
 	proxy(stdioConn, remoteConn)
 	return nil
+}
+
+// dialTunnelWithRecovery dials, and on a rejection gives the token source one
+// chance to notice that the server's configuration has moved.
+//
+// The case this exists for: a cached access token that is still valid by its own
+// `exp` is returned without resolving anything, which is the fast path working as
+// designed. If the server has since changed issuer, client ID or audience, that
+// token is refused on every invocation and nothing in the flow ever looks at the
+// server's metadata again — the user is locked out until the cache expires or
+// they delete it by hand.
+//
+// Exactly one retry, and only when re-resolution shows the configuration actually
+// changed; see TokenAfterRejection. Both conditions matter: without the first this
+// could loop, and without the second every rejection — a disabled account, a
+// revoked scope — would open a browser that cannot help.
+//
+// 403 counts alongside 401, and this is the part worth reading twice. The
+// server answers a token that failed validation with 403 — wrong issuer, wrong
+// audience, bad signature — and reserves 401 for a missing or malformed header.
+// The configuration-changed case therefore arrives as a 403, which by RFC 7235
+// carries no WWW-Authenticate challenge and so carries no `resource_metadata`
+// either. Keying this recovery on the challenge, as the RFC 9728 §5.2 flow
+// suggests, would miss every case it exists for; keying it on the status code
+// catches them. tunnelserver's TestChallengeAbsentOnSuccessAndOnForbidden pins
+// the server half of that.
+func dialTunnelWithRecovery(ctx context.Context, cfg clientConfig, source authTokenSource, token string) (*websocket.Conn, *http.Response, error) {
+	conn, resp, err := dialTunnel(ctx, cfg, token)
+	if err == nil || !isAuthRejection(err) {
+		return conn, resp, err
+	}
+	replacement, retryErr := source.TokenAfterRejection(ctx)
+	if retryErr != nil {
+		// Report what the server said, not what re-resolution then hit: the
+		// rejection is the user's actual problem and the recovery attempt was
+		// ours.
+		log.Printf("re-reading server configuration after a rejected token failed: %v", retryErr)
+		return conn, resp, err
+	}
+	if replacement == "" {
+		return conn, resp, err
+	}
+	log.Println("server configuration changed; retrying with a token obtained under the new one")
+	return dialTunnel(ctx, cfg, replacement)
+}
+
+// isAuthRejection reports whether the server refused the credential, as opposed
+// to refusing the request for capacity or rate reasons.
+func isAuthRejection(err error) bool {
+	var dialErr *tunnelDialError
+	if !errors.As(err, &dialErr) {
+		return false
+	}
+	return dialErr.StatusCode == http.StatusUnauthorized || dialErr.StatusCode == http.StatusForbidden
 }
 
 func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket.Conn, *http.Response, error) {
@@ -518,9 +712,16 @@ func (e *tunnelDialError) categoryMessage() string {
 }
 
 // handleControlMessages reads from the MultiplexConn's control channel and
-// responds to server-initiated longevity messages. When the server warns that
-// the token is about to expire, the client attempts to obtain a fresh token
-// and sends it back over the control channel.
+// responds to server-initiated longevity messages.
+//
+// Every string taken from a control message is logged with %q. These are chosen by
+// the tunnel server, they reach a terminal under ssh and a log aggregator after
+// that, and none of them passes through a parser that would reject control bytes —
+// so raw output would let the far end rewrite the line reporting it or forge a
+// record beside it.
+//
+// When the server warns that the token is about to expire, the client attempts to
+// obtain a fresh token and sends it back over the control channel.
 func handleControlMessages(ctx context.Context, conn *wsconn.MultiplexConn, source authTokenSource) {
 	for {
 		select {
@@ -537,7 +738,7 @@ func handleControlMessages(ctx context.Context, conn *wsconn.MultiplexConn, sour
 				}
 				_ = json.Unmarshal(msg.Data, &payload)
 				if payload.Reason != "token" {
-					log.Printf("server warning: connection expiring due to %s", payload.Reason)
+					log.Printf("server warning: connection expiring due to %q", payload.Reason)
 					continue
 				}
 				newToken, err := source.AccessToken(ctx, false)
@@ -559,13 +760,13 @@ func handleControlMessages(ctx context.Context, conn *wsconn.MultiplexConn, sour
 					Reason string `json:"reason"`
 				}
 				_ = json.Unmarshal(msg.Data, &payload)
-				log.Printf("server rejected token refresh: %s", payload.Reason)
+				log.Printf("server rejected token refresh: %q", payload.Reason)
 			case "disconnect":
 				var payload struct {
 					Reason string `json:"reason"`
 				}
 				_ = json.Unmarshal(msg.Data, &payload)
-				log.Printf("server disconnecting: %s", payload.Reason)
+				log.Printf("server disconnecting: %q", payload.Reason)
 				_ = conn.Close()
 				return
 			}
