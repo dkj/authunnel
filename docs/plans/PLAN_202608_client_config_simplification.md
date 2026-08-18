@@ -443,498 +443,108 @@ The test named for the flag was retitled to match what it can actually prove
 comment says so and points at the parse test for the suppression itself. A test whose name claims
 more than its assertions is how the previous plan's redirect tests went wrong.
 
-### Review findings on the client-side work, all fixed
-
-Four, two of them P1. Recorded in full because three were places where a *stated* trade-off turned
-out to be the wrong one, which is more useful to a future reader than the diffs.
-
-- **P1: the resource comparison was origin-only, and RFC 9728 §3.3 requires the whole identifier.**
-  This plan argued for the weaker version explicitly — "a deployment behind a path-rewriting reverse
-  proxy legitimately sees a different path, while the origin is the part that decides who could have
-  served the document" — and the argument is wrong about what the check is *for*. It is not only
-  "who served this"; it is "is this document about the resource I am using". One hostname can carry
-  several protected resources, and an origin comparison lets a document about `/a/tunnel` hand its
-  authorization server and client ID to a client asking about `/b/tunnel`. The path-rewriting case
-  is real but is configuration, not grounds for weakening the check for everyone: the server gained
-  `--resource-url` to declare its externally visible identifier, and the comparison is now exact
-  after syntax-based normalisation only.
-- **P1: discovered addresses were unfiltered (RFC 9728 §7.7).** Shape and transport were checked;
-  where the name actually pointed was not, so a public tunnel server could aim the client's own auth
-  traffic at loopback or `169.254.169.254`. Fixed at two layers, because neither covers the other:
-  a resolution check — the only protection for `authorization_endpoint`, which goes to the OS URL
-  dispatcher and through no client of ours — and a dial guard that connects to the address it
-  verified, closing the rebinding gap the first leaves open, since the attacker chose the name and
-  therefore controls its DNS. Two scoping decisions keep it from over-blocking: private networks are
-  not refused (an internal IdP is an ordinary deployment, and the existing `ipblock.Default()` set
-  already excludes RFC1918 for the same reason), and the guard is lifted when the tunnel server is
-  itself internal, which is the local-development case (narrowed in round five below to
-  loopback and `localhost` only — read that before treating this sentence as current).
-  This is what moved the deny-list into
-  `internal/ipblock`: the server asking about SOCKS destinations and the client asking about
-  discovered addresses are the same question, and a second copy of the answer would drift.
-- **P2: the tunnel URL's query was dropped from the resource identity.** The stated reason —
-  avoiding forwarding "whatever a caller had appended" — holds for the fragment and fails for the
-  query, which the WebSocket dial already sends to that same host. Dropping it disclosed nothing
-  and instead collapsed distinct resources onto one identity, so `?tenant=a` and `?tenant=b` shared
-  discovered configuration *and a cache entry*. The query is now carried through the §3.1
-  derivation, compared, and part of the cache identity; the server echoes it, since it routes on
-  path alone and a query is opaque routing information belonging to whatever sits in front.
-- **P2: a stale-but-unexpired cached token was an unrecoverable lockout.** The fast path returns a
-  cached access token without reading any metadata — by design — so a server that changes issuer,
-  client ID or audience leaves every client presenting a credential it will keep refusing until the
-  cache expires. The client now re-resolves once on a rejection and retries with a token obtained
-  under the new configuration.
-
-  **The trigger the review proposed does not fire in this codebase**, and it is worth writing down
-  why. RFC 9728 §5.2 has the client react to the `resource_metadata` challenge on a 401 — but this
-  server answers a token that *failed validation* with 403 and reserves 401 for a missing or
-  malformed header. A 403 carries no challenge (RFC 7235), so the configuration-changed case would
-  never have been seen. The recovery keys on 401 **or** 403 instead.
-
-  Two guards make the retry safe: exactly one attempt, and only when re-resolution shows the
-  configuration actually changed. Without the second, a disabled account or a revoked scope — which
-  produce the same rejection and are fixed by neither re-resolution nor re-authentication — would
-  open a browser on every ssh invocation.
-
-### Second review round, all fixed
-
-Four again, and the shape of them is the lesson: two were *incomplete* fixes from the round above,
-which is the failure mode this plan should have expected of itself.
-
-- **P1: the query was still dropped where it mattered.** The previous round corrected the §3.1
-  derivation and the comparison, and left `resourceURLForTunnel` — the client's own derivation, and
-  the thing that actually produces the cache key — untouched, with a comment asserting "query and
-  fragment are dropped by the derivation itself" that had just stopped being true. So `?tenant=a`
-  and `?tenant=b` still shared discovered configuration and a cache entry while the dial still sent
-  the query.
-
-  **Every test missed it because every test assigned `source.resourceURL` by hand.** That is the
-  same gap recorded two rounds earlier about `newAuthTokenSource` — a config-to-source mapping that
-  no test crossed — and it recurred because the fix then was one test, not a rule. The rule:
-  **a value the production config path computes must be asserted through that path.** The new tests
-  go through `parseClientConfig`, and the mutation now fails.
-- **P1: the dial guard was bypassed by an HTTP proxy.** `NewBoundedClient` sets
-  `Proxy: http.ProxyFromEnvironment`, and `Transport.Clone` preserves it, so with a proxy configured
-  the transport dials the *proxy*: the guard inspected the proxy's address while the destination went
-  unchecked. Two things were wrong at once, because the naive repair is also wrong — checking the
-  proxy hop would refuse a loopback proxy, which is a common corporate shape.
-
-  Fixed by adding the layer that can see the destination: a RoundTripper check on every request,
-  which also covers each redirect hop, plus a context marker that exempts the proxy hop from the
-  dialer. The honest scope, now stated in the code and the docs rather than implied: a proxied
-  client's destination is resolved *by the proxy*, so there is no address for us to pin and rebinding
-  is narrowed, not prevented.
-- **P2: the challenge omitted the query.** The document echoes it, so a standards-following client
-  that followed the challenge fetched the query-less document and then failed its own equality check
-  — a challenge leading somewhere self-defeating, which is worse than sending none. The test follows
-  the challenge and asserts the document at the far end describes the resource that was requested,
-  which is the property that matters rather than the header's spelling.
-- **P2: `--resource-url` accepted unusable schemes.** `ftp://host/path` normalised fine and would
-  have been published as an identifier no client can retrieve. Fixed at the root by making http(s)
-  part of `NormalizeResourceIdentifier` — the single identifier rule the derivation is built on —
-  rather than adding a second check at the flag.
-
-  One consequence recorded because it cuts against an instinct: the fix first routed the flag through
-  `ProtectedResourceURL` "to prove the derivation runs", and the mutation check showed that
-  indirection was undetectable, since that function adds no rejection the normaliser does not already
-  make. Reverted to the normaliser. A distinction no test can see is not defence in depth.
-
-A behaviour change fell out of the identifier rule and is worth flagging: a fragment is now
-**refused** by the derivation rather than silently stripped. The client strips its own first — a
-fragment in `--tunnel-url` is inert, never sent, so failing discovery over it would be the worse
-answer — while a fragment arriving in a *document* is refused, because quietly discarding part of a
-value that is about to be compared for equality is how the derived and compared values drift apart.
-
-### Third review round, all fixed
-
-Three, all P1, and two of them were *my* fixes from the round above being wrong rather than
-incomplete — which is a different and more uncomfortable failure than the last round's.
-
-- **The condition that relaxed the guard was attacker-supplied.** The previous round decided
-  "internal targets are acceptable when the resource server is itself internal" by *resolving the
-  tunnel host* and treating any blocked answer as internal. The tunnel host belongs to the party the
-  guard exists to constrain, so its DNS is theirs: two A records, one public and one loopback,
-  classified their server as local and switched every downstream check off, after which the document
-  could name any internal address it liked. A guard whose activation condition is chosen by its
-  adversary is not a guard, and I built one while writing a comment about how carefully it was
-  scoped.
-
-  Now decided from the spelling alone — a literal address in the protected set, or a name RFC 6761
-  reserves for loopback — and resolving nothing. The cost is a development host that reaches its
-  tunnel through a private alias, which must pass `--oidc-issuer`; the benefit is a condition no
-  remote party can satisfy. All resolution in `internal/authhttp` now goes through one seam so a
-  test can assert which paths resolve and which must not, because the first version of that test
-  could not tell the two apart and the mutation check passed.
-- **Documenting the proxy exposure was not a fix — and refusing every proxied request was not the
-  right one either.** Recorded as one item because the second correction came from a question about
-  the first, and the pair is more instructive than either half.
-
-  The round-two version kept the proxy, checked the destination per request, and wrote down that a
-  proxied client's rebinding window was narrowed rather than closed. That is a guard advertised in the
-  README which silently does not hold for a whole class of users, so round three refused every
-  proxied request. The review asked, reasonably, whether rebinding is a problem at all when the
-  authunnel server is https — and it is not.
-
-  **For an https destination the certificate is the binding, and it survives a proxy.** The transport
-  issues `CONNECT` and then performs its own TLS handshake with the origin, validating against the
-  name it asked for; the proxy is a blind relay. A rebound internal service cannot complete that
-  handshake, because the attacker owns the name but not that service's key. Address pinning was only
-  ever standing in for the thing TLS already does. Verified rather than reasoned about: a test relays
-  every tunnel to one origin regardless of the name requested, and the mismatched name fails on the
-  certificate before a single request is served.
-
-  So the refusal is now scoped to **plaintext** through a proxy, where nothing binds the origin and a
-  proxy fetching an internal `http` endpoint is precisely the §7.7 pivot. On the proxied https path the
-  address checks are *skipped* rather than applied, because a proxied network frequently resolves
-  external names only at the proxy and demanding a local answer would break exactly the clients that
-  can reach the destination. The same reasoning fixed the client's static endpoint check, which had
-  been treating "cannot resolve" as grounds for refusal.
-
-  What that recovers: zero-configuration discovery works behind a proxy again, and since a plaintext
-  discovered endpoint already requires `--insecure-oidc-issuer`, the remaining refusal does not arise
-  in a normal deployment. What it does not cover, stated rather than glossed: a TLS-terminating proxy
-  with its CA installed *is* the origin as far as validation goes, and the control for that is the
-  proxy's own egress policy.
-
-  The lesson worth keeping is not about proxies. Twice in a row the error was reaching for a
-  client-side check without first asking what the transport already guarantees — once by under-scoping
-  the guard and once by over-scoping it. **Establish what TLS is already binding before deciding what
-  needs pinning.**
-
-- **Escaped path segments were collapsed.** Every derivation carried `url.URL.Path`, the decoded
-  form, so `String()` re-encoded it and `/tenant%2Fone/tunnel` came back as `/tenant/one/tunnel` —
-  two identifiers RFC 3986 §2.2 keeps distinct, merged into one discovery result and one cache entry,
-  while the code and the docs promised a verbatim path comparison. Fixed at all three sites by
-  carrying the escaped form.
-
-  One limitation now stated rather than left implicit: equivalent percent-encodings (`%7E` and `~`)
-  are not folded together, so they compare unequal. That errs toward refusing a legitimate document
-  rather than accepting a foreign one, which is the correct side to be wrong on, and both values are
-  quoted in the error.
-
-### Fourth review round: the issuer pin was hollow
-
-One finding, and it invalidated a claim this plan makes in its own opening section.
-
-**`--oidc-issuer` did not pin where the metadata came from.** The check compared the configured
-issuer against `authorization_servers` and then, separately, adopted
-`authunnel_authorization_server_metadata_url` whenever the operator had not supplied one. Both fields
-come from the same tunnel server. So a hostile server echoed the expected issuer, pointed the client
-at its own metadata document — whose `issuer` field is self-asserted, as the `metadataURL` comment in
-`client/auth.go` has said since the first round — and named the authorization and token endpoints from
-there. The browser went to its authorization endpoint; the code, the PKCE verifier and any refresh
-token went to its token endpoint.
-
-Every element of that was already written down here. "The trust question, stated up front" says an
-operator who does not accept the trade "keeps supplying `--oidc-issuer`", and the invariants say an
-explicit value is never overridden by a discovered one. Both were false in this case, and the reason
-is worth more than the fix: **I reasoned field by field.** Explicit issuer beats published issuer,
-explicit metadata URL beats published metadata URL — each true, and together not enough, because one
-field determines what another field guarantees. "Explicit wins" has to be evaluated per *guarantee*.
-The issuer's guarantee is "the endpoints come from this issuer", and the document's location is what
-decides that.
-
-Fixed by bounding the published location: accepted when no issuer is configured (nothing to
-undermine, and that is the trade the feature makes), and otherwise only when it shares an origin with
-the configured issuer — where TLS makes the issuer's own host answer for the document. That keeps the
-case the flag exists for, since an authorization server publishing RFC 8414 metadata at a
-non-derivable path serves it from its own host. A cross-origin location with an issuer pinned is
-announced and ignored rather than treated as an error: it is not necessarily an attack, and silence
-would leave an operator debugging a 404 on the derived path while the server advertises a location the
-client declined.
-
-The gate reads the *configured* `s.issuer`, not `identity.Issuer`, which may have just been adopted
-from the document being judged. That distinction is not cosmetic and the first version of the test
-could not see it — see the mutation notes.
-
-**What a pinned issuer still does not pin**, now stated in README and DEPLOYMENT rather than left to
-be inferred: the audience and the RFC 8707 resource. Those are adopted when the client supplies
-neither, so a tunnel server can influence what the token is *for* even when it cannot influence where
-the login happens. An operator pinning the issuer out of distrust should pin `--oidc-audience` or
-`--oidc-resource` as well. Not gated automatically, because a mixed configuration — pin the IdP,
-discover the audience — is a legitimate thing to want, and the flag to express distrust already
-exists.
-
-### Fifth review round: the relaxation set was the refusal set
-
-One finding, and it is the same mistake as the fourth round in a different costume.
-
-**Link-local, IMDS, multicast and unspecified literals disabled every guard.** The classification
-reused `ipblock.Default()` — the list of addresses a remote party may not send this client to — to
-answer a different question: is this host the machine we are running on. Loopback answers yes to both.
-The others answer yes to the first and no to the second, so a tunnel URL of
-`http://169.254.169.254/protected/tunnel` was classified as local and switched off every check,
-including the one protecting the instance metadata service. "The tunnel server is IMDS" is the last
-circumstance in which to start trusting what it says.
-
-Narrowed to loopback literals plus `localhost`/`*.localhost`. Every documented development path in
-this repo uses `localhost`, so the narrowing costs nothing real; `0.0.0.0` and `::` are excluded as
-well, even though a connection to them cannot leave the host, because no documented setup spells it
-that way and one clear refusal is cheaper than a standing question about why an unspecified address
-counts as an identity.
-
-The recurring error, now twice: **two questions answered by one artefact.** Round four was one
-guarantee (a pinned issuer) undermined by a different field (the metadata URL). This is one list
-serving both "refuse" and "trust". In both cases the individual pieces were right and the coupling
-was wrong, and in both cases the comment above the code described the narrower intent while the code
-did the broader thing. The test written for this is deliberately a *property* — every member of the
-refusal set is checked, and only loopback may also relax — rather than a list of examples, so a future
-entry in `ipblock.Default()` cannot inherit "local" by being added in one place.
-
-### Sixth review round: the pin held only until the first redirect
-
-One finding, and it is the third consecutive instance of the same underlying error.
-
-**A same-origin open redirect defeated the round-four issuer pin.** That fix checked the published
-metadata URL against the configured issuer's origin — and then the fetch followed redirects anywhere,
-provided they stayed on https. So a hostile tunnel publishes a URL that *does* start on the issuer's
-origin and happens to be an open redirect, which is not a rare thing to find on an IdP host, and the
-document actually read comes from wherever it points. Every check written so far still passed.
-
-Fixed by refusing to leave the origin a metadata fetch started on, unconditionally rather than only
-when something is pinned: a conditional rule needs a reader to work out which case they are in, and the
-unconditional one makes true a claim this documentation already made about *both* documents — that each
-comes from the origin it describes.
-
-Two decisions inside that, both of which the tests forced rather than confirmed:
-
-- **Origin, not hostname.** The first version compared hostnames, which is the exact statement of what
-  TLS guarantees, since a certificate answers for a host on any port. The regression fixture walked
-  straight through it: two `httptest` servers share the hostname `127.0.0.1` and differ only by port.
-  That is not merely a fixture artefact — in plaintext mode there is no certificate to appeal to and a
-  different port is a different service. The stricter rule costs only an http-to-https upgrade of the
-  same document, which an operator can express by spelling the metadata URL as its final location.
-- **The pin is nested inside the downgrade guard**, so an https-to-http hop still reports "transport
-  downgrade on the auth path" rather than the origin message. A downgrade is nearly always an origin
-  change too, and the sharper diagnosis should win — the same ordering argument as the proxy check.
-  Two existing tests caught this by asserting on the reason, which is the value of asserting on
-  messages an operator will read.
-
-**Extended beyond the finding to the token request**, where the same gap had a worse consequence: a
-307 or 308 preserves method and body, so a cross-origin redirect there forwards a refresh token or an
-authorization code to another host, and the downgrade rule does not notice an https-to-https hop. The
-test uses a *working* https token endpoint on the other origin, recording what it receives, so the
-refusal is attributable to the policy rather than to a broken target.
-
-**The pattern, now three for three.** Round four: one guarantee undermined by a different field. Round
-five: one list answering two questions. Round six: a property established at check time and dissolved
-at use time. None was a wrong rule in isolation — each was a *coupling* between a rule and a mechanism
-elsewhere. The question that finds these is not "is this check correct" but "what else can change the
-thing this check just established", and it is the question to ask first on any further pass.
-
-### Seventh review round: policy keyed on the wrong question
-
-Two findings, both P2, both the same misattribution: discovery-input policy applied on the basis of
-*whether discovery ran* rather than *what the tunnel server actually chose*.
-
-- **A configured issuer was filtered as discovered input.** Discovery runs when any essential value is
-  missing — including when only `--oidc-client-id` is — and the advertised issuer was then put through
-  the transport and address rules, and the shared HTTP client wrapped with the address guard. So an
-  operator's own loopback issuer worked or failed depending on whether an unrelated flag was supplied,
-  contradicting a promise this documentation makes in three places.
-
-  Fixed with one predicate, `authorizationServerIsRemotelyChosen`: false whenever `--oidc-issuer` or
-  `--oidc-metadata-url` fixes the authorization server's location. In that mode nothing the client
-  fetches was located by the tunnel server — the resource URL is typed by the operator, the
-  authorization server's document comes from the operator's own issuer or metadata URL, and a
-  *published* metadata URL is adopted only within that issuer's origin — and what the tunnel server may
-  still supply, a client ID and an audience, names no address at all. The shape rule still applies to
-  everything, since a value that is not a usable http(s) URL is worth refusing whoever chose it.
-
-- **A hint was judged before the decision not to use it.** With an issuer configured, a cross-origin
-  published metadata URL that was also plaintext or internal failed the transport and address rules and
-  became a hard error, so the documented "announced and ignored" outcome was unreachable for exactly
-  the values a hostile server would choose — turning a hint into a denial of service against a client
-  that had pinned its issuer and should have been immune. Now the same-origin comparison comes first
-  and nothing is validated that is not about to be adopted.
-
-Two notes on the tests, because both mutations initially passed and the reasons were different:
-
-- the ordering fix was invisible against a hint that fails only the *discovery* rules, since those are
-  skipped anyway once an issuer is configured. It is detectable against a hint that fails the **shape**
-  rule, which applies regardless of who chose the value — so the test now covers a `file://` hint as
-  well as an internal one;
-- the early return in `adoptAuthorizationServer` turned out to be genuinely unobservable: the only
-  value that reaches the check there is the configured issuer itself, which passed the same shape rule
-  at parse time. The guarantee lives in the predicate, and the comment now says so instead of claiming
-  the return as a mechanism. Same discipline as the `--resource-url` indirection removed in round two,
-  applied to a comment rather than to code, because the return does make the function clearer to read.
-
-The recurring lesson, in its fourth form: **a rule is only as good as the question it is keyed on.**
-Rounds four to six were rules undermined by a coupling elsewhere; this one is a rule keyed on a
-correlate of its subject — "discovery ran" instead of "the tunnel server chose this" — which is the
-same error one level up.
-
-### Eighth review round: unparsed remote text reaching a terminal
-
-One finding, and an instructive interaction with the previous round.
-
-**Values a document chose were printed raw.** The published metadata URL is announced when it loses the
-same-origin comparison, and round seven had deliberately moved that announcement *ahead* of validation
-so an unusable hint could be ignored rather than fail the flow. The consequence was not obvious: the
-values that reach that line are precisely the ones no parser accepted — `url.Parse` refuses control
-characters, so a hint carrying them fails `SameOrigin` and takes exactly that branch. Raw, an escape
-sequence can erase or rewrite the line reporting it, and a carriage return can overwrite it, so a
-refusal can be made to read as a success; the same bytes forge a neighbouring record in a log
-aggregator. The bounded HTTP error body had the same shape.
-
-Fixed with `%q` at each sink. The audit found three sinks beyond the two reported, all the same class:
-
-- the issuer-mismatch comparison, which prints a document's self-declared issuer — a string that is
-  compared but never parsed, so nothing else would reject anything in it;
-- the OIDC callback's `error` parameter, chosen by whoever answered the authorization request;
-- the three control-message reasons logged by `handleControlMessages`, chosen outright by the tunnel
-  server. Those predate this work, and were fixed anyway: leaving known sinks of the same class while
-  fixing two would be an odd place to stop.
-
-Deliberately *not* quoted: values that came through `url.Parse` (which refuses control bytes) or
-through the client-ID, scope and audience charset checks, since those cannot carry any; and the
-authorization URL printed for the user to copy into a browser, where quoting would break what the line
-is for.
-
-The interaction is the part worth remembering. Round seven's fix — decide before validating — was
-right, and it *moved an unvalidated value to an output sink*. Neither change was wrong on its own; the
-hazard existed only in their combination. Which is the same lesson as rounds four to seven in yet
-another form, and the reason the question to ask of a change is not only "is this correct" but "what
-does this newly expose, and to whom".
-
-### Ninth review round: the sink that is not ours
-
-Two findings, and together they show why round eight's approach was necessary but not sufficient.
-
-- **A dependency renders untrusted bytes for us.** `golang.org/x/oauth2` embeds a non-conforming token
-  endpoint response body — and the HTTP reason phrase with it — directly in
-  `RetrieveError.Error()`. Wrapping that with `%w` and printing it with `%v` puts whatever the endpoint
-  chose on the terminal, and in zero-configuration mode the tunnel server chooses that endpoint. There
-  is no format verb in this repository to correct: the bytes appear when the dependency renders itself.
-
-  Round eight quoted each site where *this code* formats a remote value. That was the right fix for
-  those sites and it cannot reach this one, so the escaping now also happens at the boundary where text
-  reaches a person: the client's standard logger writes through `safeLogWriter`, which escapes control
-  characters and preserves one trailing newline so records stay one to a line. That covers every log
-  call in the binary, including ones in code not yet written. The two mechanisms are complementary —
-  per-site quoting delimits a value that is known to be remote, the boundary catches what we do not
-  format — and each has its own test.
-
-  The server needs no equivalent, and this is worth knowing rather than assuming: it routes the
-  standard logger into slog's JSON handler, and JSON encoding escapes control characters as a matter of
-  course.
-
-- **The HTTP reason phrase was still from the wire.** `response.Status` is `"403 Forbidden"` as the
-  *server* wrote it, and Go's client parser passes control bytes there straight through — verified with
-  a raw listener rather than assumed, since it is the part of a response that looks least
-  attacker-influenced. Errors now describe a response with the numeric code plus Go's own `StatusText`.
-
-Three things this round corrected in my own understanding, all worth recording:
-
-- **The refresh path does not display its error.** The finding cited both the refresh and the exchange;
-  driving the real binary showed a failed refresh is swallowed, because `tokenForResolvedIdentity`
-  treats anything that is not a refusal as grounds for interactive login — the client sat waiting for a
-  browser callback rather than reporting. The exchange path does display it, and so does a refresh with
-  no fallback available. The boundary covers all of them, which is the argument for a boundary.
-- **`git checkout` on a staged file is not a revert to my edits.** Used twice in mutation scripts, it
-  silently reverted files to their staged versions and dropped that round's work — caught by a full run
-  both times, but the lesson is to back up with `cp` and never `git checkout` during a mutation check.
-- **A mutation found an untested production link.** Deleting the installation from `main` broke no
-  test, because every test installed the writer itself — the same shape as the
-  `newAuthTokenSource` and `parseClientConfig` gaps from rounds two and seven. Extracted
-  `installSafeLogging` so the wiring has a name a test can reach, and stated plainly what remains
-  uncovered: main's single call to it, which no test can reach.
-
-### Tenth review round: a "dead" check that was not
-
-One finding, and it is the only regression in this work that a review round *introduced*
-rather than found.
-
-**The empty-fragment case.** `NormalizeResourceIdentifier` refused a fragment with
-`u.Fragment != "" || strings.Contains(rawURL, "#")`. A review sweep reported the first
-disjunct as subsuming the second — "url.Parse only ever sets Fragment from a literal #,
-so a non-empty Fragment implies a # in the raw string" — and I removed the raw-string
-half on that basis. The implication is true and it is the wrong direction. The raw-string
-test was there for the converse: a URL ending in a *bare* `#` parses with `Fragment == ""`
-and leaves no other trace, so the parsed field alone accepts it and normalisation then
-drops the delimiter — the silent discarding the surrounding comment forbids — and
-`--resource-url https://example/path#` passed server validation.
-
-Note the asymmetry that makes this counter-intuitive: a bare `?` *does* record itself, in
-`url.URL.ForceQuery`. There is no `ForceFragment`. That is now written next to the check.
-
-Neither existing test could see it: every fragment case used `#frag`. Tests now cover the
-bare delimiter at all three layers — the identifier rule, the handler's `Validate`, and
-the server's startup — and the mutation fails all three.
-
-**How I came to do it.** The sweep's evidence was "over `%23`, `#b`, trailing `#` and
-no-`#` inputs there is no case with `Fragment != ""` and no `#` in the raw string" — which
-verifies the implication as *stated* and never asks what the second disjunct was written
-for. I checked the claim and not the purpose. That is the same error as every round from
-four onwards, arriving from the opposite side: not prose that lagged the code, but code
-deleted because a claim about it sounded right. **Before removing a check, state what it
-was for and construct the input it was guarding against.** If that input cannot be
-constructed, the check is genuinely dead; if it can, the claim was about something else.
+### Review rounds, all findings fixed
+
+Ten rounds, 21 findings. The invariants they produced live in DEPLOYMENT.md and DEVELOPMENT.md;
+what is kept here is the finding, the fix, and the pattern that connects them.
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | Resource comparison was origin-only; RFC 9728 §3.3 requires the whole identifier, so a document about `/a/tunnel` could configure a client asking about `/b/tunnel` | Exact comparison after syntax normalisation; `--resource-url` declares an externally visible identifier for path-rewriting proxies |
+| 1 | Discovered addresses unfiltered (§7.7): a public tunnel server could aim the client's auth traffic at loopback or IMDS | Resolution check plus a dial guard that connects to the address it verified; deny-list moved to `internal/ipblock` so client and server share one answer |
+| 1 | The tunnel URL's query was dropped from the resource identity, collapsing `?tenant=a` and `?tenant=b` onto one cache entry | Query carried through the §3.1 derivation, the comparison and the cache key |
+| 1 | A stale-but-unexpired cached token was an unrecoverable lockout after a server reconfiguration | One re-resolve and retry, gated on the configuration having actually changed; keyed on 401 **or** 403, since this server answers a failed token with 403 and a 403 carries no challenge |
+| 2 | The query was still dropped in `resourceURLForTunnel` — the function that actually produces the cache key | Fixed, and the tests moved to run through `parseClientConfig` |
+| 2 | The dial guard was bypassed by an HTTP proxy: it inspected the proxy's address while the destination went unchecked | A RoundTripper destination check (which also covers each redirect hop) plus a context marker exempting the proxy hop, so a loopback proxy is not refused |
+| 2 | The `WWW-Authenticate` challenge omitted the query, so a conforming client fetched a document that failed its own equality check | Challenge and document derived from one accessor |
+| 2 | `--resource-url ftp://…` normalised fine and would publish an unretrievable identifier | http(s) folded into `NormalizeResourceIdentifier`, the single identifier rule |
+| 3 | The condition that relaxed the address guard was attacker-supplied: it resolved the tunnel host and treated a blocked answer as internal | Decided from the spelling alone, resolving nothing; all resolution moved behind one seam a test can assert on |
+| 3 | Documenting the proxy exposure was not a fix — and refusing every proxied request was not the right one | Refusal scoped to *plaintext* via a proxy; proxied https is allowed because the certificate binds the origin, verified with a relay fixture rather than reasoned about |
+| 3 | Escaped path segments were collapsed, merging `/tenant%2Fone` with `/tenant/one` | Escaped form carried at all three derivation sites |
+| 4 | `--oidc-issuer` did not pin where the metadata came from: the issuer and the published metadata URL both come from the tunnel server | A published metadata URL is adopted only within the configured issuer's origin, gated on the *configured* value rather than one just adopted |
+| 5 | Link-local, IMDS, multicast and unspecified literals disabled every guard, because the relaxation set was the refusal set | Narrowed to loopback plus `localhost`/`*.localhost`, pinned by a property test over the whole refusal set |
+| 6 | A same-origin open redirect defeated the round-four pin: the fetch followed redirects anywhere on https | Metadata fetch pinned to its starting origin, and the same pin extended to the token requests, where a 307 preserves the credential-bearing body |
+| 7 | A configured issuer was filtered as discovered input, so an operator's own loopback issuer worked or failed depending on an unrelated flag | One predicate, `authorizationServerIsRemotelyChosen`, keyed on who chose the authorization server |
+| 7 | A hint was validated before the decision not to use it, turning "announced and ignored" into a denial of service against a client that had pinned its issuer | Same-origin comparison first; nothing validated that is not about to be adopted |
+| 8 | Values a document chose were printed raw, so an escape sequence could rewrite the line reporting a refusal | `%q` at each of five sinks; deliberately not applied to values that came through `url.Parse` or the charset checks, nor to the authorization URL a user must copy |
+| 9 | `golang.org/x/oauth2` renders a non-conforming token response body inside its own error, so there is no format verb here to correct | Escaping added at the boundary as well: the client's logger writes through `safeLogWriter`. The server needs no equivalent — slog's JSON handler escapes as a matter of course |
+| 9 | The HTTP reason phrase was still from the wire; Go's parser passes control bytes through | Errors report the numeric code plus Go's own `StatusText`, verified with a raw listener |
+| 10 | An empty fragment stopped being rejected: a sweep called `strings.Contains(rawURL, "#")` a dead disjunct and I removed it | Restored, with the asymmetry recorded next to it — a bare `?` records itself in `url.URL.ForceQuery`, and there is no `ForceFragment` |
+
+**The pattern, in seven forms.** None of these was a wrong rule in isolation; each was a *coupling*
+between a rule and a mechanism elsewhere. One guarantee undermined by a different field (4). One list
+answering two questions (5). A property established at check time and dissolved at use time (6). A
+rule keyed on a correlate of its subject (7). A correct change newly exposing an unvalidated value
+(8). A sink owned by a dependency (9). And a check deleted because a claim about it sounded right
+(10). The question that finds these is not "is this check correct" but "what else can change the
+thing this check just established" — and, before deleting anything, "state what it was for and
+construct the input it was guarding against".
+
+Two process notes worth keeping:
+
+- **Twice the error was reaching for a client-side check without first asking what the transport
+  already guarantees** — once by under-scoping the address guard and once by over-scoping it.
+  Establish what TLS is already binding before deciding what needs pinning.
+- **`git checkout` on a staged file is not a revert to your edits.** Used twice in mutation scripts,
+  it silently restored the staged version and dropped that round's work. Back up with `cp`.
 
 ### Mutation checks run
 
-Every security-relevant assertion in this work was verified by breaking the code and confirming the
-test fails — the discipline the previous plan arrived at after shipping tests that proved nothing:
+Every security-relevant assertion here was verified by breaking the code and confirming a test
+fails. The full list is in the git history of this file; what is worth keeping is the checks that
+initially **passed**, since each exposed a test that proved less than its name claimed:
 
-- redirect guard removed from `authmeta.fetchDocument` → the plaintext mirror serves a *valid*
-  document, so the fetch succeeds and the test fails on "want the redirect refused" rather than on a
-  coincidental mismatch;
-- `cacheMatchesResolved` removed → the refresh token reaches the token endpoint, caught by the
-  collector rather than by an error value;
-- the per-field exemption in `cacheMatchesConfigured` widened to every unconfigured field → a token
-  minted for another audience is reused;
-- the origin check in `FetchProtectedResource` removed → a document describing `elsewhere.example`
-  is accepted;
-- resolution moved above the cache check → `TestCacheHitMakesNoRequestAtAll` fails, which is the
-  only thing standing between this feature and an HTTP request per `ssh` invocation;
-- the client's `--no-resource-metadata` no longer suppressing the lookup → the parse test fails.
-  This one initially *passed*, which is what exposed the restated-condition problem above; it is
-  recorded because a mutation check that passes is the useful outcome, not the wasted one;
-- the static internal-address check neutered → the direct test of it fails; the dial guard removed
-  → the integration test fails on the metadata endpoint having been reached. Split into two tests
-  after a single one passed under the first mutation: with the guard active the dial is refused
-  before the static check is ever consulted, so one test could not cover both layers and the name
-  it carried claimed otherwise;
-- the origin-only comparison restored → the differing-path and differing-query tests fail;
-- the retry disabled → the token source is never consulted; the changed-configuration guard removed
-  → a replacement is offered when nothing changed, which is the browser-on-every-invocation bug;
-- the query dropped from `resourceURLForTunnel` again → both `parseClientConfig` tests fail, where
-  the previous round's tests had stayed green;
-- the RoundTripper destination check removed → the proxied internal destination is reached; the
-  proxy-hop exemption removed → a public destination through a loopback proxy is refused, which is
-  the false positive the exemption exists for;
-- the challenge query dropped → the follow-the-challenge test fails. This one initially passed for
-  want of any test at all, which is why the test was written before the fix was believed;
-- http(s) removed from the identifier rule → the derivation and normaliser tests fail. The
-  `--resource-url` indirection through `ProtectedResourceURL`, by contrast, could *not* be caught,
-  and was removed for that reason;
-- the local classification made to resolve again → the resolver seam test fails. The first version of
-  that test passed under the mutation, because a hermetic fixture has no non-reserved name that
-  resolves to loopback; the seam is what made the property assertable at all, and the limit is
-  recorded in the test's own comment;
-- the plaintext-via-proxy refusal disabled → that test fails on the public destination, which no
-  address rule would have refused; and the refusal widened back to *every* proxied request → the
-  https-through-a-proxy tests fail, so the scoping is pinned from both sides;
-- the proxy-hop dial exemption removed → proxied https fails on the loopback proxy's own address,
-  which is the false positive that exemption exists for;
-- the escaped path dropped at either site → the `%2F` tests fail, including the one asserting the two
-  spellings do not share an identity;
-- the escaping writer made a pass-through → the writer and boundary tests fail; `installSafeLogging`
-  made a no-op → the wiring test fails; the wire reason phrase restored → the raw-listener test fails;
-- every `%q` sink reverted to `%s` at once → the announcement, the HTTP body, the mismatch and the
-  control-message tests each fail on raw control bytes, so no sink is covered only by another's test;
-- the predicate widened to "discovery ran at all" → both configured-value tests fail; forced false
-  entirely → the zero-config filtering tests fail, so the boundary is pinned from both sides;
-- the raw-string half of the fragment check dropped → the identifier, handler and server
-  tests each fail on a bare `#`, where the older `#frag` cases could not see it;
-- the metadata redirect pin removed → the open-redirect test adopts the attacker's endpoints again;
-  the token-leg pin removed → the credential reaches the other origin; the origin comparison relaxed
-  to ignore ports → both fail, which is how the hostname-only version was caught in the first place;
-- the relaxation widened back to the whole refusal set → the property test fails, naming IMDS; and
-  narrowed too far, with `localhost` dropped → the documented development path fails, so the set is
-  pinned from both sides;
-- the metadata-URL gate removed → the relocated-document test fails on the adopted URL. Gating on
-  `identity.Issuer` instead of `s.issuer` initially passed, because the exploit test's document echoes
-  the configured issuer and the two values are equal there; the case that separates them is an
-  *unpinned* client accepting a cross-origin location, which must keep working. Both are now pinned.
+- `--no-resource-metadata` no longer suppressing the lookup. The parse error restated
+  `needsDiscovery`'s condition instead of deriving from it, so the suppression term was
+  unobservable. One expression now gates both.
+- The static internal-address check neutered. With the dial guard active the dial is refused before
+  the static check is consulted, so one test could not cover both layers; split in two.
+- The `--resource-url` indirection through `ProtectedResourceURL`. Genuinely undetectable — that
+  function adds no rejection the normaliser does not already make — so the indirection was removed.
+  A distinction no test can see is not defence in depth.
+- The local classification made to resolve again. A hermetic fixture has no non-reserved name that
+  resolves to loopback; the resolver seam is what made the property assertable at all.
+- The early return in `adoptAuthorizationServer`. Verified unobservable: the only value reaching it
+  is the configured issuer, already shape-checked at parse time. The code stayed for readability and
+  the comment now attributes the guarantee to the predicate instead of claiming the return.
+- `installSafeLogging` deleted from `main`. Every test installed the writer itself — the same shape
+  as the `newAuthTokenSource` and `parseClientConfig` gaps. Extracted so the wiring has a name a
+  test can reach; `main`'s single call to it remains uncovered, which DEVELOPMENT.md records.
+- Gating the metadata pin on `identity.Issuer` rather than `s.issuer`. The exploit fixture's document
+  echoes the configured issuer, so the two are equal there; the case that separates them is an
+  *unpinned* client accepting a cross-origin location, which must keep working.
+
+### Merging main, and one reversal
+
+Main landed PR #68, a behaviour-preserving simplification of this same area. Its API is adopted here:
+`CheckDiscoveredEndpoint` (shape and downgrade fused), `CheckHTTPURL`, `CheckConfiguredURL`.
+
+One of its non-goals is in direct tension with round six: *"Preventing HTTPS-to-HTTPS redirects. A
+request rooted at the issuer's authenticated HTTPS origin may follow an authenticated delegation."*
+Round six made the origin pin unconditional, arguing that a conditional rule forces a reader to work
+out which case they are in. That argument loses to a stated non-goal, so the pin is now split:
+
+- **Metadata fetches** — pinned only for a *published* location adopted under a configured
+  `--oidc-issuer`. Everywhere else main's delegation case is permitted: an unpinned client has no
+  origin to hold a redirect to, an operator's own `--oidc-metadata-url` is a location they chose, and
+  the derived well-known path is the issuer's own. In the one remaining case the same-origin check on
+  the published URL is the whole of the round-four fix, and an open redirect on the issuer's host
+  would defeat it.
+- **Token requests** — pinned unconditionally. Main's non-goal is about where a *document* may come
+  from, and a document is not a credential. A 307 preserves method and body: with the pin removed,
+  `TestTokenEndpointCrossOriginRedirectIsRefused` records the other origin receiving
+  `grant_type=refresh_token&refresh_token=…` verbatim. That was re-verified during the merge rather
+  than taken on trust from the round-six note.
+
+The composition order was also inverted while merging: the caller's inherited `CheckRedirect` is now
+consulted **before** the origin pin, so a redirect that is both a downgrade and an origin change is
+reported as the downgrade — the more specific fault. The composed verdict is unchanged.
+
+**Round eleven found the split's own bug, and it is round six's pattern again.** The pin was recorded
+on the source when the published URL was adopted, and `TokenAfterRejection` discards `s.effective` and
+re-resolves — so a server that stopped publishing a metadata URL left a stale pin on the *derived*
+fetch, refusing the very delegation this split exists to permit. Fixed by deleting the field:
+`metadataOriginIsPinned()` derives the answer from `s.effective`, which is the state that gets reset,
+so there is nothing left to forget. A property established at one moment and stored outlives the thing
+it described — the fix for that is to compute it from the state it is a property *of*, not to add
+another line to a reset.

@@ -12,62 +12,26 @@ import (
 	"authunnel/internal/ipblock"
 )
 
-// The addresses refused below are ipblock.Default(): loopback, IPv4/IPv6
-// link-local (including the cloud instance-metadata address 169.254.169.254),
-// unspecified, and multicast. Deliberately *not* RFC1918, CGNAT or IPv6 ULA — an
-// authorization server on a private network is an ordinary corporate deployment,
-// and refusing it would break far more than it protected.
+// This file refuses ipblock.Default() addresses — loopback, IPv4/IPv6 link-local
+// (including the cloud instance-metadata address 169.254.169.254), unspecified,
+// multicast — for values a *remote* party chose, which is the pivot RFC 9728 §7.7
+// describes. Private networks are deliberately not refused, and a configured issuer
+// is the operator's own decision and is not filtered.
 //
-// This matters only for values a *remote* party chose. A configured issuer is the
-// operator's own decision and is not filtered; a discovered one arrives from a
-// tunnel server that could name anything, and RFC 9728 §7.7 calls out exactly
-// this — a resource server steering a client's own auth traffic at addresses only
-// the client can reach.
+// The rationale and the residual limits are in DEPLOYMENT.md, "Discovered addresses
+// and the internal-address guard". What a maintainer must not break:
 //
-// Two layers, because neither covers the other's case:
-//
-//   - CheckPublicAddress resolves a URL's host up front. It is the only option for
-//     the authorization_endpoint, which is handed to the OS URL dispatcher rather
-//     than fetched by us, so there is no connection of ours to guard.
-//   - RefuseInternalAddresses guards each request's own destination, and — when
-//     the connection is made directly — the dial as well. The dial layer is what
-//     closes the gap the static check leaves: the attacker chose the hostname, so
-//     they control its DNS, and a name that resolves publicly during the check can
-//     resolve to loopback a moment later. Checking at dial time and connecting to
-//     the address that was checked is the only version of that which holds.
-//
-// **An HTTP proxy removes the address checks, so what happens then turns on whether
-// anything else binds the origin — and for https, something does.**
-//
-// Through a proxy the destination is resolved by the *proxy*, so neither the address
-// that was checked nor the address that was dialled describes where the traffic went.
-//
-// For an https destination that does not matter. The transport issues CONNECT and
-// then performs its own TLS handshake with the origin, validating the certificate
-// against the name it asked for; the proxy is a blind relay. A rebound internal
-// service cannot complete that handshake — the attacker owns the name but not that
-// service's key — so it can neither deliver a document nor receive a credential. TLS
-// is the binding, and address pinning was only ever standing in for it. Such requests
-// are allowed, and the address checks are skipped rather than applied: with a proxy in
-// play the local resolver's answer is not the one that will be used, and a proxied
-// network often has no local answer at all.
-//
-// For a plaintext destination there is nothing to fall back on, and a proxy fetching
-// an internal http endpoint on this client's behalf is exactly the RFC 9728 §7.7
-// pivot. Those requests are refused. Plaintext discovery already requires
-// --insecure-oidc-issuer, so the refusal does not arise in a normal deployment.
-//
-// One limit this cannot close, stated rather than glossed: a TLS-terminating proxy
-// with its CA installed locally *is* the origin as far as certificate validation is
-// concerned, so it can serve internal content under any name. That is a trust the
-// operator established deliberately, and the control for it is the proxy's own egress
-// policy, not anything on this side.
-//
-// Two earlier versions of this comment were wrong in opposite directions — one
-// exempted the proxy hop and called the residual exposure documented, the other
-// claimed every proxied request was refused and that zero-configuration discovery
-// therefore could not work behind a proxy. Neither matched the code by the time it
-// was read. If the rule changes again, this paragraph is the first thing to update.
+//   - CheckPublicAddress is the only guard available for the authorization_endpoint,
+//     which is handed to the OS URL dispatcher rather than fetched, so there is no
+//     connection of ours to check.
+//   - RefuseInternalAddresses checks each request's destination and, on a direct
+//     connection, dials the address it checked. The attacker chose the hostname and
+//     so controls its DNS: a name that resolves publicly during the check can resolve
+//     to loopback a moment later.
+//   - A proxied request skips the address checks rather than applying them, because
+//     the proxy resolves the destination and the local answer describes nothing.
+//     https is allowed, since TLS binds the origin instead; plaintext is refused,
+//     since nothing does.
 
 // resolveTimeout bounds the lookup CheckPublicAddress performs. Short: it is one
 // DNS query, and it sits on the interactive login path.
@@ -120,46 +84,21 @@ func CheckPublicAddress(ctx context.Context, label, rawURL string) error {
 // name service can change: a loopback literal, or a name RFC 6761 §6.3 reserves for
 // loopback.
 //
-// It answers the question a caller needs before applying any of this — whether the
-// resource server is the client's own machine, in which case a local authorization
-// server is the expected answer rather than an attack, and the guards would do
-// nothing but break a development setup.
+// Callers use it to skip the guards when the tunnel server is the client's own
+// machine, where a local authorization server is the expected answer rather than an
+// attack. Two properties are load-bearing, and this set is **not** ipblock.Default():
 //
-// **This set is narrower than ipblock.Default(), and the difference is the point.**
-// Those are two different questions, and an earlier version answered both with the
-// one list:
+//   - "Is this host the machine we are running on" is a different question from "may
+//     a remote party send this client here", and only loopback answers the first.
+//     Answering both with the refusal set let a tunnel URL of 169.254.169.254 count
+//     as local and switch off every guard, including the one protecting that address.
+//   - It resolves nothing. The host belongs to the party these guards constrain, so a
+//     name answering with both a public and a loopback address would otherwise turn
+//     them off.
 //
-//   - the refusal set asks "may a remote party send this client here" — no, for
-//     loopback, link-local, IMDS, unspecified and multicast alike;
-//   - this asks "is this host the machine we are running on" — true only of
-//     loopback.
-//
-// Reusing the refusal set meant a tunnel URL pointing at 169.254.169.254 was
-// classified as local and switched off *every* guard, including the one protecting
-// that very address. "The tunnel server is the instance metadata service" is the last
-// circumstance in which to start trusting what it says. Link-local, multicast and
-// unspecified either name something other than this machine or cannot carry a tunnel
-// at all, so none of them belongs here.
-//
-// 0.0.0.0 and :: are excluded too, though a connection to them cannot leave the host:
-// they are not a spelling any documented setup uses, and one clear refusal that
-// --oidc-issuer answers costs less than a standing invitation to wonder why an
-// unspecified address counts as an identity.
-//
-// **It deliberately resolves nothing**, which is the other half of the point. An
-// earlier version resolved the host and treated any blocked answer as local. The host
-// in question is the tunnel server's — which in the threat model this guard exists for
-// is the *attacker's* — so its DNS is theirs to choose: two A records, one public and
-// one loopback, classified their server as local and switched every downstream guard
-// off. A guard whose activation condition is supplied by the party it constrains is
-// not a guard.
-//
-// What the narrowness costs: a development host that reaches its tunnel through a
-// private alias (say dev.authunnel.test in /etc/hosts) is not recognised, so a
-// loopback authorization server discovered from it is refused. The way through is the
-// one every other opinionated check here has — configure the values, with
-// --oidc-issuer and --oidc-client-id, which are the operator's own decision and are
-// not filtered.
+// The cost is that a development host reached through a private alias in /etc/hosts is
+// not recognised, so a loopback authorization server discovered from it is refused.
+// Such setups configure --oidc-issuer and --oidc-client-id, which are not filtered.
 func HostIsAlwaysLocal(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -205,9 +144,8 @@ func RefuseInternalAddresses(base *http.Client) *http.Client {
 		return &guarded
 	}
 	// A caller supplying its own RoundTripper has no dialer of ours to guard, so
-	// only the destination check is available. That is the shape tests use when
-	// they inject a transport, and it is strictly better than the nothing this
-	// used to install.
+	// only the destination check is available. That is the shape tests use when they
+	// inject a transport.
 	guarded.Transport = &destinationGuard{next: inner}
 	return &guarded
 }

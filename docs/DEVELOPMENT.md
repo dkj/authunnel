@@ -39,7 +39,7 @@ When changing the auth flow, keep these invariants intact:
 
 - ProxyCommand mode must only write transport bytes to `stdout`; any user-facing auth output belongs on `stderr`.
 - Managed OIDC mode must prefer cache, then refresh, then browser login, so repeated `ssh` runs stay fast and predictable — **except** when the failure is a refusal rather than a rejection. A refresh that failed because an endpoint or transport was refused must not fall through to interactive login: the browser flow ends at the same endpoint and would fail identically after making the user authenticate. Those refusals are identified by `errors.Is(err, authhttp.ErrUnsafeTransport)`; keep them distinguishable from an expired or revoked credential, which *should* fall through.
-- Endpoints named by a metadata document must be validated before use, on both binaries, by two rules that do not subsume each other: they must be `http(s)` URLs with a host in every mode, and they must not be less protected than the transport the metadata arrived over. The first is what keeps a `file://` or custom scheme out of the authorization URL handed to the OS dispatcher; the second is what stops an `https` document redirecting credentials to plaintext. See [Transport rules on the auth path](DEPLOYMENT.md#transport-rules-on-the-auth-path).
+- Both binaries validate every metadata-advertised endpoint with the combined `CheckDiscoveredEndpoint` policy: an absolute `http(s)` URL with a host and no downgrade from an HTTPS metadata source. Auth HTTP clients separately refuse HTTPS-to-plaintext redirects. See [Transport rules on the auth path](DEPLOYMENT.md#transport-rules-on-the-auth-path).
 - The PKCE loopback callback stays plain `http://127.0.0.1:…` deliberately (RFC 8252) and is outside those rules. Do not "fix" it.
 - The token cache identity must include everything that determines **where a credential gets sent**, not only what determines whether it is still valid. Today that is the resource URL discovery ran against, issuer, metadata URL, client ID, audience, resource, and scopes — the `oidcIdentity` type. The metadata URL is the non-obvious one: it names the token endpoint the refresh token is posted to, and discovery only checks that the document's `issuer` field equals the configured issuer — a string the document asserts about itself, which does not bind the host serving it. Dropping it from the identity lets a changed or mistyped `--oidc-metadata-url` hand an existing refresh token to whatever endpoint the new document names. Build cache entries with `managedOIDCTokenSource.cacheFor` rather than enumerating fields at the call site.
 - Because some of that identity can now be **discovered**, the cache is compared twice and both comparisons are load-bearing. `cacheMatchesConfigured` runs before resolution — it is all the cache-hit path can afford — and exempts a field only when a resolver will supply it; exempting every unconfigured field instead would let a token minted for one audience satisfy a request for none. `cacheMatchesResolved` runs after resolution and before any refresh grant, with no exemptions: a resolution that names a different authorization server, client, or metadata URL than the credential was issued under discards the cache rather than posting the refresh token to it. Removing either check reintroduces the credential-disclosure bug recorded in [PLAN_202608_client_discovery.md](plans/PLAN_202608_client_discovery.md).
@@ -97,7 +97,7 @@ Current fast coverage includes:
 - recovery from a rejected token: a replacement obtained when re-resolution shows the configuration changed, nothing done when it has not, no retry on capacity rejections, and exactly one retry — asserted on the sequence of tokens the tunnel actually saw
 - a zero-configuration end-to-end tunnel: a client parsed from `--tunnel-url` alone completing a browser login and moving bytes through the real handler, then a second invocation reusing the cache without touching the metadata endpoint or the browser
 - auth-path transport rules: non-`http(s)` and host-less endpoints rejected in every mode including under `--insecure-oidc-issuer`, plaintext endpoints rejected when the metadata came over `https`, and redirect downgrades refused on all three fetches — metadata, JWKS, and the client's token exchange
-- how those redirect tests are built, because it is the part that makes them worth trusting: each points at a plaintext *mirror* serving content that would genuinely succeed if reached — a matching metadata document, the redirecting issuer's own keys, a working token response — and asserts the mirror received **no request at all**. A pass therefore means the fetch never happened, not that it happened and failed for some other reason. Keep that property when editing them: a mirror serving the wrong issuer's keys still makes the test pass while proving nothing, which is how these were first written. Verify by removing the guard and checking the tests fail on "expected ... to be refused" rather than on a mismatch
+- redirect-downgrade fixtures use working plaintext mirrors and assert the mirror received no request, proving the unsafe fetch was refused rather than failing later for unrelated content
 - token validation: `nbf` not-before enforcement, `iat` sanity check, non-empty `sub` requirement, refresh subject pinning, refresh deadline enforcement
 - admission controls: global concurrent cap, per-user concurrent cap, per-user rate limiting (fake-clock deterministic), dial timeout against blackholed destinations, handler-level rejection with correct HTTP status and `Retry-After`
 - egress posture: startup rejection when neither `--allow` rules nor `--allow-open-egress` is present, mutual exclusion between the two modes, env-var equivalents
@@ -164,25 +164,19 @@ Keycloak publishes OIDC discovery at the derived well-known path, so no discover
 override is needed here. To test against an authorization server that only
 publishes RFC 8414 metadata, or one whose metadata sits off the issuer path, add
 `--oidc-metadata-url` pointing at the document — the server still requires its
-`issuer` to match `OIDC_ISSUER`. `--oidc-jwks-uri` skips metadata discovery
-altogether, which is useful for reproducing a start-up-with-IdP-down scenario.
-Both accept `http://` under `INSECURE_OIDC_ISSUER=true`, but neither accepts
+`issuer` to match `OIDC_ISSUER`. `--oidc-jwks-uri` skips metadata discovery so
+server auth egress can be restricted to the configured key endpoint. Both
+accept `http://` under `INSECURE_OIDC_ISSUER=true`, but neither accepts
 `file://`. The startup log line `token_validator_ready` reports which mode
 resolved.
 
 The client has the matching `--oidc-metadata-url`, with the same semantics and
 the same `--insecure-oidc-issuer` relaxation.
 
-There is no client equivalent of `--oidc-jwks-uri`. Not because pinning could
-never help — it would, in the narrow case where metadata is unavailable while the
-token and authorization endpoints still respond, which a provider migration can
-produce — but because the cost is wrong. A bad `--oidc-jwks-uri` on the server
-rejects tokens; a bad pinned token endpoint on the client *receives the refresh
-token*, so a typo or a stale value after a migration becomes credential
-disclosure rather than a failed login. If that outage case ever matters, caching
-the endpoints discovery already verified is the better direction, and it has its
-own stale-endpoint risks to design around. See
-[PLAN_202608_client_discovery.md](plans/PLAN_202608_client_discovery.md).
+There is no client equivalent of `--oidc-jwks-uri`: pinning the endpoint that
+receives refresh tokens has materially different failure consequences from
+pinning the server's read-only JWKS endpoint. See the security rationale in
+[DEPLOYMENT.md](DEPLOYMENT.md#issuer-metadata-and-key-discovery).
 
 Note the client's OIDC settings are flags only — it has no environment-variable
 equivalents beyond `ACCESS_TOKEN` and `AUTHUNNEL_TUNNEL_URL`.

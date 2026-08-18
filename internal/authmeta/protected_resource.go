@@ -79,14 +79,12 @@ func (p *ProtectedResource) AuthorizationServer() string {
 // identifier: the well-known segment is inserted between the authority and the
 // path, and the query is carried through.
 //
-// The query is part of the identifier — §3.1 retains it, and a resource
-// identifier is permitted to carry one — so two tunnel URLs differing only in
-// their query are two resources, with their own metadata and, downstream, their
-// own cached credentials. An earlier version dropped it, reasoning that it would
-// "leak whatever a caller had appended". That reasoning holds for the fragment,
-// which is never sent anywhere, and fails for the query, which the WebSocket dial
-// already sends to this very host: dropping it disclosed nothing and instead
-// collapsed distinct resources onto one identity.
+// The query is part of the identifier — §3.1 retains it, and a resource identifier
+// may carry one — so two tunnel URLs differing only in their query are two
+// resources, with their own metadata and their own cached credentials. Dropping it
+// would collapse them onto one identity, and discloses nothing in exchange: the
+// WebSocket dial already sends that query to this very host. The fragment is the
+// opposite case and is refused outright, since it is never sent anywhere.
 func ProtectedResourceURL(resourceURL string) (string, error) {
 	// Via the identifier rule rather than a private copy of it: the value being
 	// derived from and the value being compared must be judged the same way, or
@@ -321,13 +319,13 @@ func ValidateAudience(audience string) error {
 	return nil
 }
 
-// CheckDiscoveredURL applies the configured-URL rules to a URL that arrived in a
-// metadata document, plus the downgrade rule relative to where that document came
-// from. Remote input is held to the standard a local flag is held to, not a
-// weaker one.
+// CheckDiscoveredURL holds a discovered URL to the rule a configured one gets —
+// https unless the insecure override — on top of the shape and downgrade rules
+// authhttp.CheckDiscoveredEndpoint already applies. Remote input is not judged more
+// leniently than a flag.
 func CheckDiscoveredURL(label, sourceURL, discoveredURL string, allowPlaintext bool) error {
 	if err := authhttp.CheckConfiguredURL(label, discoveredURL, allowPlaintext); err != nil {
 		return err
 	}
-	return authhttp.CheckNoSchemeDowngrade(label, sourceURL, discoveredURL)
+	return authhttp.CheckDiscoveredEndpoint(label, sourceURL, discoveredURL)
 }

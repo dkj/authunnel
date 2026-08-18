@@ -112,12 +112,12 @@ func localStatus(code int) string {
 // rules: a validated http(s) URL, a client that refuses to be redirected off
 // https, and a bounded body.
 //
-// The redirect guards are applied here even though every current caller passes an
+// The redirect guard is applied here even though every current caller passes an
 // already-guarded client. A guarantee that depends on the caller having wrapped
 // its client is not a guarantee, and double-wrapping is harmless — the outer
 // policy checks, then delegates to the inner one, which checks again.
 func fetchDocument(ctx context.Context, httpClient *http.Client, label, documentURL string, into any) error {
-	if err := authhttp.CheckEndpointURL(label, documentURL); err != nil {
+	if err := authhttp.CheckHTTPURL(label, documentURL); err != nil {
 		return err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, documentURL, nil)
@@ -126,12 +126,11 @@ func fetchDocument(ctx context.Context, httpClient *http.Client, label, document
 	}
 	request.Header.Set("Accept", "application/json")
 
-	// Both policies: the document may not be fetched over a downgraded transport,
-	// and may not come from an origin other than the one asked. The second is what
-	// makes "this document came from that origin" true after redirects as well as
-	// before them — a check on where a fetch begins pins nothing if the fetch may
-	// end elsewhere.
-	response, err := authhttp.RefuseTransportDowngrade(authhttp.PinRedirectOrigin(httpClient)).Do(request)
+	// Downgrade refusal only: an HTTPS-rooted chain may delegate the final fetch to
+	// another HTTPS host, which is a documented non-goal to prevent. A caller that
+	// needs the stricter rule wraps its own client — see the client's use of
+	// authhttp.PinRedirectOrigin for the one case that does.
+	response, err := authhttp.RefuseTransportDowngrade(httpClient).Do(request)
 	if err != nil {
 		return err
 	}

@@ -171,16 +171,8 @@ func writeDiscoveryTestJSON(t *testing.T, w http.ResponseWriter, payload any) {
 	}
 }
 
-// plaintextMirror is an endpoint served over plain http that records whether it
-// was reached. Tests use one as a redirect target so the *only* thing wrong with
-// the fetch is the transport.
-//
-// Its body is assigned after construction, because a faithful mirror has to
-// serve content valid for the issuer that redirects *to* it — and that issuer
-// needs the mirror's URL to exist first. Getting this wrong is easy and quiet:
-// a mirror serving another issuer's keys or issuer string makes the redirect
-// fail for its own reasons, and the test then passes without the guard doing
-// anything.
+// plaintextMirror records requests and serves content valid for the redirecting
+// issuer, proving a refusal is caused by transport rather than fixture data.
 type plaintextMirror struct {
 	URL string
 
@@ -215,8 +207,6 @@ func (m *plaintextMirror) received() int {
 	return m.requests
 }
 
-// serveJWKSOf makes the mirror return src's key set, so a followed redirect
-// would verify src's tokens successfully.
 func (m *plaintextMirror) serveJWKSOf(t *testing.T, src *fakeIssuer) {
 	t.Helper()
 	m.mu.Lock()
@@ -231,9 +221,6 @@ func (m *plaintextMirror) serveJWKSOf(t *testing.T, src *fakeIssuer) {
 	}
 }
 
-// serveMetadataFor makes the mirror return a document that discovery would
-// accept for src — matching issuer, working jwks_uri — so a followed redirect
-// would complete cleanly.
 func (m *plaintextMirror) serveMetadataFor(t *testing.T, src *fakeIssuer) {
 	t.Helper()
 	m.mu.Lock()
@@ -248,9 +235,7 @@ func (m *plaintextMirror) serveMetadataFor(t *testing.T, src *fakeIssuer) {
 	}
 }
 
-// TestMetadataRedirectDowngradeIsRefused covers the third fetch the redirect
-// guard protects. The advertised metadata URL is https and passes validation,
-// then redirects to a plaintext document that would otherwise discover cleanly.
+// Metadata redirects must not leave HTTPS.
 func TestMetadataRedirectDowngradeIsRefused(t *testing.T) {
 	mirror := newPlaintextMirror(t)
 	redirecting := newFakeIssuer(t, fakeIssuerConfig{
@@ -258,8 +243,6 @@ func TestMetadataRedirectDowngradeIsRefused(t *testing.T) {
 		metadataPaths:      []string{oidcWellKnownPath},
 		metadataRedirectTo: mirror.URL,
 	})
-	// Valid for the issuer being configured, so following the redirect would
-	// discover cleanly. Only the transport is wrong.
 	mirror.serveMetadataFor(t, redirecting)
 
 	_, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
@@ -278,10 +261,7 @@ func TestMetadataRedirectDowngradeIsRefused(t *testing.T) {
 	}
 }
 
-// TestHTTPSMetadataRejectsPlaintextJWKS covers the downgrade an https metadata
-// document can otherwise force: it names the JWKS endpoint, so without a check
-// it can send the key fetch to plaintext, where a network attacker can
-// substitute signing keys and mint tokens that verify.
+// HTTPS metadata must not advertise a plaintext JWKS endpoint.
 func TestHTTPSMetadataRejectsPlaintextJWKS(t *testing.T) {
 	plaintextJWKS := newPlaintextMirror(t)
 	downgraded := newFakeIssuer(t, fakeIssuerConfig{
@@ -304,9 +284,7 @@ func TestHTTPSMetadataRejectsPlaintextJWKS(t *testing.T) {
 	}
 }
 
-// TestHTTPSMetadataAcceptsHTTPSJWKS is the control for the test above: the same
-// TLS setup with an https jwks_uri must still work, so the rejection there is
-// attributable to the scheme and not to TLS handling in general.
+// Control: the same fixture works when JWKS remains on HTTPS.
 func TestHTTPSMetadataAcceptsHTTPSJWKS(t *testing.T) {
 	issuer := newFakeIssuer(t, fakeIssuerConfig{useTLS: true, metadataPaths: []string{oidcWellKnownPath}})
 
@@ -326,10 +304,7 @@ func TestHTTPSMetadataAcceptsHTTPSJWKS(t *testing.T) {
 	}
 }
 
-// TestJWKSRedirectDowngradeIsRefused covers the second half of the same
-// exposure: the advertised jwks_uri passes the scheme check, then redirects to
-// plaintext. Go follows cross-scheme redirects silently, so this needs its own
-// guard rather than falling out of the URL check.
+// A JWKS redirect must be refused before the plaintext mirror is reached.
 func TestJWKSRedirectDowngradeIsRefused(t *testing.T) {
 	mirror := newPlaintextMirror(t)
 	redirecting := newFakeIssuer(t, fakeIssuerConfig{
@@ -337,12 +312,8 @@ func TestJWKSRedirectDowngradeIsRefused(t *testing.T) {
 		metadataPaths:  []string{oidcWellKnownPath},
 		jwksRedirectTo: mirror.URL,
 	})
-	// The redirecting issuer's own keys, so a followed redirect would verify
-	// its tokens. Only the transport is wrong.
 	mirror.serveJWKSOf(t, redirecting)
 
-	// Discovery succeeds: the advertised jwks_uri is https. The downgrade
-	// only appears when the key set is actually fetched.
 	validator, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
 		Issuer:     redirecting.URL,
 		Audience:   "test-aud",
@@ -358,17 +329,12 @@ func TestJWKSRedirectDowngradeIsRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "transport downgrade") {
 		t.Fatalf("error = %v, want the redirect downgrade guard", err)
 	}
-	// The key set must not have been fetched from the plaintext endpoint
-	// at all; an error alone would not rule out a fetch that failed later.
 	if hits := mirror.received(); hits != 0 {
 		t.Fatalf("plaintext JWKS endpoint received %d request(s), want none", hits)
 	}
 }
 
-// TestPlaintextMetadataAllowsPlaintextJWKS documents that the rule is about
-// *downgrade*, not about https absolutely: an issuer already served over http
-// — the local development setup the config layer gates behind
-// --insecure-oidc-issuer — has no downgrade left to prevent.
+// The explicit development posture permits an all-HTTP issuer and JWKS.
 func TestPlaintextMetadataAllowsPlaintextJWKS(t *testing.T) {
 	issuer := newFakeIssuer(t, fakeIssuerConfig{metadataPaths: []string{oidcWellKnownPath}})
 
@@ -502,12 +468,7 @@ func TestMetadataURLReachesNonDerivedPath(t *testing.T) {
 	}
 }
 
-// TestMetadataURLRejectsIssuerMismatch pins the one thing the issuer comparison
-// does buy: an *honestly* wrong metadata URL — a different tenant, a staging
-// AS — is refused, because a legitimate server declares its own issuer. It is
-// not a defence against a hostile URL, which can echo the expected issuer; see
-// the MetadataURL field comment. Assert the specific cause, since a network or
-// parse failure would also produce an error here.
+// A legitimate but wrong metadata document is rejected by issuer comparison.
 func TestMetadataURLRejectsIssuerMismatch(t *testing.T) {
 	const tenantPath = "/.well-known/oauth-authorization-server/tenant1"
 	issuer := newFakeIssuer(t, fakeIssuerConfig{
@@ -524,16 +485,12 @@ func TestMetadataURLRejectsIssuerMismatch(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a metadata document advertising a different issuer to be rejected")
 	}
-	// Assert the specific cause rather than any error: a network or parse
-	// failure would also produce a non-nil error here and would make this
-	// test pass while the binding check was gone.
 	if !errors.Is(err, oidc.ErrIssuerInvalid) {
 		t.Fatalf("error = %v, want it to be %v (the issuer binding check)", err, oidc.ErrIssuerInvalid)
 	}
 }
 
-// TestMetadataURLAcceptsRFC8414ShapedDocument confirms a pure OAuth2 metadata
-// document — no OIDC-specific fields — carries everything the server needs.
+// A pure RFC 8414 document carries everything the server needs.
 func TestMetadataURLAcceptsRFC8414ShapedDocument(t *testing.T) {
 	const asPath = "/.well-known/oauth-authorization-server"
 	issuer := newFakeIssuer(t, fakeIssuerConfig{
@@ -558,11 +515,13 @@ func TestMetadataURLAcceptsRFC8414ShapedDocument(t *testing.T) {
 	}
 }
 
-// TestPinnedJWKSSkipsDiscovery asserts the pinned path never asks for metadata
-// at all — that absence is the whole point of the flag, so assert on the
-// request count rather than only on the happy path working.
+// Pinned JWKS validates a token while the metadata endpoint is unavailable and
+// without requesting it.
 func TestPinnedJWKSSkipsDiscovery(t *testing.T) {
-	issuer := newFakeIssuer(t, fakeIssuerConfig{metadataPaths: []string{oidcWellKnownPath}})
+	issuer := newFakeIssuer(t, fakeIssuerConfig{
+		metadataPaths:  []string{oidcWellKnownPath},
+		metadataStatus: http.StatusServiceUnavailable,
+	})
 
 	validator, mode, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
 		Issuer:     issuer.URL,
@@ -584,32 +543,7 @@ func TestPinnedJWKSSkipsDiscovery(t *testing.T) {
 	}
 }
 
-// TestPinnedJWKSStartsWithMetadataUnavailable covers the operational reason
-// for the flag: the server comes up even when the issuer cannot serve its
-// metadata document.
-func TestPinnedJWKSStartsWithMetadataUnavailable(t *testing.T) {
-	issuer := newFakeIssuer(t, fakeIssuerConfig{
-		metadataPaths:  []string{oidcWellKnownPath},
-		metadataStatus: http.StatusInternalServerError,
-	})
-
-	validator, _, err := NewJWTTokenValidator(context.Background(), JWTValidatorConfig{
-		Issuer:     issuer.URL,
-		Audience:   "test-aud",
-		JWKSURI:    issuer.jwksURI(),
-		HTTPClient: issuer.server.Client(),
-	})
-	if err != nil {
-		t.Fatalf("pinned JWKS should not depend on metadata availability: %v", err)
-	}
-	if _, err := validator.ValidateAccessToken(context.Background(), issuer.signToken(t, "test-aud")); err != nil {
-		t.Fatalf("validate token: %v", err)
-	}
-}
-
-// TestPinnedJWKSStillEnforcesIssuer pins the invariant that the overrides
-// replace metadata *location* only. With no document to cross-check, the `iss`
-// claim check is the only thing binding accepted tokens to an issuer.
+// A pinned key set does not relax the configured issuer claim.
 func TestPinnedJWKSStillEnforcesIssuer(t *testing.T) {
 	issuer := newFakeIssuer(t, fakeIssuerConfig{metadataPaths: []string{oidcWellKnownPath}})
 
@@ -622,8 +556,6 @@ func TestPinnedJWKSStillEnforcesIssuer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create validator: %v", err)
 	}
-	// The token is signed by a key in the pinned JWKS, but carries the fake
-	// issuer's URL as `iss` rather than the configured issuer.
 	if _, err := validator.ValidateAccessToken(context.Background(), issuer.signToken(t, "test-aud")); err == nil {
 		t.Fatal("expected a token whose iss differs from the configured issuer to be rejected")
 	}

@@ -119,45 +119,27 @@ const defaultOIDCScopes = "openid offline_access"
 // resolution has happened.
 type managedOIDCTokenSource struct {
 	issuer string
-	// metadataURL, when set, replaces the well-known path derived from
-	// issuer, and makes issuer optional: with no issuer configured, the one
-	// the document declares is adopted.
-	//
-	// When both are set, discovery compares the document's `issuer` field
-	// against issuer, but that field is supplied by the document about itself
-	// and proves nothing about the host serving it. Treat the check as
-	// catching an honest wrong URL — staging for production, one tenant for
-	// another, which a legitimate AS reveals by declaring its own issuer — not
-	// as a boundary. A hostile or mistyped URL can echo the expected issuer
-	// and name any endpoints it likes; only trusting this value prevents that.
-	//
-	// With no issuer configured, that check is given up along with it. A
-	// metadata URL naming the wrong tenant is then indistinguishable from the
-	// right one until a browser login has already happened and the authunnel
-	// server rejects the resulting token.
+	// metadataURL overrides derived discovery, and makes issuer optional: with no
+	// issuer configured, the one the document declares is adopted. Its
+	// self-asserted issuer is a consistency check; the operator must trust the URL
+	// that supplies the authorization and token endpoints.
 	metadataURL string
 	clientID    string
 	audience    string
 	resource    string
 	scopes      string
-	// resourceURL is the tunnel endpoint's resource identifier, and is set only
-	// when something essential is missing from the configuration above. Its
-	// emptiness is therefore the switch: a fully-configured source never fetches
-	// protected-resource metadata, so existing invocations make exactly the
-	// network calls they made before.
+	// resourceURL is the tunnel endpoint's resource identifier, set only when some
+	// essential value above is missing. Its emptiness is the switch: a
+	// fully-configured source fetches no protected-resource metadata.
 	resourceURL string
-	// insecureOIDCIssuer relaxes the https requirement for *discovered* URLs as
-	// well as configured ones. Remote input is held to the same rule a flag is,
-	// which means the same override too — a developer pointing at a local
-	// Keycloak over http needs the discovered issuer to be permitted as well.
+	// insecureOIDCIssuer relaxes the https requirement for discovered URLs as well
+	// as configured ones, since remote input is held to the same rule as a flag.
 	insecureOIDCIssuer bool
-	// allowInternalTargets records that the resource server is itself at an
-	// internal address, so the addresses it names may be internal too. Decided
-	// once, before any fetch, from the tunnel URL; see resolveIdentity.
+	// allowInternalTargets permits internal addresses named by the document,
+	// because the tunnel URL itself names this machine. See resolveIdentity.
 	allowInternalTargets bool
-	// resourceIsLocal is the decision above, injectable because a test server is
-	// always on loopback and could otherwise not exercise the public-resource
-	// case at all. nil means authhttp.HostIsAlwaysLocal.
+	// resourceIsLocal is that decision, injectable because a test server is always
+	// on loopback. nil means authhttp.HostIsAlwaysLocal.
 	resourceIsLocal func(string) bool
 	cachePath       string
 	noBrowser       bool
@@ -168,54 +150,18 @@ type managedOIDCTokenSource struct {
 	now             func() time.Time
 
 	mu sync.Mutex
-	// effective is the configured identity plus whatever resolution supplied.
-	// nil until resolve has succeeded once; memoised for the process lifetime,
-	// which is one ssh invocation.
+	// effective is the configured identity plus whatever resolution supplied. nil
+	// until resolve has succeeded once; memoised for one ssh invocation.
 	effective *oidcIdentity
 	discovery oauth2.Endpoint
 }
 
-// tokenCache is intentionally a single JSON document so developers can inspect
-// and delete it easily during debugging. Cache entries are scoped to the resource
-// URL discovery ran against, the issuer, the metadata URL, the client ID, the
-// audience, the resource, and the scopes — to avoid reusing a credential in a context
-// it was not obtained for.
-//
-// The metadata URL belongs in that identity, and an earlier version of this
-// comment argued the opposite — that the override only relocates the document,
-// so a token obtained through it is "the same token". That reasoning asks
-// whether the credential is still *valid*, which is the wrong question. The
-// question is who receives it. The metadata document names the token endpoint
-// the refresh token is posted to, and the only check on that document is that
-// its `issuer` field equals the configured issuer — a plain string comparison
-// against a value the document supplies about itself. Nothing binds the
-// metadata host to the issuer it claims, so a mistyped or hostile metadata URL
-// can echo the right issuer and name any token endpoint it likes.
-//
-// Left out of the identity, adding or changing --oidc-metadata-url would keep an
-// existing refresh token valid and post it to whatever that new document
-// advertises, with no user interaction. Including it means the cache is
-// discarded instead and the user re-authenticates.
-//
-// What that does and does not buy, precisely: it prevents the **silent reuse of
-// an already-issued refresh token**. It is not a general defence against a
-// hostile metadata URL. If the user goes on to complete the fallback login, the
-// authorization code and its PKCE verifier are still sent to the token endpoint
-// that document names — and a document can pair the *real* authorization
-// endpoint with an attacker's token endpoint, so the user sees a genuine IdP
-// page and the code that comes back is a real, redeemable one. Nothing here
-// stops that; only trusting the metadata URL does.
-//
-// The cost is one interactive login the first time an operator sets the flag,
-// and again if they change it. That is the correct trade. Caches written before
-// this field existed unmarshal with an empty MetadataURL and still match a
-// source that uses the derived path, so no one is logged out by the upgrade.
-//
-// The identity recorded here is the *resolved* one, so an entry written by a
-// source that adopted its issuer from a metadata document records that issuer
-// rather than the empty configured value. That is what makes the comparison in
-// cacheMatchesResolved meaningful; see cacheMatchesConfigured for why matching
-// cannot simply be deferred until after resolution.
+// tokenCache is scoped by every setting that determines credential validity or
+// destination. MetadataURL is included because its document chooses the token
+// endpoint; ResourceURL because in discovery mode everything else derives from it.
+// Changing either must not silently send an existing refresh token to a new
+// destination. Empty values preserve compatibility with caches created before those
+// fields existed.
 type tokenCache struct {
 	// ResourceURL records the resource identifier this entry's configuration was
 	// discovered from. Omitted, and left empty, when nothing was discovered, so
@@ -263,11 +209,8 @@ func newAuthTokenSource(cfg clientConfig) (authTokenSource, error) {
 			// client through cfg.AuthHTTPClient.
 			client = authhttp.NewBoundedClient()
 		}
-		// Applied here rather than relying on NewBoundedClient, which sets
-		// the same policy: an injected client must not be able to opt out of
-		// it. This path carries the refresh token and the authorization code,
-		// so a redirect off https would disclose a credential rather than
-		// merely weaken a fetch of public material.
+		// Apply explicitly so injected clients cannot bypass the credential-
+		// bearing path's downgrade policy.
 		client = authhttp.RefuseTransportDowngrade(client)
 		output := cfg.Stderr
 		if output == nil {
@@ -544,7 +487,16 @@ func (s *managedOIDCTokenSource) resolveEndpoints(ctx context.Context) error {
 	// hostile one, since the document asserts that field about itself. With no
 	// issuer configured the declared one is adopted and that check is gone. See
 	// the metadataURL field comment.
-	document, err := authmeta.FetchAuthorizationServer(ctx, s.httpClient, s.effective.Issuer, s.effective.MetadataURL)
+	// A published metadata URL adopted under a configured issuer is the one fetch
+	// whose origin is load-bearing: the same-origin check on that value is the whole
+	// of the pin, and an open redirect on the issuer's host would defeat it.
+	// Elsewhere an HTTPS-rooted chain may delegate to another HTTPS host, which the
+	// discovery simplification plan lists as a non-goal to prevent.
+	metadataClient := s.httpClient
+	if s.metadataOriginIsPinned() {
+		metadataClient = authhttp.PinRedirectOrigin(metadataClient)
+	}
+	document, err := authmeta.FetchAuthorizationServer(ctx, metadataClient, s.effective.Issuer, s.effective.MetadataURL)
 	if err != nil {
 		return refuse(err)
 	}
@@ -552,19 +504,15 @@ func (s *managedOIDCTokenSource) resolveEndpoints(ctx context.Context) error {
 	// identity is the one this document declared, whether it was configured or
 	// adopted.
 	s.effective.Issuer = document.Issuer
-	// Validate both endpoints before either is used. token_endpoint receives the
-	// refresh token and the authorization code; authorization_endpoint is handed
-	// to the OS URL dispatcher, which will launch whatever application claims
-	// the scheme, so CheckEndpointURL is the whole of the protection there — the
-	// redirect guard on s.httpClient never sees that leg.
+	// Validate both endpoints before use. token_endpoint receives credentials;
+	// authorization_endpoint is handed to the OS URL dispatcher and is not covered
+	// by the HTTP client's redirect guard, so the shape check is the whole of the
+	// protection there.
 	for _, endpoint := range []struct{ label, value string }{
 		{"authorization_endpoint", document.AuthorizationEndpoint},
 		{"token_endpoint", document.TokenEndpoint},
 	} {
-		if err := authhttp.CheckEndpointURL(endpoint.label, endpoint.value); err != nil {
-			return refuse(err)
-		}
-		if err := authhttp.CheckNoSchemeDowngrade(endpoint.label, metadataSource, endpoint.value); err != nil {
+		if err := authhttp.CheckDiscoveredEndpoint(endpoint.label, metadataSource, endpoint.value); err != nil {
 			return refuse(err)
 		}
 		if err := s.checkDiscoveredAddress(ctx, endpoint.label, endpoint.value); err != nil {
@@ -724,6 +672,28 @@ func (s *managedOIDCTokenSource) adoptMetadataURL(ctx context.Context, identity 
 	return nil
 }
 
+// metadataOriginIsPinned reports whether the metadata fetch must refuse to leave the
+// origin it starts on: true only for a location this tunnel server published, adopted
+// under a configured --oidc-issuer. There the same-origin comparison in
+// adoptMetadataURL is the whole of the pin, and an open redirect on the issuer's host
+// would defeat it. An operator's own --oidc-metadata-url is not pinned — they chose
+// that location — and neither is the derived well-known path, so HTTPS-to-HTTPS
+// delegation stays permitted as the discovery simplification plan's non-goals require.
+//
+// Derived from s.effective rather than recorded when the value is adopted, because it
+// is a property of the resolution in force. Stored, it outlived the state it described:
+// TokenAfterRejection discards s.effective and re-resolves, so a server that stopped
+// publishing a metadata URL left a stale pin on the derived fetch.
+func (s *managedOIDCTokenSource) metadataOriginIsPinned() bool {
+	if s.issuer == "" || s.effective == nil {
+		return false
+	}
+	// The comparison with s.metadataURL is what separates adopted from
+	// operator-supplied: resolveIdentity seeds the field from the configured flag, so
+	// any other value arrived from the document.
+	return s.effective.MetadataURL != "" && s.effective.MetadataURL != s.metadataURL
+}
+
 // adoptAuthorizationServer applies the issuer half of applyResourceMetadata, which
 // is the half with a rule of its own — see that function's comment for why a
 // contradiction here is an error rather than an override.
@@ -760,7 +730,7 @@ func (s *managedOIDCTokenSource) adoptAuthorizationServer(ctx context.Context, i
 func (s *managedOIDCTokenSource) checkDiscoveredURL(ctx context.Context, label, value string) error {
 	// Shape always: a value that is not a usable http(s) URL is worth refusing
 	// whoever chose it, and this is the check the OS URL dispatcher depends on.
-	if err := authhttp.CheckEndpointURL(label, value); err != nil {
+	if err := authhttp.CheckHTTPURL(label, value); err != nil {
 		return err
 	}
 	if !s.authorizationServerIsRemotelyChosen() {
@@ -935,6 +905,17 @@ func (s *managedOIDCTokenSource) saveCache(cache tokenCache) error {
 	return nil
 }
 
+// credentialClient is the client for the two requests that carry a credential in
+// their body — the refresh and the code exchange. Both are pinned to the origin they
+// start on: a 307 preserves method and body, so an open redirect on the token
+// endpoint's own host would otherwise post the refresh token or the authorization
+// code to a third party, and https-to-https is not a downgrade for the transport rule
+// to catch. Verified by TestTokenEndpointCrossOriginRedirectIsRefused, which records
+// the body the other origin would have received.
+func (s *managedOIDCTokenSource) credentialClient() *http.Client {
+	return authhttp.PinRedirectOrigin(s.httpClient)
+}
+
 func (s *managedOIDCTokenSource) refreshToken(ctx context.Context, cache tokenCache) (*oauth2.Token, error) {
 	// Idempotent and already done by AccessToken on the normal path. Repeated
 	// here, and in interactiveToken, so neither carries an unenforced
@@ -944,17 +925,7 @@ func (s *managedOIDCTokenSource) refreshToken(ctx context.Context, cache tokenCa
 		return nil, err
 	}
 	config := s.oauthConfig("")
-	// Pinned to the token endpoint's origin as well as guarded against a
-	// downgrade. A 307 or 308 preserves method and body, so a cross-origin
-	// redirect here posts the refresh token — or, on the exchange, the
-	// authorization code and its PKCE verifier — to another host, and the
-	// downgrade rule alone does not notice an https-to-https hop.
-	//
-	// Nested in this order, matching authmeta's fetch, so the downgrade check runs
-	// first: a downgrade is nearly always an origin change too, and "transport
-	// downgrade on the auth path" is the sharper diagnosis of the two. The
-	// innermost policy re-checks the downgrade, which is harmless.
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, authhttp.RefuseTransportDowngrade(authhttp.PinRedirectOrigin(s.httpClient)))
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, s.credentialClient())
 	token := cache.asOAuth2Token()
 	refreshed, err := config.TokenSource(ctx, token).Token()
 	if err != nil {
@@ -1070,17 +1041,7 @@ func (s *managedOIDCTokenSource) interactiveToken(ctx context.Context) (*oauth2.
 		return nil, callback.err
 	}
 
-	// Pinned to the token endpoint's origin as well as guarded against a
-	// downgrade. A 307 or 308 preserves method and body, so a cross-origin
-	// redirect here posts the refresh token — or, on the exchange, the
-	// authorization code and its PKCE verifier — to another host, and the
-	// downgrade rule alone does not notice an https-to-https hop.
-	//
-	// Nested in this order, matching authmeta's fetch, so the downgrade check runs
-	// first: a downgrade is nearly always an origin change too, and "transport
-	// downgrade on the auth path" is the sharper diagnosis of the two. The
-	// innermost policy re-checks the downgrade, which is harmless.
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, authhttp.RefuseTransportDowngrade(authhttp.PinRedirectOrigin(s.httpClient)))
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, s.credentialClient())
 	token, err := config.Exchange(ctx, callback.code, oauth2.SetAuthURLParam("code_verifier", verifier))
 	if err != nil {
 		return nil, fmt.Errorf("exchange authorization code: %w", err)

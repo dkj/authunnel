@@ -17,9 +17,7 @@ import (
 	"authunnel/internal/authhttp"
 )
 
-// metadataIssuer serves only an OIDC discovery document, with the advertised
-// endpoints under the test's control. It is deliberately minimal: these tests
-// are about whether an endpoint is accepted, not about completing a flow.
+// metadataIssuer serves discovery with test-controlled endpoints.
 type metadataIssuer struct {
 	URL string
 }
@@ -55,9 +53,7 @@ func literal(value string) func(string) string {
 	return func(string) string { return value }
 }
 
-// failingOpener fails the test if the browser is ever launched. Asserting only
-// on the returned error would still pass if the URL had already been handed to
-// the OS dispatcher, which is the thing that must not happen.
+// failingOpener proves rejected authorization URLs never reach OS dispatch.
 func failingOpener(t *testing.T) browserOpener {
 	t.Helper()
 	return func(_ context.Context, url string) error {
@@ -91,40 +87,27 @@ func newTestSource(t *testing.T, issuerURL string, client *http.Client, opener b
 	}
 }
 
-// TestDiscoveryRejectsPlaintextTokenEndpoint covers the credential-bearing
-// endpoint: an https metadata document must not be able to send the refresh
-// token and authorization code to a plaintext endpoint.
-func TestDiscoveryRejectsPlaintextTokenEndpoint(t *testing.T) {
+func TestDiscoveryRejectsPlaintextEndpoints(t *testing.T) {
 	plain, _ := newMetadataIssuer(t, false, sameHost("/auth"), sameHost("/token"))
-	issuer, client := newMetadataIssuer(t, true, sameHost("/auth"), literal(plain.URL+"/token"))
-
-	source := newTestSource(t, issuer.URL, client, failingOpener(t))
-	_, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
-	if err == nil {
-		t.Fatal("expected an https issuer advertising a plaintext token_endpoint to be rejected")
-	}
-	if !strings.Contains(err.Error(), "non-https token_endpoint") {
-		t.Fatalf("error = %v, want the token_endpoint downgrade check", err)
+	for _, tt := range []struct {
+		name, field string
+		auth, token func(string) string
+	}{
+		{name: "authorization", field: "authorization_endpoint", auth: literal(plain.URL + "/auth"), token: sameHost("/token")},
+		{name: "token", field: "token_endpoint", auth: sameHost("/auth"), token: literal(plain.URL + "/token")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			issuer, client := newMetadataIssuer(t, true, tt.auth, tt.token)
+			source := newTestSource(t, issuer.URL, client, failingOpener(t))
+			_, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
+			if err == nil || !strings.Contains(err.Error(), "non-https "+tt.field) {
+				t.Fatalf("error = %v, want %s downgrade rejection", err, tt.field)
+			}
+		})
 	}
 }
 
-func TestDiscoveryRejectsPlaintextAuthorizationEndpoint(t *testing.T) {
-	plain, _ := newMetadataIssuer(t, false, sameHost("/auth"), sameHost("/token"))
-	issuer, client := newMetadataIssuer(t, true, literal(plain.URL+"/auth"), sameHost("/token"))
-
-	source := newTestSource(t, issuer.URL, client, failingOpener(t))
-	_, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
-	if err == nil {
-		t.Fatal("expected an https issuer advertising a plaintext authorization_endpoint to be rejected")
-	}
-	if !strings.Contains(err.Error(), "non-https authorization_endpoint") {
-		t.Fatalf("error = %v, want the authorization_endpoint downgrade check", err)
-	}
-}
-
-// TestDiscoveryAcceptsHTTPSEndpoints is the control for the two above: the same
-// TLS setup with https endpoints must succeed, so their rejections are
-// attributable to the scheme rather than to TLS handling in the fixture.
+// Control: the same TLS fixture succeeds when both endpoints remain HTTPS.
 func TestDiscoveryAcceptsHTTPSEndpoints(t *testing.T) {
 	issuer, client := newMetadataIssuer(t, true, sameHost("/auth"), sameHost("/token"))
 
@@ -138,10 +121,7 @@ func TestDiscoveryAcceptsHTTPSEndpoints(t *testing.T) {
 	}
 }
 
-// TestDiscoveryRejectsNonHTTPEndpointsOverPlaintextMetadata is the case the
-// downgrade check alone cannot catch. With an http metadata source there is no
-// downgrade, so every scheme passes that check — including file://, which would
-// otherwise reach the OS URL dispatcher via the browser opener.
+// Plaintext development metadata still cannot advertise non-network schemes.
 func TestDiscoveryRejectsNonHTTPEndpointsOverPlaintextMetadata(t *testing.T) {
 	for _, tt := range []struct {
 		name              string
@@ -174,8 +154,6 @@ func TestDiscoveryRejectsNonHTTPEndpointsOverPlaintextMetadata(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			// Plain http issuer: the local-development posture the config
-			// layer gates behind --insecure-oidc-issuer.
 			issuer, client := newMetadataIssuer(t, false, tt.auth, tt.token)
 
 			source := newTestSource(t, issuer.URL, client, failingOpener(t))
@@ -190,12 +168,7 @@ func TestDiscoveryRejectsNonHTTPEndpointsOverPlaintextMetadata(t *testing.T) {
 	}
 }
 
-// plaintextTokenMirror is a working token endpoint served over plain http,
-// which records what it actually received. Tests use it as a redirect target so
-// the only thing wrong with the exchange is the transport: reached directly it
-// completes a refresh and captures the credential (see the control test below),
-// so a failure through the redirect is the guard firing rather than a broken
-// endpoint — and what it captured shows what a downgrade would have disclosed.
+// plaintextTokenMirror is a working token endpoint that records request bodies.
 type plaintextTokenMirror struct {
 	URL string
 
@@ -246,15 +219,8 @@ func newRefreshableSource(t *testing.T, issuerURL string, client *http.Client) *
 	return source
 }
 
-// newRedirectingTokenIssuer serves https metadata whose token_endpoint is
-// https — so it passes the static checks — and then redirects the exchange to
-// target with the given status.
-//
-// The status matters. Go rewrites 301/302/303 to GET and drops the request
-// body, so those would not carry the refresh token onward even unguarded; 307
-// and 308 preserve method and body, which is what makes a downgrade here a
-// credential disclosure rather than a failed request. Tests use 307 so the
-// guard is exercised against the case that actually leaks.
+// newRedirectingTokenIssuer advertises HTTPS, then redirects token exchange.
+// Tests use 307 because it preserves the credential-bearing request body.
 func newRedirectingTokenIssuer(t *testing.T, target string, status int) (string, *http.Client) {
 	t.Helper()
 	var issuerURL string
@@ -276,11 +242,7 @@ func newRedirectingTokenIssuer(t *testing.T, target string, status int) (string,
 	return issuerURL, server.Client()
 }
 
-// TestTokenEndpointRedirectDowngradeIsRefused covers the half the static
-// endpoint check cannot: the advertised token_endpoint is https and passes
-// validation, then redirects to plaintext at exchange time. Go follows
-// cross-scheme redirects silently, so only the client's redirect policy stops
-// the refresh token being posted in clear text.
+// A 307 downgrade must be refused before the refresh token reaches plaintext.
 func TestTokenEndpointRedirectDowngradeIsRefused(t *testing.T) {
 	mirror := newPlaintextTokenMirror(t)
 	issuerURL, client := newRedirectingTokenIssuer(t, mirror.URL, http.StatusTemporaryRedirect)
@@ -293,19 +255,12 @@ func TestTokenEndpointRedirectDowngradeIsRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "transport downgrade") {
 		t.Fatalf("error = %v, want the redirect downgrade guard", err)
 	}
-	// The credential must not have reached the plaintext endpoint at all.
-	// Asserting only on the error would pass even if the body had already
-	// been sent and the failure came afterwards.
 	if requests, bodies := mirror.received(); requests != 0 {
 		t.Fatalf("plaintext endpoint received %d request(s) with bodies %q, want none", requests, bodies)
 	}
 }
 
-// TestTokenMirrorCompletesRefreshDirectlyAndSeesTheCredential is the control
-// for the test above, and it does double duty: it proves the mirror is a
-// working token endpoint, so the failure there is attributable to the redirect,
-// and it shows the refresh token really is in the request body — which is what
-// a 307 downgrade would have carried to a plaintext endpoint.
+// Control: the mirror works directly and receives the refresh token.
 func TestTokenMirrorCompletesRefreshDirectlyAndSeesTheCredential(t *testing.T) {
 	mirror := newPlaintextTokenMirror(t)
 	issuer, client := newMetadataIssuer(t, false, sameHost("/auth"), literal(mirror.URL))
@@ -328,14 +283,7 @@ func TestTokenMirrorCompletesRefreshDirectlyAndSeesTheCredential(t *testing.T) {
 	}
 }
 
-// TestNewAuthTokenSourceGuardsInjectedClient exercises the production wiring
-// rather than the test helper's.
-//
-// Every other test here builds managedOIDCTokenSource directly and applies
-// RefuseTransportDowngrade itself, which means none of them would notice if the
-// wrapping in newAuthTokenSource were deleted. This one passes an *unguarded*
-// client through clientConfig.AuthHTTPClient — the seam real callers and tests
-// use to inject one — so it fails if the production code stops wrapping.
+// Production wiring must guard an injected, initially unguarded client.
 func TestNewAuthTokenSourceGuardsInjectedClient(t *testing.T) {
 	mirror := newPlaintextTokenMirror(t)
 	issuerURL, client := newRedirectingTokenIssuer(t, mirror.URL, http.StatusTemporaryRedirect)
@@ -375,9 +323,7 @@ func TestNewAuthTokenSourceGuardsInjectedClient(t *testing.T) {
 	}
 }
 
-// newTenantIssuer serves metadata only at an RFC 8414 path, which inserts the
-// well-known segment before the path component and so cannot be reached by the
-// OIDC derivation.
+// newTenantIssuer serves metadata only at an RFC 8414 path.
 func newTenantIssuer(t *testing.T, advertisedIssuer func(base string) string) (string, string, *http.Client) {
 	t.Helper()
 	const tenantPath = "/.well-known/oauth-authorization-server/tenant1"
@@ -392,9 +338,6 @@ func newTenantIssuer(t *testing.T, advertisedIssuer func(base string) string) (s
 				"token_endpoint":         base + "/token",
 			})
 		case "/token":
-			// A working token endpoint, so a test can assert a refresh
-			// *completed* through the override rather than inferring
-			// success from which error came back.
 			writeJSONForTest(t, w, map[string]any{
 				"access_token":  "tenant-access-token",
 				"token_type":    "Bearer",
@@ -409,12 +352,9 @@ func newTenantIssuer(t *testing.T, advertisedIssuer func(base string) string) (s
 	return base + "/tenant1", base + tenantPath, server.Client()
 }
 
-// TestMetadataURLReachesNonDerivedPath covers the interop gap the flag exists
-// for on the client, mirroring the server-side case.
 func TestMetadataURLReachesNonDerivedPath(t *testing.T) {
 	issuer, metadataURL, client := newTenantIssuer(t, func(base string) string { return base + "/tenant1" })
 
-	// Without the override the derived path 404s.
 	source := newTestSource(t, issuer, client, failingOpener(t))
 	if _, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback"); err == nil {
 		t.Fatal("expected discovery to fail when metadata is not at the derived path")
@@ -431,15 +371,7 @@ func TestMetadataURLReachesNonDerivedPath(t *testing.T) {
 	}
 }
 
-// TestNewAuthTokenSourceAppliesMetadataURL exercises the production wiring, not
-// the test helper's.
-//
-// The other override tests set managedOIDCTokenSource.metadataURL directly, and
-// the config tests stop at parseClientConfig — so the mapping from
-// clientConfig.OIDCMetadataURL onto the token source is covered by neither, and
-// deleting it leaves them all green (verified by mutation). This test goes
-// through newAuthTokenSource against an issuer whose metadata is *only* at the
-// non-derived path, so it can only succeed if the override reaches discovery.
+// Production wiring must carry the metadata override into discovery.
 func TestNewAuthTokenSourceAppliesMetadataURL(t *testing.T) {
 	issuer, metadataURL, client := newTenantIssuer(t, func(base string) string { return base + "/tenant1" })
 
@@ -484,12 +416,7 @@ func TestNewAuthTokenSourceAppliesMetadataURL(t *testing.T) {
 	}
 }
 
-// TestClientMetadataURLRejectsIssuerMismatch pins what the issuer comparison
-// does catch: an honestly wrong metadata URL, which a legitimate server reveals
-// by declaring its own issuer. It is not a defence against a hostile URL — that
-// field is self-asserted and can echo anything — so do not read this test as
-// proving the override preserves trust. Asserts the specific cause, since a
-// network or parse failure would also produce an error here.
+// A legitimate but wrong metadata document is rejected by issuer comparison.
 func TestClientMetadataURLRejectsIssuerMismatch(t *testing.T) {
 	issuer, metadataURL, client := newTenantIssuer(t, func(string) string { return "https://attacker.example" })
 
@@ -504,17 +431,10 @@ func TestClientMetadataURLRejectsIssuerMismatch(t *testing.T) {
 	}
 }
 
-// TestDowngradeIsJudgedAgainstMetadataURLNotIssuer pins a consequence of the
-// override that is easy to get wrong: once the document can come from somewhere
-// other than the issuer, it is the *document's* transport that decides whether
-// an endpoint is downgraded. Here the issuer string is http but the metadata is
-// fetched over https, so plaintext endpoints must still be refused — judging
-// against the issuer would have let them through.
+// Endpoint transport is judged against the metadata URL, not the issuer string.
 func TestDowngradeIsJudgedAgainstMetadataURLNotIssuer(t *testing.T) {
 	plain, _ := newMetadataIssuer(t, false, sameHost("/auth"), sameHost("/token"))
 
-	// Metadata served over https, advertising the plaintext issuer string so
-	// zitadel's issuer check still passes, and plaintext endpoints.
 	var httpsBase string
 	server := newIPv4TLSTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/meta" {
@@ -540,8 +460,7 @@ func TestDowngradeIsJudgedAgainstMetadataURLNotIssuer(t *testing.T) {
 	}
 }
 
-// TestPlaintextIssuerWithPlaintextEndpointsStillWorks pins the development
-// path: an http issuer with http endpoints is unaffected by any of the above.
+// The explicit development posture still permits an all-HTTP local IdP.
 func TestPlaintextIssuerWithPlaintextEndpointsStillWorks(t *testing.T) {
 	issuer, client := newMetadataIssuer(t, false, sameHost("/auth"), sameHost("/token"))
 

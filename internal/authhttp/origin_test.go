@@ -84,18 +84,23 @@ func TestPinRedirectOriginLayersOnTheCallersPolicy(t *testing.T) {
 		t.Fatal("an inherited error must keep its own identity")
 	}
 
-	// Cross-origin: ours refuses first, and the caller's is not reached.
-	inheritedCalled = false
 	crossOrigin, err := http.NewRequest(http.MethodGet, "https://elsewhere.example/meta", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	err = pinned.CheckRedirect(crossOrigin, []*http.Request{from})
-	if !errors.Is(err, ErrUnsafeTransport) {
+	// The caller's verdict is reported ahead of ours, so a redirect that is both a
+	// downgrade and an origin change is named as the downgrade — the more specific
+	// fault. The composed answer is still refusal either way.
+	if err := pinned.CheckRedirect(crossOrigin, []*http.Request{from}); !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v, want the caller's more specific %v", err, sentinel)
+	}
+	// With a permissive caller, ours is what refuses a cross-origin hop.
+	permissive := PinRedirectOrigin(&http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return nil }})
+	if err := permissive.CheckRedirect(crossOrigin, []*http.Request{from}); !errors.Is(err, ErrUnsafeTransport) {
 		t.Fatalf("error = %v, want %v", err, ErrUnsafeTransport)
 	}
-	if inheritedCalled {
-		t.Fatal("our refusal should not have consulted the caller's policy")
+	if err := permissive.CheckRedirect(sameOrigin, []*http.Request{from}); err != nil {
+		t.Fatalf("a same-origin hop with a permissive caller should be allowed, got: %v", err)
 	}
 
 	// And the caller's own client is untouched.

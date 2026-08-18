@@ -38,10 +38,9 @@ func TestParseClientConfigDefaultsMetadataURLEmpty(t *testing.T) {
 	}
 }
 
-// TestParseClientConfigMetadataURLWithoutIssuer pins that the override can stand
-// in for the issuer. The document declares one, and with nothing configured to
-// compare it against it is adopted — which is exactly the consistency check being
-// traded away, not an oversight. See the metadataURL field comment in auth.go.
+// The override can now stand in for the issuer: the document declares one, and
+// with nothing to compare it against it is adopted. That is the consistency check
+// being traded away deliberately — see the metadataURL field comment in auth.go.
 func TestParseClientConfigMetadataURLWithoutIssuer(t *testing.T) {
 	cfg, err := parseClientConfig(
 		[]string{
@@ -120,8 +119,7 @@ func TestParseClientConfigRejectsHTTPMetadataURL(t *testing.T) {
 }
 
 func TestParseClientConfigAcceptsHTTPMetadataURLWithInsecureFlag(t *testing.T) {
-	// The issuer is http too: one flag relaxes both, since an operator
-	// pointing at a local IdP needs them together.
+	// The development override applies consistently to both OIDC URLs.
 	_, err := parseClientConfig(
 		[]string{
 			"--tunnel-url", "https://tunnel.example/protected/tunnel",
@@ -137,8 +135,6 @@ func TestParseClientConfigAcceptsHTTPMetadataURLWithInsecureFlag(t *testing.T) {
 	}
 }
 
-// TestParseClientConfigRejectsFileMetadataURL mirrors the server: the insecure
-// flag relaxes transport security, it does not widen the permitted schemes.
 func TestParseClientConfigRejectsFileMetadataURL(t *testing.T) {
 	for _, args := range [][]string{
 		baseClientArgs("--oidc-metadata-url", "file:///etc/authunnel/meta.json"),
@@ -151,10 +147,6 @@ func TestParseClientConfigRejectsFileMetadataURL(t *testing.T) {
 	}
 }
 
-// TestParseClientConfigRejectsFileIssuer covers what sharing the server's
-// validator picked up for the client: --oidc-issuer previously reported a
-// file:// value as a generic "not a valid URL" (it has no host), rather than
-// naming the scheme. Both flags now use one rule.
 func TestParseClientConfigRejectsFileIssuer(t *testing.T) {
 	_, err := parseClientConfig(
 		[]string{

@@ -79,6 +79,73 @@ func TestTokenAfterRejectionReplacesTheTokenWhenConfigurationChanged(t *testing.
 	}
 }
 
+// TestTokenAfterRejectionDropsTheMetadataOriginPin covers state that outlived the
+// resolution it described. The pin belongs to a *published* metadata URL adopted under
+// a configured issuer; while it was recorded on the source at adoption time, discarding
+// s.effective here did not discard it, so a server that stopped publishing one left the
+// derived well-known fetch pinned to the issuer's origin — refusing the HTTPS-to-HTTPS
+// delegation the discovery simplification plan's non-goals permit.
+//
+// Both legs are plaintext, which is what makes the assertion attributable: a
+// plaintext-to-plaintext cross-host redirect is not a downgrade, so the origin pin is
+// the only rule that would refuse it.
+func TestTokenAfterRejectionDropsTheMetadataOriginPin(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	// A relocated document on the issuer's own origin: adopted, and the pin engages.
+	const relocated = "/.well-known/oauth-authorization-server/tenant1"
+	fixture.setDocument(func(d *authmeta.ProtectedResource) {
+		d.AuthorizationServerMetadataURL = fixture.Issuer + relocated
+	})
+
+	source := fixture.discoverySource(t, completingOpener(new(int)))
+	source.issuer = fixture.Issuer
+	if err := source.resolve(context.Background()); err != nil {
+		t.Fatalf("first resolution: %v", err)
+	}
+	if !source.metadataOriginIsPinned() {
+		t.Fatal("adopting a published metadata URL under a configured issuer must pin its origin")
+	}
+
+	// The server stops publishing the relocation, and the issuer now delegates its
+	// derived document to another host.
+	delegate := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSONForTest(t, w, map[string]string{
+			"issuer":                 fixture.Issuer,
+			"authorization_endpoint": fixture.Issuer + "/auth",
+			"token_endpoint":         fixture.Issuer + "/token",
+		})
+	}))
+	fixture.setDocument(func(d *authmeta.ProtectedResource) { d.AuthorizationServerMetadataURL = "" })
+	fixture.setRedirect("/.well-known/openid-configuration", delegate.URL+"/meta")
+
+	// Seeded to match what the second resolution finds, so TokenAfterRejection
+	// re-resolves and then reports "nothing changed" without a login: this test is
+	// about the resolution, not the recovery.
+	cachePath := filepathForTest(t, "tokens.json")
+	writeTokenCacheForTest(t, cachePath, tokenCache{
+		ResourceURL:  fixture.ResourceURL,
+		Issuer:       fixture.Issuer,
+		ClientID:     "published-cli",
+		Scopes:       normalizeScopes(publishedScopes),
+		AccessToken:  "token-the-server-now-refuses",
+		RefreshToken: "refresh-token-1",
+		TokenType:    "Bearer",
+		Expiry:       time.Now().Add(time.Hour),
+	})
+	source.cachePath = cachePath
+
+	replacement, err := source.TokenAfterRejection(context.Background())
+	if err != nil {
+		t.Fatalf("re-resolution after a rejection should follow the issuer's own delegation: %v", err)
+	}
+	if replacement != "" {
+		t.Fatalf("replacement = %q, want none: the configuration is unchanged", replacement)
+	}
+	if source.metadataOriginIsPinned() {
+		t.Fatal("with no published metadata URL in force the derived fetch must not be pinned")
+	}
+}
+
 // completingOpener drives the loopback callback to completion, so a test about
 // what happens *after* a login does not hang waiting for one. It reuses the
 // existing helper rather than reimplementing the callback dance.
