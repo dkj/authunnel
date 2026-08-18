@@ -1,5 +1,7 @@
 # PLAN 2026-08: Discovery hardening simplification
 
+Status: implemented and verified on 2026-08-18.
+
 Follow-up to [the server discovery plan](PLAN_202608_discovery_overrides.md) and
 [the client discovery plan](PLAN_202608_client_discovery.md). Those changes are
 functionally sound, but their implementation and explanation grew beyond what
@@ -129,10 +131,9 @@ Every discovered endpoint must pass two checks:
 1. it is an absolute `http(s)` URL with a host; and
 2. it is not a downgrade from the metadata source.
 
-The current API exports these as `CheckEndpointURL` and
-`CheckNoSchemeDowngrade`, then relies on every caller remembering to invoke both
-in the correct order. Comments and tests repeatedly explain why they must stay
-paired.
+Before this cleanup, two public helpers required every caller to remember both
+checks and their ordering. Comments and tests repeatedly explained why they had
+to stay paired.
 
 ### Changes
 

@@ -59,10 +59,9 @@ type serverConfig struct {
 	// is self-asserted, so the comparison catches an honest wrong URL rather
 	// than a hostile one — this value needs the same trust as Issuer.
 	OIDCMetadataURL string
-	// OIDCJWKSURI pins the key set endpoint and skips metadata discovery
-	// entirely. Mutually exclusive with OIDCMetadataURL. Neither field
-	// replaces Issuer, which stays required in every mode because it is the
-	// value enforced as the `iss` claim on each token.
+	// OIDCJWKSURI restricts auth egress to a configured key endpoint by
+	// skipping metadata discovery. Mutually exclusive with OIDCMetadataURL.
+	// Issuer remains required and is enforced as the `iss` claim.
 	OIDCJWKSURI   string
 	TokenAudience string
 	ListenAddr    string
@@ -136,11 +135,11 @@ Flags and their environment variable equivalents:
                              authorization server publishing RFC 8414 metadata at a path the OIDC
                              derivation cannot construct. The document's issuer must still match
                              --oidc-issuer. Mutually exclusive with --oidc-jwks-uri.
-  --oidc-jwks-uri <url>      Pinned JWKS endpoint; skips metadata discovery entirely (env:
-                             OIDC_JWKS_URI). The server then makes no network call at startup and
-                             comes up with the issuer unreachable, but a wrong URL surfaces on the
-                             first protected request, and the issuer-to-keys binding is asserted by
-                             you rather than verified. Mutually exclusive with --oidc-metadata-url.
+  --oidc-jwks-uri <url>      Pinned JWKS endpoint; skips metadata discovery so server auth egress can
+                             be limited to the key endpoint (env: OIDC_JWKS_URI). Keys are fetched on
+                             the first protected request and during rotation, so this endpoint must
+                             remain reachable. The issuer-to-keys binding is asserted by you rather
+                             than verified. Mutually exclusive with --oidc-metadata-url.
   --token-audience <string>  Audience required in validated access tokens (env: TOKEN_AUDIENCE)
   --listen-addr <addr>       Listen address (env: LISTEN_ADDR, default: :8443 for TLS-files, :443 for ACME, :8080 for plaintext-behind-reverse-proxy)
   --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)

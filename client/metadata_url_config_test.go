@@ -38,10 +38,7 @@ func TestParseClientConfigDefaultsMetadataURLEmpty(t *testing.T) {
 	}
 }
 
-// TestParseClientConfigMetadataURLRequiresIssuer pins that the override cannot
-// stand in for the issuer. The document declares an issuer, but it declares it
-// about itself, so it identifies nothing — --oidc-issuer is what the comparison
-// is against, and it stays required.
+// The metadata override changes lookup location, not the expected issuer.
 func TestParseClientConfigMetadataURLRequiresIssuer(t *testing.T) {
 	_, err := parseClientConfig(
 		[]string{
@@ -87,8 +84,7 @@ func TestParseClientConfigRejectsHTTPMetadataURL(t *testing.T) {
 }
 
 func TestParseClientConfigAcceptsHTTPMetadataURLWithInsecureFlag(t *testing.T) {
-	// The issuer is http too: one flag relaxes both, since an operator
-	// pointing at a local IdP needs them together.
+	// The development override applies consistently to both OIDC URLs.
 	_, err := parseClientConfig(
 		[]string{
 			"--tunnel-url", "https://tunnel.example/protected/tunnel",
@@ -104,8 +100,6 @@ func TestParseClientConfigAcceptsHTTPMetadataURLWithInsecureFlag(t *testing.T) {
 	}
 }
 
-// TestParseClientConfigRejectsFileMetadataURL mirrors the server: the insecure
-// flag relaxes transport security, it does not widen the permitted schemes.
 func TestParseClientConfigRejectsFileMetadataURL(t *testing.T) {
 	for _, args := range [][]string{
 		baseClientArgs("--oidc-metadata-url", "file:///etc/authunnel/meta.json"),
@@ -118,10 +112,6 @@ func TestParseClientConfigRejectsFileMetadataURL(t *testing.T) {
 	}
 }
 
-// TestParseClientConfigRejectsFileIssuer covers what sharing the server's
-// validator picked up for the client: --oidc-issuer previously reported a
-// file:// value as a generic "not a valid URL" (it has no host), rather than
-// naming the scheme. Both flags now use one rule.
 func TestParseClientConfigRejectsFileIssuer(t *testing.T) {
 	_, err := parseClientConfig(
 		[]string{
