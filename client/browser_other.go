@@ -32,7 +32,7 @@ func defaultBrowserOpener(ctx context.Context, url string) error {
 	// over a plaintext metadata fetch (development, behind
 	// --insecure-oidc-issuer) the document is modifiable in transit, so the
 	// supplier is whoever is on the network path. What makes this safe is that
-	// authhttp.CheckEndpointURL has already restricted the authorization
+	// authhttp.CheckDiscoveredEndpoint has already restricted the authorization
 	// endpoint to http/https with a host, in every mode, before the URL is
 	// built. Keep that check if this code is refactored.
 	if err := exec.CommandContext(commandCtx, name, url).Run(); err != nil {

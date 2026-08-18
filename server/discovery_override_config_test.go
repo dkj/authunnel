@@ -94,11 +94,7 @@ func TestParseServerConfigRejectsBothDiscoveryOverrides(t *testing.T) {
 	}
 }
 
-// TestParseServerConfigStillRequiresIssuerWithOverrides pins the invariant that
-// the overrides replace metadata *location* only. Under --oidc-jwks-uri the
-// issuer is the sole binding between accepted tokens and an issuer, so dropping
-// the requirement would be a silent security regression rather than a
-// simplification.
+// Overrides change lookup location, not the issuer tokens must claim.
 func TestParseServerConfigStillRequiresIssuerWithOverrides(t *testing.T) {
 	for _, override := range [][]string{
 		{"--oidc-metadata-url", "https://as.example/meta"},
@@ -138,9 +134,7 @@ func TestParseServerConfigAcceptsHTTPDiscoveryOverridesWithInsecureFlag(t *testi
 		{"--oidc-metadata-url", "http://as.example/meta"},
 		{"--oidc-jwks-uri", "http://as.example/keys"},
 	} {
-		// The issuer is http:// here too: the insecure flag relaxes all
-		// three URLs together, which is the whole reason it is one flag
-		// rather than three.
+		// The development override applies consistently to all OIDC URLs.
 		args := append([]string{
 			"--oidc-issuer", "http://issuer.example",
 			"--token-audience", "authunnel-server",
@@ -156,34 +150,16 @@ func TestParseServerConfigAcceptsHTTPDiscoveryOverridesWithInsecureFlag(t *testi
 	}
 }
 
-// TestParseServerConfigRejectsFileJWKSURI covers the deliberate refusal to load
-// a JWKS from disk through this flag. Routing file:// through the shared auth
-// HTTP client would make local files reachable from any redirect that client
-// follows, so the scheme is refused by name rather than being quietly accepted
-// and failing on the first protected request.
 func TestParseServerConfigRejectsFileJWKSURI(t *testing.T) {
-	_, err := parseServerConfig(
-		baseServerArgs("--oidc-jwks-uri", "file:///etc/authunnel/jwks.json"),
-		func(string) string { return "" },
-	)
-	if err == nil || !strings.Contains(err.Error(), `"file"`) {
-		t.Fatalf("expected the file scheme to be rejected by name, got: %v", err)
-	}
-}
-
-// TestParseServerConfigRejectsFileJWKSURIUnderInsecureFlag is the more
-// important half: --insecure-oidc-issuer relaxes transport security for a local
-// development IdP, it does not widen the set of permitted schemes.
-func TestParseServerConfigRejectsFileJWKSURIUnderInsecureFlag(t *testing.T) {
-	_, err := parseServerConfig(
-		baseServerArgs(
-			"--oidc-jwks-uri", "file:///etc/authunnel/jwks.json",
-			"--insecure-oidc-issuer",
-		),
-		func(string) string { return "" },
-	)
-	if err == nil || !strings.Contains(err.Error(), `"file"`) {
-		t.Fatalf("--insecure-oidc-issuer must not permit the file scheme, got: %v", err)
+	for _, insecure := range []bool{false, true} {
+		args := baseServerArgs("--oidc-jwks-uri", "file:///etc/authunnel/jwks.json")
+		if insecure {
+			args = append(args, "--insecure-oidc-issuer")
+		}
+		_, err := parseServerConfig(args, func(string) string { return "" })
+		if err == nil || !strings.Contains(err.Error(), `"file"`) {
+			t.Fatalf("insecure=%v: expected the file scheme to be rejected, got: %v", insecure, err)
+		}
 	}
 }
 
@@ -200,8 +176,6 @@ func TestParseServerConfigRejectsMalformedDiscoveryOverrides(t *testing.T) {
 	}
 }
 
-// TestParseServerConfigDefaultsLeaveOverridesUnset guards the default path:
-// with neither flag set the resolved config is unchanged from before.
 func TestParseServerConfigDefaultsLeaveOverridesUnset(t *testing.T) {
 	cfg, err := parseServerConfig(baseServerArgs(), func(string) string { return "" })
 	if err != nil {

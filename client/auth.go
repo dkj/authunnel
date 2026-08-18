@@ -53,16 +53,9 @@ type browserOpener func(context.Context, string) error
 // only falls back to interactive PKCE when needed.
 type managedOIDCTokenSource struct {
 	issuer string
-	// metadataURL, when set, replaces the well-known path derived from
-	// issuer.
-	//
-	// Discovery compares the document's `issuer` field against issuer, but
-	// that field is supplied by the document about itself and proves nothing
-	// about the host serving it. Treat the check as catching an honest wrong
-	// URL — staging for production, one tenant for another, which a
-	// legitimate AS reveals by declaring its own issuer — not as a boundary.
-	// A hostile or mistyped URL can echo the expected issuer and name any
-	// endpoints it likes; only trusting this value prevents that.
+	// metadataURL overrides derived discovery. Its self-asserted issuer is a
+	// consistency check; the operator must trust the URL that supplies the
+	// authorization and token endpoints.
 	metadataURL  string
 	clientID     string
 	audience     string
@@ -80,40 +73,11 @@ type managedOIDCTokenSource struct {
 	discovery oauth2.Endpoint
 }
 
-// tokenCache is intentionally a single JSON document so developers can inspect
-// and delete it easily during debugging. Cache entries are scoped to issuer,
-// metadata URL, client ID, audience, resource, and scopes to avoid reusing a
-// credential in a context it was not obtained for.
-//
-// The metadata URL belongs in that identity, and an earlier version of this
-// comment argued the opposite — that the override only relocates the document,
-// so a token obtained through it is "the same token". That reasoning asks
-// whether the credential is still *valid*, which is the wrong question. The
-// question is who receives it. The metadata document names the token endpoint
-// the refresh token is posted to, and the only check on that document is that
-// its `issuer` field equals the configured issuer — a plain string comparison
-// against a value the document supplies about itself. Nothing binds the
-// metadata host to the issuer it claims, so a mistyped or hostile metadata URL
-// can echo the right issuer and name any token endpoint it likes.
-//
-// Left out of the identity, adding or changing --oidc-metadata-url would keep an
-// existing refresh token valid and post it to whatever that new document
-// advertises, with no user interaction. Including it means the cache is
-// discarded instead and the user re-authenticates.
-//
-// What that does and does not buy, precisely: it prevents the **silent reuse of
-// an already-issued refresh token**. It is not a general defence against a
-// hostile metadata URL. If the user goes on to complete the fallback login, the
-// authorization code and its PKCE verifier are still sent to the token endpoint
-// that document names — and a document can pair the *real* authorization
-// endpoint with an attacker's token endpoint, so the user sees a genuine IdP
-// page and the code that comes back is a real, redeemable one. Nothing here
-// stops that; only trusting the metadata URL does.
-//
-// The cost is one interactive login the first time an operator sets the flag,
-// and again if they change it. That is the correct trade. Caches written before
-// this field existed unmarshal with an empty MetadataURL and still match a
-// source that uses the derived path, so no one is logged out by the upgrade.
+// tokenCache is scoped by every setting that determines credential validity or
+// destination. MetadataURL is included because its document chooses the token
+// endpoint; changing it must not silently send an existing refresh token to a
+// new destination. An empty value preserves compatibility with caches created
+// for derived discovery before this field existed.
 type tokenCache struct {
 	Issuer string `json:"issuer"`
 	// MetadataURL records which metadata document produced the endpoints these
@@ -144,11 +108,8 @@ func newAuthTokenSource(cfg clientConfig) (authTokenSource, error) {
 			// client through cfg.AuthHTTPClient.
 			client = authhttp.NewBoundedClient()
 		}
-		// Applied here rather than relying on NewBoundedClient, which sets
-		// the same policy: an injected client must not be able to opt out of
-		// it. This path carries the refresh token and the authorization code,
-		// so a redirect off https would disclose a credential rather than
-		// merely weaken a fetch of public material.
+		// Apply explicitly so injected clients cannot bypass the credential-
+		// bearing path's downgrade policy.
 		client = authhttp.RefuseTransportDowngrade(client)
 		output := cfg.Stderr
 		if output == nil {
@@ -269,20 +230,14 @@ func (s *managedOIDCTokenSource) oauthConfig(ctx context.Context, redirectURL st
 		if s.metadataURL != "" {
 			metadataSource = s.metadataURL
 		}
-		// Validate both endpoints before either is used. token_endpoint
-		// receives the refresh token and the authorization code;
-		// authorization_endpoint is handed to the OS URL dispatcher, which
-		// will launch whatever application claims the scheme, so
-		// CheckEndpointURL is the whole of the protection there — the
-		// redirect guard on s.httpClient never sees that leg.
+		// Validate both endpoints before use. token_endpoint receives
+		// credentials; authorization_endpoint is handed to the OS URL
+		// dispatcher and is not covered by the HTTP client's redirect guard.
 		for _, endpoint := range []struct{ label, value string }{
 			{"authorization_endpoint", discovery.AuthorizationEndpoint},
 			{"token_endpoint", discovery.TokenEndpoint},
 		} {
-			if err := authhttp.CheckEndpointURL(endpoint.label, endpoint.value); err != nil {
-				return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
-			}
-			if err := authhttp.CheckNoSchemeDowngrade(endpoint.label, metadataSource, endpoint.value); err != nil {
+			if err := authhttp.CheckDiscoveredEndpoint(endpoint.label, metadataSource, endpoint.value); err != nil {
 				return nil, fmt.Errorf("discover issuer %q: %w", s.issuer, err)
 			}
 		}

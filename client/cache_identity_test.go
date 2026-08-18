@@ -11,10 +11,7 @@ import (
 	"time"
 )
 
-// hostileMetadata serves a document that echoes the configured issuer — which is
-// all the discovery check compares — while pointing the token endpoint at a
-// collector. It stands in for a mistyped metadata URL just as well as a
-// malicious one; the client cannot tell them apart, which is the point.
+// hostileMetadata echoes the expected issuer but points tokens at a collector.
 func hostileMetadata(t *testing.T, issuer string) (metadataURL string, collector *plaintextTokenMirror, client *http.Client) {
 	t.Helper()
 	collector = newPlaintextTokenMirror(t)
@@ -35,15 +32,7 @@ func hostileMetadata(t *testing.T, issuer string) (metadataURL string, collector
 	return base + "/metadata", collector, server.Client()
 }
 
-// TestCachedRefreshTokenIsNotSentToANewMetadataSource is the regression test for
-// the disclosure this cache scoping exists to prevent.
-//
-// A refresh token cached under the derived discovery path must not be posted to
-// the token endpoint named by a *different* metadata document. Checking that the
-// document's `issuer` matches proves nothing about the host serving it, so
-// without scoping the cache, adding or mistyping --oidc-metadata-url would hand
-// an existing credential to whatever that document names — no user interaction
-// required.
+// A metadata override must not receive a refresh token cached under discovery.
 func TestCachedRefreshTokenIsNotSentToANewMetadataSource(t *testing.T) {
 	const issuer = "https://issuer.example"
 	metadataURL, collector, client := hostileMetadata(t, issuer)
@@ -63,11 +52,8 @@ func TestCachedRefreshTokenIsNotSentToANewMetadataSource(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Reaching the browser is the proof that the cache was discarded *and*
-	// that discovery got far enough to build an authorization URL. Asserting
-	// only "the collector saw nothing" would also pass if the fixture broke
-	// and nothing was ever attempted. Cancelling here ends the wait for a
-	// callback that will never arrive, instead of a fixed sleep.
+	// Browser invocation proves the cache was discarded; cancellation ends the
+	// otherwise interactive flow without a fixed sleep.
 	browserCalls := 0
 	source := &managedOIDCTokenSource{
 		issuer:      issuer,
@@ -87,10 +73,6 @@ func TestCachedRefreshTokenIsNotSentToANewMetadataSource(t *testing.T) {
 
 	_, err := source.AccessToken(ctx, false)
 
-	// The defect assertion comes first so a regression reports the leak
-	// itself. Checking the browser first would instead report "the flow did
-	// not reach interactive login", which reads like a broken fixture — the
-	// cache having been reused is exactly why interactive login is skipped.
 	requests, bodies := collector.received()
 	for _, body := range bodies {
 		if strings.Contains(body, "super-secret-refresh-token") {
@@ -101,8 +83,6 @@ func TestCachedRefreshTokenIsNotSentToANewMetadataSource(t *testing.T) {
 		t.Fatalf("token endpoint named by the new metadata document received %d request(s): %q", requests, bodies)
 	}
 
-	// Then the liveness assertions: without these the test would also pass if
-	// the fixture broke and nothing was ever attempted.
 	if browserCalls != 1 {
 		t.Fatalf("browser opened %d times, want 1 — the flow did not reach interactive login, so this test proved nothing", browserCalls)
 	}
@@ -111,8 +91,6 @@ func TestCachedRefreshTokenIsNotSentToANewMetadataSource(t *testing.T) {
 	}
 }
 
-// TestCacheIsScopedToMetadataURL covers the identity rule directly, in both
-// directions, so the behaviour is pinned independently of the attack scenario.
 func TestCacheIsScopedToMetadataURL(t *testing.T) {
 	const issuer = "https://issuer.example"
 
@@ -164,9 +142,7 @@ func TestCacheIsScopedToMetadataURL(t *testing.T) {
 	}
 }
 
-// TestCacheWrittenBeforeMetadataFieldStillLoads pins the upgrade path: an
-// existing cache file has no metadata_url key, and an operator not using the
-// flag must not be logged out by adding the field.
+// A legacy derived-discovery cache has no metadata_url and remains compatible.
 func TestCacheWrittenBeforeMetadataFieldStillLoads(t *testing.T) {
 	const issuer = "https://issuer.example"
 	cachePath := filepathForTest(t, "tokens.json")

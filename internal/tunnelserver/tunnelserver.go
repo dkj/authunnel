@@ -50,41 +50,17 @@ const (
 	maxAuthorizationHeaderBytes = maxBearerTokenBytes + 64
 )
 
-// JWTTokenValidator validates bearer access tokens against a JWKS, then applies
-// an explicit audience check for the protected resource.
-//
-// For audit purposes, note how the key set was reached, because it differs by
-// DiscoveryMode and the validator cannot tell afterwards:
-//
-//   - under DiscoveryModeDerived the well-known path is constructed from the
-//     issuer URL, so the document was fetched from the issuer's own host over
-//     TLS. That is a real binding: the origin is authenticated, not merely
-//     claimed;
-//   - under DiscoveryModeMetadataURL the document came from a host the operator
-//     named. Discovery compares the document's `issuer` field to the configured
-//     issuer, but a document asserts that field about itself, so it binds
-//     nothing — the operator's choice of URL is the binding;
-//   - under DiscoveryModePinnedJWKS there is no document at all, so the
-//     issuer-to-keys binding is asserted by the operator outright.
-//
-// Only the first is verified. An earlier version of this comment grouped the
-// first two together as "discovered", which overstates the second.
-//
-// What does not vary: the verifier pins the configured issuer, so every token's
-// `iss` claim is enforced against it in all three modes. Note what that does and
-// does not bound — it fixes *which issuer* a token may name, not *which keys*
-// may sign for it. A metadata document that names attacker-controlled keys
-// still yields tokens this validator accepts, because they can claim the
-// configured issuer truthfully as far as the verifier can tell.
+// JWTTokenValidator verifies bearer tokens against a remote JWKS and enforces
+// the configured issuer and audience. DiscoveryMode records how the JWKS
+// endpoint was trusted: derived discovery is rooted at the issuer's HTTPS
+// origin, while metadata and JWKS overrides rely on operator configuration.
 type JWTTokenValidator struct {
 	audience string
 	verifier *op.AccessTokenVerifier
 }
 
-// DiscoveryMode names how a validator located the issuer's JWKS, for startup
-// logging. The operator gave up a verification step in anything other than
-// DiscoveryModeDerived, so the choice should be visible in the log without
-// having to diff the deployment config.
+// DiscoveryMode names how a validator located the issuer's JWKS. It is logged
+// at startup so the active trust model is visible to operators.
 type DiscoveryMode string
 
 const (
@@ -101,15 +77,8 @@ const (
 )
 
 // JWTValidatorConfig configures token validation. Issuer and Audience are
-// required in every mode.
-//
-// MetadataURL and JWKSURI change where the key set is found. Issuer remains the
-// value enforced as the `iss` claim on every token, so they cannot change which
-// issuer *name* is accepted — but they do change which keys sign for it, which
-// is the same thing from an attacker's point of view. Treat both as trusted
-// configuration, not as relocations of something already verified. They are
-// mutually exclusive; the server rejects both being set before reaching this
-// constructor.
+// required. MetadataURL and JWKSURI are mutually exclusive trusted overrides
+// for locating the key set; neither changes the issuer claim that is enforced.
 type JWTValidatorConfig struct {
 	// Issuer is the identity anchor. It is enforced as `iss` on every token
 	// and, on the discovery paths, must equal the `issuer` advertised by the
@@ -117,41 +86,23 @@ type JWTValidatorConfig struct {
 	Issuer string
 	// Audience is required in every validated token.
 	Audience string
-	// MetadataURL overrides the derived well-known path. Use it for an
-	// authorization server that publishes RFC 8414 metadata at a path the
-	// OIDC derivation cannot reach, or whose metadata sits off the issuer
-	// path entirely.
-	//
-	// Discovery compares the document's `issuer` against Issuer, but that
-	// field is self-asserted: a document at any host can echo the expected
-	// issuer and advertise attacker-controlled keys, which this server would
-	// then accept for tokens claiming that issuer. The check catches an
-	// honest wrong URL, not a hostile one. This value must be trusted as much
-	// as Issuer itself.
+	// MetadataURL overrides the derived well-known path. The document's
+	// self-asserted issuer is checked for consistency, but the operator is
+	// responsible for trusting the URL that supplies the key endpoint.
 	MetadataURL string
-	// JWKSURI pins the key set endpoint and skips metadata discovery. The
-	// constructor then makes no network call, so the server starts even
-	// with the issuer unreachable — at the cost of surfacing a wrong URL on
-	// the first protected request rather than at startup.
+	// JWKSURI restricts server auth egress to the configured key endpoint by
+	// skipping metadata discovery. Keys are still fetched lazily on the first
+	// protected request and again during rotation.
 	JWKSURI string
 	// HTTPClient carries the bounded transport used for metadata and JWKS
 	// fetches. Required.
 	HTTPClient *http.Client
 }
 
-// NewJWTTokenValidator resolves the issuer's JWKS *endpoint* once at startup
-// and builds a validator whose claim checks then run locally against a cached
-// key set. Note the keys themselves are not fetched here: NewRemoteKeySet is
-// lazy, so the first fetch happens on the first token verified, and further
-// fetches happen whenever a token presents an unrecognised kid. The process
-// therefore needs outbound access to the JWKS endpoint for its whole lifetime,
-// not just during startup.
-//
-// Configuration errors fail at startup rather than on the first protected
-// request — except under JWKSURI, where there is no startup fetch to fail.
-//
-// The returned DiscoveryMode records how the key set was located, for the
-// caller to log.
+// NewJWTTokenValidator resolves the JWKS endpoint and constructs a validator.
+// The key set itself is lazy and in-memory: first use and unknown key IDs fetch
+// from JWKS, so that endpoint must remain reachable for the process lifetime.
+// The returned DiscoveryMode is suitable for startup logging.
 func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTTokenValidator, DiscoveryMode, error) {
 	if cfg.Issuer == "" {
 		return nil, "", errors.New("issuer is required")
@@ -174,9 +125,9 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 
 	jwksURI, mode := cfg.JWKSURI, DiscoveryModePinnedJWKS
 	if jwksURI != "" {
-		// The server's config layer already checks this, but the constructor
-		// is exported and must not depend on its caller having done so.
-		if err := authhttp.CheckEndpointURL("jwks_uri", jwksURI); err != nil {
+		// The caller owns the HTTPS-versus-development-HTTP policy. Independently
+		// reject values that the remote key set cannot safely fetch.
+		if err := authhttp.CheckHTTPURL("JWKS URI", jwksURI); err != nil {
 			return nil, "", err
 		}
 	}
@@ -194,17 +145,7 @@ func NewJWTTokenValidator(ctx context.Context, cfg JWTValidatorConfig) (*JWTToke
 		if err != nil {
 			return nil, "", fmt.Errorf("discover issuer metadata: %w", err)
 		}
-		// Two checks, because neither subsumes the other. The first is
-		// absolute — the endpoint must be a real http(s) URL, which also
-		// covers the empty case. The second is relative to how the metadata
-		// arrived: a document fetched over https must not be able to send
-		// the key fetch to a plaintext endpoint. Over an http metadata
-		// source the second passes everything, which is why the first is
-		// not redundant.
-		if err := authhttp.CheckEndpointURL("jwks_uri", discovery.JwksURI); err != nil {
-			return nil, "", err
-		}
-		if err := authhttp.CheckNoSchemeDowngrade("jwks_uri", metadataSource, discovery.JwksURI); err != nil {
+		if err := authhttp.CheckDiscoveredEndpoint("jwks_uri", metadataSource, discovery.JwksURI); err != nil {
 			return nil, "", err
 		}
 		jwksURI, mode = discovery.JwksURI, DiscoveryModeDerived
