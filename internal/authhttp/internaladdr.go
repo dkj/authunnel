@@ -36,23 +36,38 @@ import (
 //     resolve to loopback a moment later. Checking at dial time and connecting to
 //     the address that was checked is the only version of that which holds.
 //
-// **An HTTP proxy is refused outright rather than accommodated.** With a proxy in
-// play the destination is resolved by the *proxy*, so there is no address for this
-// client to pin: a name can answer publicly to us and internally to the proxy, or
-// rebind between the two lookups, and the proxy fetches the internal one on our
-// behalf. A per-request destination check narrows that window without closing it.
+// **An HTTP proxy removes the address checks, so what happens then turns on whether
+// anything else binds the origin — and for https, something does.**
 //
-// An earlier version kept the proxy and documented the residual exposure. That was
-// the wrong call: a guard that silently does not hold is worse than one that
-// visibly does not apply, and prose in a README is not a mitigation. Requests
-// through a guarded client are therefore refused when a proxy would be used.
+// Through a proxy the destination is resolved by the *proxy*, so neither the address
+// that was checked nor the address that was dialled describes where the traffic went.
 //
-// The cost is explicit: **zero-configuration discovery does not work behind a
-// mandatory HTTP proxy.** Two ways forward, both already part of this design —
-// add the host to NO_PROXY when it is directly reachable, or configure the values
-// with --oidc-issuer and --oidc-client-id, which are the operator's own decision
-// and are never filtered. Neither weakens the guarantee for anybody else, which an
-// "unsafe proxy" opt-in would have invited.
+// For an https destination that does not matter. The transport issues CONNECT and
+// then performs its own TLS handshake with the origin, validating the certificate
+// against the name it asked for; the proxy is a blind relay. A rebound internal
+// service cannot complete that handshake — the attacker owns the name but not that
+// service's key — so it can neither deliver a document nor receive a credential. TLS
+// is the binding, and address pinning was only ever standing in for it. Such requests
+// are allowed, and the address checks are skipped rather than applied: with a proxy in
+// play the local resolver's answer is not the one that will be used, and a proxied
+// network often has no local answer at all.
+//
+// For a plaintext destination there is nothing to fall back on, and a proxy fetching
+// an internal http endpoint on this client's behalf is exactly the RFC 9728 §7.7
+// pivot. Those requests are refused. Plaintext discovery already requires
+// --insecure-oidc-issuer, so the refusal does not arise in a normal deployment.
+//
+// One limit this cannot close, stated rather than glossed: a TLS-terminating proxy
+// with its CA installed locally *is* the origin as far as certificate validation is
+// concerned, so it can serve internal content under any name. That is a trust the
+// operator established deliberately, and the control for it is the proxy's own egress
+// policy, not anything on this side.
+//
+// Two earlier versions of this comment were wrong in opposite directions — one
+// exempted the proxy hop and called the residual exposure documented, the other
+// claimed every proxied request was refused and that zero-configuration discovery
+// therefore could not work behind a proxy. Neither matched the code by the time it
+// was read. If the rule changes again, this paragraph is the first thing to update.
 
 // resolveTimeout bounds the lookup CheckPublicAddress performs. Short: it is one
 // DNS query, and it sits on the interactive login path.

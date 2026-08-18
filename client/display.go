@@ -40,8 +40,8 @@ type safeLogWriter struct{ to io.Writer }
 // Extracted so a test can exercise the wiring rather than only the writer. Be clear
 // about what that covers: it catches this function becoming a no-op and the writer
 // ceasing to escape, and it cannot catch main dropping the call, because main is not
-// reachable from a test. That one line is the untested link, and it is recorded as
-// such in docs/DEVELOPMENT.md rather than papered over.
+// reachable from a test. That one line is the untested link, listed among the known
+// gaps in docs/DEVELOPMENT.md rather than papered over.
 func installSafeLogging() {
 	log.SetOutput(newSafeLogWriter(os.Stderr))
 }

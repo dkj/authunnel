@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"authunnel/internal/authmeta"
 )
 
 // TestTokenAfterRejectionReplacesTheTokenWhenConfigurationChanged is the lockout
@@ -24,7 +26,7 @@ func TestTokenAfterRejectionReplacesTheTokenWhenConfigurationChanged(t *testing.
 		ResourceURL:  fixture.ResourceURL,
 		Issuer:       fixture.Issuer,
 		ClientID:     "the-old-client",
-		Scopes:       normalizeScopes("openid offline_access"),
+		Scopes:       normalizeScopes(publishedScopes),
 		AccessToken:  "token-the-server-now-refuses",
 		RefreshToken: "refresh-token-for-the-old-client",
 		TokenType:    "Bearer",
@@ -107,7 +109,7 @@ func TestTokenAfterRejectionDoesNothingWhenConfigurationIsUnchanged(t *testing.T
 		ResourceURL:  fixture.ResourceURL,
 		Issuer:       fixture.Issuer,
 		ClientID:     "published-cli",
-		Scopes:       normalizeScopes("openid offline_access"),
+		Scopes:       normalizeScopes(publishedScopes),
 		AccessToken:  "a-token-the-server-dislikes",
 		RefreshToken: "refresh-token",
 		TokenType:    "Bearer",
@@ -139,7 +141,7 @@ func TestTokenAfterRejectionNoticesAChangedIssuer(t *testing.T) {
 		ResourceURL:  fixture.ResourceURL,
 		Issuer:       "http://issuer-that-has-since-moved.example",
 		ClientID:     "published-cli",
-		Scopes:       normalizeScopes("openid offline_access"),
+		Scopes:       normalizeScopes(publishedScopes),
 		AccessToken:  "stale-token",
 		RefreshToken: "super-secret-refresh-token",
 		TokenType:    "Bearer",
@@ -264,5 +266,66 @@ func TestDialDoesNotRetryOnAdmissionRejections(t *testing.T) {
 		if len(tunnel.attempts) != 1 {
 			t.Fatalf("status %d: attempts = %v, want one", status, tunnel.attempts)
 		}
+	}
+}
+
+// TestTokenAfterRejectionForgetsWhatItResolvedEarlier covers the line the recovery
+// turns on, which nothing reached before: the reset of the memoised identity and
+// endpoints.
+//
+// The other tests here call TokenAfterRejection on a source that has never resolved,
+// so there is no memoised state to forget and deleting the reset left them green.
+// This drives the production sequence instead — an expired cache forces AccessToken to
+// resolve, *then* the server changes its published client ID, *then* the token is
+// rejected — which is the only shape where the reset does anything.
+func TestTokenAfterRejectionForgetsWhatItResolvedEarlier(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	cachePath := filepathForTest(t, "tokens.json")
+	writeTokenCacheForTest(t, cachePath, tokenCache{
+		ResourceURL:  fixture.ResourceURL,
+		Issuer:       fixture.Issuer,
+		ClientID:     "published-cli",
+		Scopes:       normalizeScopes(publishedScopes),
+		AccessToken:  "expired-token",
+		RefreshToken: "refresh-token",
+		TokenType:    "Bearer",
+		Expiry:       time.Now().Add(-time.Minute),
+	})
+
+	opened := 0
+	source := fixture.discoverySource(t, completingOpener(&opened))
+	source.cachePath = cachePath
+
+	// First: a real resolution, which memoises the identity and the endpoints.
+	if _, err := source.AccessToken(context.Background(), true); err != nil {
+		t.Fatalf("AccessToken: %v", err)
+	}
+	if source.effective == nil || source.effective.ClientID != "published-cli" {
+		t.Fatalf("expected the first call to memoise the published identity, got %+v", source.effective)
+	}
+	firstFetches, _ := fixture.counts()
+
+	// The server moves to a different client, and the token is rejected.
+	fixture.setDocument(func(d *authmeta.ProtectedResource) { d.ClientID = "the-new-client" })
+
+	replacement, err := source.TokenAfterRejection(context.Background())
+	if err != nil {
+		t.Fatalf("TokenAfterRejection: %v", err)
+	}
+	if replacement == "" {
+		t.Fatal("expected a replacement once the published client ID changed")
+	}
+	// The reset is what makes the second fetch happen at all: without it the
+	// memoised identity is reused, the comparison finds nothing changed, and the
+	// client stays locked out until the cache expires.
+	laterFetches, _ := fixture.counts()
+	if laterFetches <= firstFetches {
+		t.Fatalf("metadata fetched %d times then %d; the recovery must re-read the document rather than reuse what it resolved", firstFetches, laterFetches)
+	}
+	if source.effective.ClientID != "the-new-client" {
+		t.Fatalf("resolved client ID = %q, want the newly published one", source.effective.ClientID)
+	}
+	if opened != 1 {
+		t.Fatalf("browser logins = %d, want exactly one", opened)
 	}
 }

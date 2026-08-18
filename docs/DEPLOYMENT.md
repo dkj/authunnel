@@ -277,7 +277,7 @@ refresh token or an authorization code.
 
 They are additionally held to the resolved-IP deny-list (RFC 9728 §7.7): a client that reached its
 tunnel server over a public address refuses to follow that server to loopback, a link-local address,
-or a cloud instance-metadata service. **Clients behind an HTTP proxy keep working, and the reason is worth understanding** because it is
+or a cloud instance-metadata service. **Clients behind an HTTP proxy keep working** because it is
 what decides how much the address checks are carrying. Through a proxy the destination is resolved by
 the proxy, so those checks report on a lookup the connection will not use — but for an `https`
 destination the client issues `CONNECT` and then performs its own TLS handshake with the origin,
@@ -298,16 +298,10 @@ the origin as far as certificate validation is concerned, so it can serve intern
 name. That is a trust the operator established deliberately, and the control for it is the proxy's own
 egress policy, not anything this client can check.
 
-The relaxation for internal deployments is likewise narrow: it applies only when the tunnel URL names
-the client's own machine *by spelling* — a **loopback** literal, or a name RFC 6761 reserves for
-loopback — and resolves nothing, because the tunnel host's DNS belongs to whoever runs that host.
-Note this is a smaller set than the addresses the guard refuses: link-local (including IMDS),
-multicast and unspecified are refused as destinations without being "this machine", so pointing a
-tunnel URL at one of them does not buy a client any extra trust. A development box reaching its tunnel through a private alias in `/etc/hosts` should pass
-`--oidc-issuer` rather than rely on classification. Private networks are not refused — an internal IdP is an
-ordinary deployment — and the guard is lifted entirely when the tunnel server is itself internal,
-which is the local-development case. It applies only to discovered values; `--oidc-issuer` is the
-operator's own decision and is not filtered.
+These rules apply only to discovered values; `--oidc-issuer` is the operator's own decision and is
+not filtered. See
+[Discovered addresses and the internal-address guard](#discovered-addresses-and-the-internal-address-guard)
+for the three layers, the proxy reasoning, and the narrow — loopback-only — relaxation.
 
 **Recovery when this configuration changes.** A client holding a cached access token that is still
 valid by its own expiry presents it without reading any metadata, so changing the issuer, client ID
@@ -337,6 +331,71 @@ ends must opt into removes no configuration from anyone. What the switch buys is
 holding a token already knows the issuer, since it obtained the token there, and a public client ID
 is not a credential. It is a switch for a deployment whose policy treats the IdP's identity as
 non-public, not a security control.
+
+### What `--oidc-issuer` pins, precisely
+
+A document naming a different issuer is a local error. The *location* of that issuer's
+metadata may not be relocated by the tunnel server either: a published
+`authunnel_authorization_server_metadata_url` is used only when it shares an origin with
+the configured issuer, which is where TLS makes the issuer's own host answer for the
+document. A cross-origin location is announced and ignored, and an operator who wants it
+passes `--oidc-metadata-url` themselves. Without that rule the pin would be hollow — a
+hostile server could echo the expected issuer, point the client at its own document, and
+name the authorization and token endpoints from there.
+
+Discovery-input filtering follows the same line: the transport, address and downgrade
+rules apply to what the *tunnel server* chose. A client that supplies `--oidc-issuer`
+(or `--oidc-metadata-url`) and omits only `--oidc-client-id` still runs discovery for
+that one hint, and its own issuer is not filtered as remote input on that account —
+otherwise the same configuration would work or fail depending on which unrelated flag
+was present.
+
+It does not pin what the token is *for*. `authunnel_audience` and `authunnel_resource`
+are still adopted when the client supplies neither, so a tunnel server can influence
+which audience is requested. Clients that pin the issuer because they do not fully trust
+the tunnel URL should pin `--oidc-audience` or `--oidc-resource` alongside it.
+
+### Discovered addresses and the internal-address guard
+
+An address named by a remote metadata document is held to the resolved-IP deny-list
+(RFC 9728 §7.7): a client that reached its tunnel server over a public address refuses
+to follow that server to loopback, a link-local address, or a cloud instance-metadata
+service. Private networks (RFC1918, CGNAT, IPv6 ULA) are **not** refused — an
+authorization server on an internal network is an ordinary deployment.
+
+Three layers, because each sees something the others cannot:
+
+1. a resolution check on the value itself — the only protection for the
+   `authorization_endpoint`, which is handed to the OS URL dispatcher rather than fetched;
+2. a per-request destination check, which also covers each redirect hop;
+3. a dial-time check that connects to the address it verified, so a name cannot resolve
+   differently a moment later.
+
+**Behind an HTTP proxy** the address checks describe a lookup the connection will not
+use, and what protects the client instead is TLS: the transport issues `CONNECT` and then
+validates the origin's certificate against the name it asked for, which a rebound internal
+service cannot present. So proxied `https` is allowed and bound by the certificate, with
+the address checks skipped rather than applied — a proxied network often resolves external
+names only at the proxy, and demanding a local answer would break exactly the clients that
+can reach the destination. Proxied *plaintext* is refused: nothing binds the origin, and a
+proxy fetching an internal `http` endpoint on the client's behalf is the pivot this guard
+exists for. Since a plaintext discovered endpoint already requires `--insecure-oidc-issuer`,
+that refusal does not arise in a normal deployment.
+
+One limit, stated rather than glossed: a TLS-terminating proxy with its CA installed on the
+client *is* the origin as far as certificate validation is concerned, so it can serve
+internal content under any name. That is a trust the operator established deliberately, and
+the control for it is the proxy's own egress policy.
+
+**The relaxation is narrow.** The guard is lifted only when the tunnel URL names the
+client's own machine *by spelling* — a **loopback** literal, or a name RFC 6761 reserves for
+loopback — and it resolves nothing, because the tunnel host's DNS belongs to the party the
+guard constrains: a host answering with both a public and a loopback address would otherwise
+switch the guard off. That set is deliberately smaller than the refused set: link-local
+(including IMDS), multicast and unspecified addresses are refused as destinations without
+being "this machine", so pointing a tunnel URL at one of them buys a client no extra trust.
+A development host reached through a private alias in `/etc/hosts` should pass
+`--oidc-issuer` rather than rely on classification.
 
 ## Transport rules on the auth path
 

@@ -292,7 +292,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.BoolVar(&cfg.ProxyCommandMode, "proxycommand", false, "Run as ssh ProxyCommand helper. Requires host and port positional arguments.")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", "", "OIDC issuer used for managed login")
 	fs.StringVar(&cfg.OIDCMetadataURL, "oidc-metadata-url", "",
-		"Authorization server metadata document URL, overriding the well-known path derived from --oidc-issuer. For an authorization server publishing RFC 8414 metadata at a path the OIDC derivation cannot construct. The document's issuer must still match --oidc-issuer.")
+		"Authorization server metadata document URL, overriding the well-known path derived from --oidc-issuer. For an authorization server publishing RFC 8414 metadata at a path the OIDC derivation cannot construct. Usable without --oidc-issuer, in which case the document's own issuer is adopted rather than checked against one.")
 	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", "", "OIDC client ID used for managed login")
 	fs.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Auth0-style 'audience' parameter requested during managed login")
 	fs.StringVar(&cfg.OIDCResource, "oidc-resource", "", "RFC 8707 'resource' parameter requested during managed login; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)")

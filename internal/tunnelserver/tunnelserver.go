@@ -366,6 +366,12 @@ type HandlerOptions struct {
 //     test. Subpaths other than /protected/tunnel return 404 after auth.
 //   - "GET /protected/tunnel" — authenticated websocket-to-SOCKS bridge.
 //     More specific than the /protected/ subtree and so takes precedence.
+//   - "GET /.well-known/oauth-protected-resource" and its subtree —
+//     unauthenticated RFC 9728 metadata, registered only when
+//     HandlerOptions.ResourceMetadata is set. Outside the /protected/ prefix by
+//     construction: §3.1 inserts the well-known segment *before* the resource's
+//     path, so nothing readable without a token lives under the prefix that means
+//     a token is required.
 //
 // Patterns are GET-only; Go's ServeMux automatically routes HEAD requests
 // to the GET handler, and the mux returns 405 with an Allow header for

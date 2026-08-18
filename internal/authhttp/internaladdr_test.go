@@ -240,124 +240,59 @@ func TestRefuseInternalAddressesRefusesPlaintextThroughAProxy(t *testing.T) {
 }
 
 // TestRefuseInternalAddressesAllowsDirectRequestsWhenAProxyIsConfigured pins that
-// the refusal is per request rather than per client. http.ProxyFromEnvironment
-// returns no proxy for many destinations even when the variables are set, and
-// those requests must still work — otherwise setting HTTP_PROXY at all would
-// disable discovery wholesale.
+// the refusal is per request, not per client. http.ProxyFromEnvironment returns no
+// proxy for many destinations even when the variables are set, and those requests
+// must still work — otherwise setting HTTP_PROXY at all would disable discovery
+// wholesale.
+//
+// The assertion is that a direct request *succeeds*. An earlier version only checked
+// that a (loopback, therefore refused) request's error did not mention the proxy,
+// which a mutant refusing every non-proxied request passed happily.
 func TestRefuseInternalAddressesAllowsDirectRequestsWhenAProxyIsConfigured(t *testing.T) {
+	var served int
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		served++
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer target.Close()
 
-	// A proxy function that declines to proxy anything: the shape of NO_PROXY
-	// covering the destination.
+	// A proxy function that declines to proxy anything — the shape of NO_PROXY
+	// covering the destination — and a dialer that reports the address it was given,
+	// so a public destination can be exercised without leaving the machine.
 	client := &http.Client{Transport: &http.Transport{
 		Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// Redirect the "public" destination at the local fixture, after the
+			// guard has judged it.
+			if strings.HasPrefix(address, "93.184.216.34:") {
+				address = strings.TrimPrefix(target.URL, "http://")
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		},
 	}}
 	guarded := RefuseInternalAddresses(client)
 
-	// Loopback, so this must be refused by the *address* rules rather than by
-	// anything to do with proxies — and the error must not mention the proxy.
-	_, err := guarded.Get(target.URL)
+	// The direct request to an acceptable address goes through.
+	response, err := guarded.Get("http://93.184.216.34/meta")
+	if err != nil {
+		t.Fatalf("a direct request must not be refused merely because a proxy function is configured: %v", err)
+	}
+	_ = response.Body.Close()
+	if served != 1 {
+		t.Fatalf("the destination served %d requests, want the direct request delivered", served)
+	}
+
+	// And a direct request to a refused address is still refused — on its address,
+	// with no mention of a proxy, since none applies.
+	_, err = guarded.Get(target.URL)
 	if err == nil {
 		t.Fatal("expected the loopback destination to be refused on its address")
 	}
+	if !errors.Is(err, ErrUnsafeTransport) {
+		t.Fatalf("error = %v, want %v", err, ErrUnsafeTransport)
+	}
 	if strings.Contains(err.Error(), "via the proxy") {
 		t.Fatalf("error = %v, want no proxy refusal when no proxy applies", err)
-	}
-}
-
-// TestGuardedDialerPinsTheCheckedAddress covers the dial layer on its own. It
-// cannot be reached through a client once the destination check is in front of it
-// — that check refuses first — so it is exercised directly, which is also the only
-// way to state what it guarantees: nothing is dialled that was not checked, and
-// what is dialled is an address rather than a name.
-//
-// Deliberately hermetic: literals for the allowed path and a /etc/hosts name for
-// the refused one, so this needs no working public DNS.
-func TestGuardedDialerPinsTheCheckedAddress(t *testing.T) {
-	var dialled []string
-	dialer := guardedDialer(func(_ context.Context, _, address string) (net.Conn, error) {
-		dialled = append(dialled, address)
-		return nil, errors.New("not connecting in this test")
-	})
-
-	if _, err := dialer(context.Background(), "tcp", "127.0.0.1:8080"); err == nil {
-		t.Fatal("expected a loopback dial to be refused")
-	} else if !errors.Is(err, ErrUnsafeTransport) {
-		t.Fatalf("error = %v, want it to be %v", err, ErrUnsafeTransport)
-	}
-	if len(dialled) != 0 {
-		t.Fatalf("dialled %v, want the connection never attempted", dialled)
-	}
-
-	// A name is resolved *before* anything is dialled, and the refusal quotes the
-	// address it resolved to — which is what proves the check happens on the
-	// address rather than on the name.
-	_, err := dialer(context.Background(), "tcp", "localhost:8080")
-	if err == nil {
-		t.Fatal("expected a name resolving to loopback to be refused")
-	}
-	if !strings.Contains(err.Error(), "127.0.0.1") && !strings.Contains(err.Error(), "::1") {
-		t.Fatalf("error = %v, want it to quote the resolved address", err)
-	}
-	if len(dialled) != 0 {
-		t.Fatalf("dialled %v, want no connection to a refused name", dialled)
-	}
-
-	// An acceptable literal is passed through unchanged: checked, then dialled.
-	if _, err := dialer(context.Background(), "tcp", "93.184.216.34:80"); err == nil {
-		t.Fatal("expected the fixture's inner dialer to report its own failure")
-	}
-	if len(dialled) != 1 || dialled[0] != "93.184.216.34:80" {
-		t.Fatalf("dialled %v, want exactly the checked address", dialled)
-	}
-}
-
-// TestHostIsAlwaysLocalResolvesNothing asserts the property the classification
-// rests on, rather than only its answers: it consults no name service, so the
-// tunnel host's DNS — which in this threat model is the attacker's — cannot switch
-// the other checks off.
-//
-// Two assertions, because they catch different regressions. The failing resolver
-// catches any reintroduction that goes through this package's resolution seam. The
-// loopback-answering resolver catches one that trusts a lookup's verdict: a public
-// name must stay non-local even when every answer is loopback. Neither can catch a
-// reintroduction that reaches past the seam to net.DefaultResolver for a name that
-// resolves to loopback — a hermetic test has no such name to offer — which is why
-// the seam exists and why this package resolves in exactly one place.
-func TestHostIsAlwaysLocalResolvesNothing(t *testing.T) {
-	restore := lookupIPAddr
-	t.Cleanup(func() { lookupIPAddr = restore })
-
-	lookupIPAddr = func(_ context.Context, host string) ([]net.IPAddr, error) {
-		t.Errorf("HostIsAlwaysLocal resolved %q; the classification must not depend on a name service", host)
-		return nil, nil
-	}
-	for _, rawURL := range []string{
-		"https://tunnel.example/protected/tunnel",
-		"http://localhost:8443/protected/tunnel",
-		"http://127.0.0.1:8443/protected/tunnel",
-		"https://nonexistent.invalid/tunnel",
-	} {
-		_ = HostIsAlwaysLocal(rawURL)
-	}
-
-	// Every name now answers as loopback. A public name must still not be local.
-	lookupIPAddr = func(context.Context, string) ([]net.IPAddr, error) {
-		return []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}, nil
-	}
-	for _, rawURL := range []string{
-		"https://tunnel.example/protected/tunnel",
-		"https://attacker.example/tunnel",
-		// The shape of the finding: an attacker's host answering with both a
-		// public and a loopback address.
-		"https://both-answers.example/tunnel",
-	} {
-		if HostIsAlwaysLocal(rawURL) {
-			t.Fatalf("HostIsAlwaysLocal(%q) = true from a lookup; the classification must come from the spelling alone", rawURL)
-		}
 	}
 }
 

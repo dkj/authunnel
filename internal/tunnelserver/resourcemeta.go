@@ -101,11 +101,12 @@ func (c *ResourceMetadataConfig) Validate() error {
 	return nil
 }
 
-// document builds the response for one request. See resourceIdentifier for the
-// one field that is not simply configuration read back.
+// document builds the response for one request. See resourceIdentity for the one
+// field that is not simply configuration read back.
 func (c *ResourceMetadataConfig) document(r *http.Request, trustForwardedProto bool) authmeta.ProtectedResource {
-	document := authmeta.ProtectedResource{
-		Resource:                       c.resourceIdentifier(r, trustForwardedProto),
+	identifier, _ := c.resourceIdentity(r, trustForwardedProto)
+	return authmeta.ProtectedResource{
+		Resource:                       identifier,
 		AuthorizationServers:           []string{c.Issuer},
 		BearerMethodsSupported:         []string{"header"},
 		ScopesSupported:                c.Scopes,
@@ -114,75 +115,70 @@ func (c *ResourceMetadataConfig) document(r *http.Request, trustForwardedProto b
 		Audience:                       c.Audience,
 		ResourceIndicator:              c.ResourceIndicator,
 	}
-	return document
 }
 
-// resourceIdentifier is what the document declares itself to be about, and what
-// the client compares — exactly — against the identifier it used.
+// resourceIdentity returns what this server calls itself and where the document
+// describing it lives — as a pair, from one decision, because the two must agree.
 //
-// Derived per request unless --resource-url says otherwise, using the same
-// scheme/host helpers — and so the same X-Forwarded-* trust rules — as the
-// WebSocket origin check. The Host header is caller-controlled, so a caller can
-// make the document name an origin of its choosing, which is harmless because it
-// affects only that caller's own response and the client compares the result
-// against the identifier it actually used.
+// They did not. The document published ResourceURL verbatim while the challenge
+// used it only if the §3.1 derivation succeeded, falling back to the
+// request-derived URL otherwise. Validate() makes that unreachable for the server
+// binary, but NewHandler does not call Validate, so a caller constructing this
+// directly got a document saying one thing and a challenge pointing at the document
+// for another — and a client following the challenge would land on a document
+// describing a resource it is not using, and refuse it. Deriving both from one
+// branch removes the possibility rather than documenting it.
 //
-// The path is this server's own canonical tunnel path, not the one the caller
-// asked about: paths are where distinct resources live, so reflecting a caller's
-// path back would make the client's check agree with anything. The query *is*
-// reflected, because
-// this server attaches no meaning to it — it routes on path alone — so a query is
-// opaque routing information belonging to whatever sits in front, and a client
-// whose tunnel URL carries one is still talking about this same resource. Echoing
-// it is what lets such a client validate at all; it weakens nothing, since the
-// only value that can match is the one the client already had.
-func (c *ResourceMetadataConfig) resourceIdentifier(r *http.Request, trustForwardedProto bool) string {
+// The declared identifier is used only when a metadata location can actually be
+// derived from it. That is not defence in depth: it is what lets the two values
+// stay consistent when the config was never validated.
+//
+// Derived per request otherwise, using the same scheme/host helpers — and so the
+// same X-Forwarded-* trust rules — as the WebSocket origin check. The Host header is
+// caller-controlled, so a caller can make the document name an origin of its
+// choosing, which is harmless because it affects only that caller's own response and
+// the client compares the result against the identifier it actually used.
+//
+// The path is this server's own canonical tunnel path, not the one the caller asked
+// about: paths are where distinct resources live, so reflecting a caller's path back
+// would make the client's check agree with anything. The query *is* reflected,
+// because this server attaches no meaning to it — it routes on path alone — so a
+// query is opaque routing information belonging to whatever sits in front, and a
+// client whose tunnel URL carries one is still talking about this same resource.
+// Echoing it is what lets such a client validate at all; it weakens nothing, since
+// the only value that can match is the one the client already had.
+func (c *ResourceMetadataConfig) resourceIdentity(r *http.Request, trustForwardedProto bool) (identifier, metadataURL string) {
 	if c.ResourceURL != "" {
-		return c.ResourceURL
+		if derived, err := authmeta.ProtectedResourceURL(c.ResourceURL); err == nil {
+			return c.ResourceURL, derived
+		}
 	}
-	resource := url.URL{
+	requested := url.URL{
 		Scheme:   requestScheme(r, trustForwardedProto),
 		Host:     requestHost(r, trustForwardedProto),
 		Path:     tunnelResourcePath,
 		RawQuery: r.URL.RawQuery,
 	}
-	return resource.String()
+	document := requested
+	document.Path = authmeta.ProtectedResourcePath + tunnelResourcePath
+	return requested.String(), document.String()
 }
 
 // challenge builds the RFC 6750 WWW-Authenticate value that points an
 // unauthenticated caller at the document.
 //
 // It is not what the authunnel client uses: that client knows it is talking to an
-// authunnel server and derives the well-known URL from its tunnel URL, which
-// costs neither a deliberate 401 nor a hit on the pre-auth limiter. The header is
-// here so the server is legible to any RFC 9728 client, and so an operator
-// reading a failed request can see where the configuration was meant to come
-// from. Do not replace the client's derivation with a probe for this header on
-// the grounds that the header exists.
+// authunnel server and derives the well-known URL from its tunnel URL, which costs
+// neither a deliberate 401 nor a hit on the pre-auth limiter. The header is here so
+// the server is legible to any RFC 9728 client, and so an operator reading a failed
+// request can see where the configuration was meant to come from. Do not replace the
+// client's derivation with a probe for this header on the grounds that the header
+// exists.
 func (c *ResourceMetadataConfig) challenge(r *http.Request, trustForwardedProto bool) string {
-	// The query rides along for the same reason the document echoes it: the
-	// derivation in RFC 9728 §3.1 carries it, and the document this points at
-	// describes the identifier *including* the query. Omitting it would send a
-	// standards-following client to the query-less document, whose `resource`
-	// then fails that client's own equality check — a challenge that leads
-	// somewhere self-defeating is worse than none.
-	metadataURL := url.URL{
-		Scheme:   requestScheme(r, trustForwardedProto),
-		Host:     requestHost(r, trustForwardedProto),
-		Path:     authmeta.ProtectedResourcePath + tunnelResourcePath,
-		RawQuery: r.URL.RawQuery,
-	}
-	if c.ResourceURL != "" {
-		// Point at the document for the declared identifier, not for the one
-		// this request implies — the two differ in exactly the deployment
-		// --resource-url exists for.
-		if derived, err := authmeta.ProtectedResourceURL(c.ResourceURL); err == nil {
-			return fmt.Sprintf("Bearer resource_metadata=%q", derived)
-		}
-	}
-	// The quoted-string form: RFC 6750 §3 auth-param values are quoted-string,
-	// and a URL contains characters (":", "/") that are not valid tokens.
-	return fmt.Sprintf("Bearer resource_metadata=%q", metadataURL.String())
+	_, metadataURL := c.resourceIdentity(r, trustForwardedProto)
+	// The quoted-string form: RFC 6750 §3 auth-param values are quoted-string, and a
+	// URL contains characters (":", "/") that are not valid tokens.
+	return fmt.Sprintf("Bearer resource_metadata=%q", metadataURL)
 }
 
 // serveResourceMetadata answers the well-known request. Unauthenticated by
@@ -198,9 +194,10 @@ func (c *ResourceMetadataConfig) serveResourceMetadata(w http.ResponseWriter, r 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	// Small, public, and cheap to regenerate, but a client fetches it on every
-	// login rather than every invocation, so a short cache lifetime saves
-	// nothing worth the staleness after an operator changes a hint.
+	// login rather than every invocation, so a short cache lifetime saves nothing
+	// worth the staleness after an operator changes a hint.
 	w.Header().Set("Cache-Control", "no-store")
+	// The GET patterns this is registered under also match HEAD, per Go's mux.
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return

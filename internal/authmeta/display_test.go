@@ -16,14 +16,14 @@ import (
 // string, so nothing upstream of display rejects it.
 const injectedControlBytes = "\x1b[2K\rall is well"
 
-// assertNoRawControlBytes checks that attacker-chosen bytes were escaped rather than
+// assertEscapedForDisplay checks that attacker-chosen bytes were escaped rather than
 // passed through.
 //
 // The hazard is concrete rather than theoretical: an escape sequence reaching a
 // terminal can erase or rewrite the line that is reporting it, and a carriage return
 // can overwrite it, so a refusal can be made to read as a success. The same bytes in
 // a log aggregator forge a neighbouring record.
-func assertNoRawControlBytes(t *testing.T, what, text string) {
+func assertEscapedForDisplay(t *testing.T, what, text string) {
 	t.Helper()
 	if strings.ContainsAny(text, "\x1b\r\x00") {
 		t.Fatalf("%s contains raw control bytes: %q", what, text)
@@ -43,7 +43,7 @@ func TestHTTPErrorBodyIsEscaped(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the 403 to be reported")
 	}
-	assertNoRawControlBytes(t, "the HTTP error", err.Error())
+	assertEscapedForDisplay(t, "the HTTP error", err.Error())
 }
 
 func TestDeclaredIssuerIsEscapedInTheMismatch(t *testing.T) {
@@ -58,5 +58,5 @@ func TestDeclaredIssuerIsEscapedInTheMismatch(t *testing.T) {
 	if !errors.Is(err, oidc.ErrIssuerInvalid) {
 		t.Fatalf("error = %v, want the issuer mismatch", err)
 	}
-	assertNoRawControlBytes(t, "the mismatch error", err.Error())
+	assertEscapedForDisplay(t, "the mismatch error", err.Error())
 }

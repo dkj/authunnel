@@ -93,7 +93,7 @@ The following properties are enforced by default with no silent bypass. Where a 
 
 - **Bearer token validation** at the WebSocket layer before any SOCKS5 connection can be attempted: signature, issuer, audience (`aud`), expiry (`exp`), non-empty subject (`sub`), not-before (`nbf` must be usable at admission time, with a 30-second clock-skew allowance), and sane issued-at (`iat` must not be meaningfully in the future). The bearer token is length-capped at 8 KiB and the `Authorization` header at 8 KiB + 64 bytes before the verifier runs, so anonymous callers cannot push oversized payloads onto the JWT parser. The `http.Server` request-header memory cap is also lowered from Go's 1 MiB default to 16 KiB as a defence-in-depth boundary against oversized non-bearer headers.
 - **Bounded issuer metadata and JWKS fetches**: both the server-side validator and the managed client share an HTTP transport with conservative dial, TLS-handshake, response-header, and overall timeouts. A stalled or unreachable issuer fails closed instead of holding startup or in-flight token validation open. Server startup wraps metadata discovery in a 30-second context, so a misconfigured issuer surfaces as a fast `create token validator` error. Under `--oidc-jwks-uri` there is no startup fetch to bound, so that check moves to the first authenticated request instead.
-- **No internal-address pivot from discovered configuration**: addresses named by a *remote* metadata document — the issuer, the authorization-server metadata URL, and the endpoints it advertises — are refused when they resolve into the built-in protected set (loopback, IPv4/IPv6 link-local including cloud IMDS, unspecified, multicast). Enforced at each layer that can see something the others cannot: a resolution check on the value itself (the only protection for the authorization URL handed to the OS), a per-request destination check, and — on a directly-dialled connection — a dial-time check that connects to the address it verified, so a name cannot resolve differently a moment later. Through an HTTP proxy the address checks describe a lookup the connection will not use, so what protects you there is TLS: the client issues `CONNECT` and then validates the origin's certificate against the name it asked for, which a rebound internal service cannot present. **Proxied `https` is therefore allowed and bound by the certificate; proxied plaintext is refused**, because it has nothing to be checked against. Plaintext discovery already requires `--insecure-oidc-issuer`, so in a normal deployment this costs nothing — zero-configuration discovery works behind a proxy. One limit: a TLS-terminating proxy whose CA you installed *is* the origin as far as validation goes, and no check here substitutes for that proxy's own egress policy. Private networks (RFC1918, CGNAT, IPv6 ULA) are deliberately *not* refused — an authorization server on an internal network is an ordinary deployment. The guard applies only to discovered values, and is relaxed only when the tunnel URL names this machine *by spelling* — a **loopback** literal, or `localhost` per RFC 6761 — which is the local-development case. That set is narrower than the refused set on purpose: link-local (including cloud IMDS), multicast and unspecified addresses are refused as destinations but are *not* this machine, and treating them as local would mean a tunnel URL pointing at the metadata service switched off the guard protecting it. That decision resolves nothing on purpose: the tunnel host's DNS belongs to the party the guard constrains, so a hostname answering with both a public and a loopback address would otherwise switch the guard off. A development host reached through a private alias should pass `--oidc-issuer` instead.
+- **No internal-address pivot from discovered configuration**: an address named by a *remote* metadata document — the issuer, the authorization-server metadata URL, or an endpoint it advertises — is refused when it resolves into the built-in protected set (loopback, IPv4/IPv6 link-local including cloud IMDS, unspecified, multicast). Private networks are deliberately not refused, and the guard applies only to values the tunnel server chose. Enforced at three layers, with a documented limit behind an HTTP proxy: [Discovered addresses and the internal-address guard](docs/DEPLOYMENT.md#discovered-addresses-and-the-internal-address-guard).
 - **No origin change on the auth path**: a metadata fetch or a token request refuses to follow a redirect off the origin it started on. Validating where a fetch begins is worth nothing if it may end somewhere else — an open redirect on the expected host would otherwise let a third party supply the document, and on the token endpoint a 307 preserves the body, so a cross-origin hop would forward a refresh token or an authorization code.
 - **No transport downgrade on the auth path**: neither side will fetch credentials or signing keys over a weaker transport than the metadata that named them. An `https` metadata document may not advertise plaintext endpoints, and redirects may not move a metadata, JWKS, or token fetch off `https`. Advertised endpoints must be `http(s)` URLs with a host in every mode, including under `--insecure-oidc-issuer` — this is what keeps a scheme like `file://` out of the authorization URL that the client hands to the OS. On the client, a refusal is terminal rather than falling back to an interactive login that would fail the same way. The PKCE loopback callback stays plaintext by design (RFC 8252). Details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path).
 - **Subject pinning during token refresh**: the server rejects any refreshed token whose `sub` differs from the original tunnel's subject.
@@ -128,25 +128,14 @@ it is a real change in what the tunnel URL controls:
   authorization server, which the user sees — never a silent hand-off of an
   already-issued refresh token, because a cached credential whose recorded issuer,
   client, or metadata URL no longer matches is discarded rather than reused.
-- **How to decline it, and exactly what that pins.** Pass `--oidc-issuer`: the client
-  then refuses a document naming a different issuer, and — the part worth stating,
-  because it was missing at first — it also refuses to take the *location* of that
-  issuer's metadata from the tunnel server unless the published location is on the
-  issuer's own origin. Without that second rule, a hostile server could echo your
-  issuer, relocate its metadata document, and choose the authorization and token
-  endpoints anyway. So a pinned issuer pins where the login goes.
-  Discovery-input filtering follows the same line: the transport, address and downgrade
-  rules apply to what the *tunnel server* chose, so a configured issuer stays unfiltered
-  whether or not some other flag was also supplied — omitting only `--oidc-client-id`
-  does not turn your own loopback issuer into remote input.
-  What it does **not** pin is what the token is *for*: the audience and RFC 8707
-  resource are still taken from the document when you do not supply them, so an
-  operator who does not trust the tunnel URL should pass `--oidc-audience` or
-  `--oidc-resource` too. To refuse the lookup
-  as a standing rule rather than as a side effect of having configured everything,
-  add `--no-resource-metadata` on the client: the configuration must then be complete,
-  checked at startup. Server-side, the flag of the same name switches publication off
-  entirely.
+- **How to decline it.** Pass `--oidc-issuer` and the client refuses a document naming
+  a different one — and refuses to let the tunnel server relocate that issuer's metadata
+  off its own origin, without which the pin would be hollow. It does not pin what the
+  token is *for*, so add `--oidc-audience` or `--oidc-resource` if you do not trust the
+  tunnel URL, and `--no-resource-metadata` to refuse the lookup as a standing rule
+  rather than as a side effect of having configured everything. Exactly what each of
+  those pins:
+  [What `--oidc-issuer` pins](docs/DEPLOYMENT.md#what---oidc-issuer-pins-precisely).
 
 ### Operator-controlled
 

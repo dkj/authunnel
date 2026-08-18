@@ -182,18 +182,40 @@ func SameOrigin(a, b string) (bool, error) {
 
 func originOf(u *url.URL) string {
 	scheme := strings.ToLower(u.Scheme)
+	return scheme + "://" + NormalizeAuthority(scheme, u)
+}
+
+// NormalizeAuthority reduces a URL's authority to the form comparisons run on:
+// host case-folded, an IP literal canonicalised, a redundant default port dropped,
+// and an IPv6 literal re-bracketed.
+//
+// Exported because it had a second implementation in internal/authmeta, and the two
+// had already drifted: this one omitted the IP canonicalisation, so SameOrigin
+// judged https://[0:0:0:0:0:0:0:1] and https://[::1] to be different origins while
+// the resource-identifier comparison judged them the same. A published metadata URL
+// on an issuer's own origin, spelled with a non-canonical IPv6 literal, would
+// therefore have been disregarded. SameOrigin's doc comment already claimed one
+// definition; this makes that true rather than aspirational.
+func NormalizeAuthority(scheme string, u *url.URL) string {
 	host := strings.ToLower(u.Hostname())
+	// Canonical form, so the many spellings of one IPv6 address compare equal —
+	// RFC 3986 §6.2.2 normalisation, and the part that used to be missing here.
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
 	port := u.Port()
-	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+	if (strings.EqualFold(scheme, "https") && port == "443") || (strings.EqualFold(scheme, "http") && port == "80") {
 		port = ""
 	}
 	if port != "" {
-		return scheme + "://" + net.JoinHostPort(host, port)
+		return net.JoinHostPort(host, port)
 	}
 	if strings.Contains(host, ":") {
-		return scheme + "://[" + host + "]"
+		// A bracket-less IPv6 literal would be ambiguous against a host:port form
+		// once these are compared as strings.
+		return "[" + host + "]"
 	}
-	return scheme + "://" + host
+	return host
 }
 
 // CheckEndpointURL validates an endpoint named by a metadata document before it
@@ -215,7 +237,7 @@ func CheckEndpointURL(label, rawURL string) error {
 	if rawURL == "" {
 		return refusef("issuer metadata did not advertise %s", label)
 	}
-	_, err := parseAuthURL(label, rawURL)
+	_, err := ParseAuthURL(label, rawURL)
 	return err
 }
 
@@ -238,7 +260,7 @@ func CheckConfiguredURL(label, rawURL string, allowPlaintext bool) error {
 	if rawURL == "" {
 		return refusef("%s is required", label)
 	}
-	u, err := parseAuthURL(label, rawURL)
+	u, err := ParseAuthURL(label, rawURL)
 	if err != nil {
 		return err
 	}
@@ -248,10 +270,15 @@ func CheckConfiguredURL(label, rawURL string, allowPlaintext bool) error {
 	return nil
 }
 
-// parseAuthURL holds the one definition of what a usable auth URL looks like:
-// http or https, absolute, with a host. Both exported checks build on it so the
-// rule cannot drift between configured and discovered URLs.
-func parseAuthURL(label, rawURL string) (*url.URL, error) {
+// ParseAuthURL holds the one definition of what a usable auth URL looks like:
+// http or https, absolute, with a host. Every check here builds on it, and
+// internal/authmeta uses it for resource identifiers, so the rule cannot drift
+// between configured URLs, discovered ones, and identifiers.
+//
+// label is the noun for the error message — a flag name, a metadata field, or
+// "resource identifier" — which is why this takes one rather than hard-coding a
+// vocabulary that only suits its first caller.
+func ParseAuthURL(label, rawURL string) (*url.URL, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, refusef("%s %q is not a valid URL: %v", label, rawURL, err)

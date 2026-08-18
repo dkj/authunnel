@@ -169,12 +169,32 @@ Flags and their environment variable equivalents:
   --token-audience <string>  Audience required in validated access tokens (env: TOKEN_AUDIENCE)
   --listen-addr <addr>       Listen address (env: LISTEN_ADDR, default: :8443 for TLS-files, :443 for ACME, :8080 for plaintext-behind-reverse-proxy)
 
+  --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)
+  --allow <rule>             Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated).
+                             Rule formats: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi.
+                             IPv6 addresses must use bracketed notation, e.g. [::1]:22.
+                             At least one --allow rule is required unless --allow-open-egress is set.
+  --allow-open-egress        Explicit opt-in for running with no allowlist; authenticated clients may CONNECT to any
+                             destination the server process can reach (env: ALLOW_OPEN_EGRESS=true). Mutually exclusive
+                             with --allow. Use only when the risk of arbitrary egress is acceptable for the deployment.
+  --ip-block <range>         Resolved-IP deny-list applied after --allow (repeatable; env: IP_BLOCK comma-separated).
+                             Accepts CIDR (127.0.0.0/8), bare IP (127.0.0.1), or bracketed IPv6 ([::1] / [fe80::/10]).
+                             When neither --ip-block nor --no-ip-block is set, defaults to a built-in protected set:
+                             loopback, IPv4/IPv6 link-local (incl. 169.254.169.254 IMDS), unspecified, and multicast.
+                             RFC1918, CGNAT, and IPv6 ULA are NOT in the default set. Applies in both restrictive
+                             and --allow-open-egress modes; deny wins over --allow.
+  --no-ip-block              Disable the resolved-IP guard entirely (env: NO_IP_BLOCK=true). Mutually exclusive with
+                             --ip-block. Use only when the deployment legitimately needs to reach addresses in the
+                             default protected set and a tighter --ip-block list is not sufficient.
+
 Client configuration published to clients (RFC 9728 protected-resource metadata):
 
   By default the server publishes GET /.well-known/oauth-protected-resource, naming
-  --oidc-issuer as the authorization server for this tunnel, so a client can be run with
-  --tunnel-url as its only flag. The hints below fill in the rest of what a client would
-  otherwise be given by hand; each is optional and unset hints are simply absent.
+  --oidc-issuer as the authorization server for this tunnel, so clients need not be told
+  where to authenticate. For a client to run with --tunnel-url as its *only* flag it also
+  needs a client ID, which means setting --client-id below: without it a client that
+  supplies none of its own fails at startup. Each hint is optional and unset hints are
+  simply absent from the document.
 
   --resource-url <url>       Externally visible resource identifier of this tunnel endpoint, e.g.
                              https://tunnel.example/protected/tunnel (env: RESOURCE_URL). Published
@@ -194,23 +214,6 @@ Client configuration published to clients (RFC 9728 protected-resource metadata)
   --no-resource-metadata     Do not publish the document, and omit the WWW-Authenticate challenge that
                              points at it (env: NO_RESOURCE_METADATA=true). Clients then need their
                              own --oidc-issuer and --oidc-client-id.
-  --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)
-  --allow <rule>             Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated).
-                             Rule formats: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi.
-                             IPv6 addresses must use bracketed notation, e.g. [::1]:22.
-                             At least one --allow rule is required unless --allow-open-egress is set.
-  --allow-open-egress        Explicit opt-in for running with no allowlist; authenticated clients may CONNECT to any
-                             destination the server process can reach (env: ALLOW_OPEN_EGRESS=true). Mutually exclusive
-                             with --allow. Use only when the risk of arbitrary egress is acceptable for the deployment.
-  --ip-block <range>         Resolved-IP deny-list applied after --allow (repeatable; env: IP_BLOCK comma-separated).
-                             Accepts CIDR (127.0.0.0/8), bare IP (127.0.0.1), or bracketed IPv6 ([::1] / [fe80::/10]).
-                             When neither --ip-block nor --no-ip-block is set, defaults to a built-in protected set:
-                             loopback, IPv4/IPv6 link-local (incl. 169.254.169.254 IMDS), unspecified, and multicast.
-                             RFC1918, CGNAT, and IPv6 ULA are NOT in the default set. Applies in both restrictive
-                             and --allow-open-egress modes; deny wins over --allow.
-  --no-ip-block              Disable the resolved-IP guard entirely (env: NO_IP_BLOCK=true). Mutually exclusive with
-                             --ip-block. Use only when the deployment legitimately needs to reach addresses in the
-                             default protected set and a tighter --ip-block list is not sufficient.
 
 TLS mode (choose exactly one):
 

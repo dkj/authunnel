@@ -75,7 +75,7 @@ type browserOpener func(context.Context, string) error
 // what it is minted for*: which authorization server, located how, on behalf of
 // which client, for which audience and scopes.
 //
-// It exists as a type because the same six values are needed in three places
+// It exists as a type because the same seven values are needed in three places
 // that must not drift apart — the token cache's identity, the comparison that
 // decides whether a cached refresh token may be reused, and the parameters of
 // the authorization request. Enumerating them at each site is how a seventh gets
@@ -176,9 +176,10 @@ type managedOIDCTokenSource struct {
 }
 
 // tokenCache is intentionally a single JSON document so developers can inspect
-// and delete it easily during debugging. Cache entries are scoped to issuer,
-// metadata URL, client ID, audience, resource, and scopes to avoid reusing a
-// credential in a context it was not obtained for.
+// and delete it easily during debugging. Cache entries are scoped to the resource
+// URL discovery ran against, the issuer, the metadata URL, the client ID, the
+// audience, the resource, and the scopes — to avoid reusing a credential in a context
+// it was not obtained for.
 //
 // The metadata URL belongs in that identity, and an earlier version of this
 // comment argued the opposite — that the override only relocates the document,
@@ -627,9 +628,11 @@ func (s *managedOIDCTokenSource) authorizationServerIsRemotelyChosen() bool {
 //     contradiction — but a *published* one is now bounded, which is the point
 //     above.
 //
-// Every URL taken from the document goes through the configured-URL rule plus the
-// downgrade rule relative to the tunnel URL: an https tunnel may not send this
-// client to a plaintext authorization server.
+// Every URL taken from the document is checked for shape — a usable http(s) URL —
+// whoever chose it. The transport, downgrade and address rules apply on top of that
+// only when the tunnel server is the party that chose where the authorization server
+// is; see authorizationServerIsRemotelyChosen for why that distinction is the subject
+// of the rule rather than an exemption from it.
 func (s *managedOIDCTokenSource) applyResourceMetadata(ctx context.Context, identity *oidcIdentity, document *authmeta.ProtectedResource) error {
 	if err := s.adoptAuthorizationServer(ctx, identity, document.AuthorizationServer()); err != nil {
 		return err

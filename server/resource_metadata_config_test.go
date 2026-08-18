@@ -163,10 +163,11 @@ func TestMalformedClientHintsFailAtStartup(t *testing.T) {
 // a published identifier nothing can use.
 func TestResourceURLRejectedAtStartupWhenUnfetchable(t *testing.T) {
 	for name, value := range map[string]string{
-		"ftp":       "ftp://tunnel.example/protected/tunnel",
-		"websocket": "wss://tunnel.example/protected/tunnel",
-		"relative":  "/protected/tunnel",
-		"fragment":  "https://tunnel.example/protected/tunnel#frag",
+		"ftp":            "ftp://tunnel.example/protected/tunnel",
+		"websocket":      "wss://tunnel.example/protected/tunnel",
+		"relative":       "/protected/tunnel",
+		"fragment":       "https://tunnel.example/protected/tunnel#frag",
+		"bare delimiter": "https://tunnel.example/protected/tunnel#",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := parseServerConfig(metadataServerArgs("--resource-url", value), func(string) string { return "" })

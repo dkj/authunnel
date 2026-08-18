@@ -82,6 +82,9 @@ Current fast coverage includes:
 - a configured loopback issuer surviving a discovery run that happened only because `--oidc-client-id` was missing, with the guard that would otherwise refuse it not installed — and the zero-config control still refusing the same address
 - an unusable published metadata URL being announced and ignored rather than failing the flow, across a hint refused by the shape rule and one refused by the address rule, since only the first detects the ordering
 - a same-origin open redirect on the issuer's host failing to relocate the metadata document, which is the bypass of the pin below
+- the document and the `WWW-Authenticate` challenge agreeing on which resource they describe, including for a `--resource-url` that `Validate` would have rejected — `NewHandler` does not validate, so the two are derived from one decision rather than trusted to match
+- `SameOrigin` and the shared authority normalisation agreeing on equivalent spellings of one origin, IPv6 literals included, after the two implementations of that rule were found to have drifted
+- `PinRedirectOrigin` layering on a caller's own redirect policy rather than replacing it — the contract `RefuseTransportDowngrade` already had a test for, and this one did not
 - a cross-origin redirect on the token endpoint refused, with a *working* https mirror on the other origin recording nothing, so the refusal is attributable to the policy rather than to a broken target
 - a pinned issuer refusing a relocated metadata document, with the assertion on the resolved *endpoints* rather than on an error, since the failure mode is a flow that succeeds against the wrong server — plus the same-origin case still working and the unpinned cross-origin case still allowed, which is what distinguishes gating on the configured issuer from gating on the resolved one
 - the relaxation set being a strict subset of the refusal set, asserted as a property so future additions to `ipblock.Default()` cannot inherit "local"
@@ -99,6 +102,21 @@ Current fast coverage includes:
 - admission controls: global concurrent cap, per-user concurrent cap, per-user rate limiting (fake-clock deterministic), dial timeout against blackholed destinations, handler-level rejection with correct HTTP status and `Retry-After`
 - egress posture: startup rejection when neither `--allow` rules nor `--allow-open-egress` is present, mutual exclusion between the two modes, env-var equivalents
 - filesystem safety: unix socket directory permission checks (group/world-writable rejection, foreign-owner rejection), stale-socket cleanup refusal on non-socket paths, umask-tightened socket creation, token cache and lock directory safety
+
+## Known coverage gaps
+
+Recorded rather than implied, so a reader can tell a deliberate limit from an oversight:
+
+- `main`'s single call to `installSafeLogging` is not reachable from a test, so that one
+  line is uncovered. Everything downstream of it is covered, and the wiring function it
+  calls has its own test.
+- `ipblock.Parse` is exported with no cross-package caller; it is used only by
+  `ParseListFromCSV` and the flag type. Predates the move out of `tunnelserver`.
+- Two tests rely on the system resolver mapping `localhost` to loopback, and one on
+  `.invalid` not resolving. Both hold on any normal host; a captive or wildcard DNS
+  resolver would break the latter.
+- The tests that capture log output mutate process-global `log` state, so they are not
+  safe to run in parallel with anything that logs.
 
 ## Local Keycloak Test Environment
 

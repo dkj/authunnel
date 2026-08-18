@@ -350,6 +350,7 @@ func TestResourceURLValidatedAsFetchable(t *testing.T) {
 		"no host":          "https:///protected/tunnel",
 		"relative":         "/protected/tunnel",
 		"fragment":         "https://tunnel.example/protected/tunnel#frag",
+		"bare delimiter":   "https://tunnel.example/protected/tunnel#",
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := &ResourceMetadataConfig{Issuer: "https://idp.example", ResourceURL: resourceURL}
@@ -457,5 +458,79 @@ func TestMetadataIsNotServedUnderTheProtectedPrefix(t *testing.T) {
 	}
 	if location := redirected.Header().Get("Location"); !strings.HasPrefix(location, "/protected/") {
 		t.Fatalf("Location = %q, want the cleaned path to stay under the authenticated prefix", location)
+	}
+}
+
+// TestDocumentAndChallengeAgreeOnAnUnvalidatedConfig pins the invariant that
+// replaced a divergence: whatever identifier the document declares, the challenge
+// points at the document for *that* identifier.
+//
+// NewHandler does not call Validate — only the server binary does — so a config with
+// an unusable ResourceURL reaches the handler. It used to publish that value verbatim
+// while the challenge fell back to the request-derived URL, so a client following the
+// challenge landed on a document about a resource it was not using and refused it.
+func TestDocumentAndChallengeAgreeOnAnUnvalidatedConfig(t *testing.T) {
+	for name, resourceURL := range map[string]string{
+		"valid and declared": "https://tunnel.example/authunnel/protected/tunnel",
+		"unusable scheme":    "ftp://tunnel.example/protected/tunnel",
+		"no host":            "https://",
+		"fragment":           "https://tunnel.example/protected/tunnel#frag",
+		"unset":              "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &ResourceMetadataConfig{Issuer: "https://idp.example", ResourceURL: resourceURL}
+			mux := resourceMetadataHandler(t, HandlerOptions{ResourceMetadata: cfg})
+
+			request := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, request)
+			challenge := recorder.Header().Get("WWW-Authenticate")
+			advertised := strings.Trim(strings.TrimPrefix(challenge, "Bearer resource_metadata="), `"`)
+			if advertised == "" {
+				t.Fatalf("challenge %q carries no URL", challenge)
+			}
+
+			// Follow it, exactly as an RFC 9728 client would, and check the
+			// document it reaches describes the identifier it would compare.
+			served, document := fetchDocumentForTest(t, mux, advertised, nil)
+			if served.Code != http.StatusOK {
+				t.Fatalf("the advertised URL %s returned %d", advertised, served.Code)
+			}
+			derived, err := authmeta.ProtectedResourceURL(document.Resource)
+			if err != nil {
+				t.Fatalf("the published resource %q is not one a client could derive a location from: %v", document.Resource, err)
+			}
+			if derived != advertised {
+				t.Fatalf("document declares %q (metadata at %q) but the challenge advertises %q",
+					document.Resource, derived, advertised)
+			}
+		})
+	}
+}
+
+// TestResourceMetadataServesHeadAndForbidsCaching covers two lines that were live
+// but unasserted: Go's mux routes HEAD to a GET pattern, and the document must not be
+// cached, since an operator changing a hint expects clients to see it.
+func TestResourceMetadataServesHeadAndForbidsCaching(t *testing.T) {
+	mux := resourceMetadataHandler(t, HandlerOptions{
+		ResourceMetadata: &ResourceMetadataConfig{Issuer: "https://idp.example"},
+	})
+
+	recorder, _ := fetchDocumentForTest(t, mux, authmeta.ProtectedResourcePath, nil)
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	request := httptest.NewRequest(http.MethodHead, authmeta.ProtectedResourcePath, nil)
+	head := httptest.NewRecorder()
+	mux.ServeHTTP(head, request)
+	if head.Code != http.StatusOK {
+		t.Fatalf("HEAD = %d, want 200", head.Code)
+	}
+	if head.Body.Len() != 0 {
+		t.Fatalf("HEAD returned %d body bytes, want none", head.Body.Len())
+	}
+	if got := head.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("HEAD Content-Type = %q, want the same as GET", got)
 	}
 }

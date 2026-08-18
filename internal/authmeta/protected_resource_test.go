@@ -52,6 +52,11 @@ func TestProtectedResourceURLRejectsUnusableResource(t *testing.T) {
 		// and quietly deriving a location for a *different* value than the one
 		// handed in is how the derived URL and the compared URL drift apart.
 		"https://tunnel.example/protected/tunnel#frag",
+		// A *bare* delimiter, which parses with an empty Fragment and no other
+		// trace — so a check on the parsed field alone accepts it and normalisation
+		// then drops the "#". The "#frag" case above cannot detect that.
+		"https://tunnel.example/protected/tunnel#",
+		"https://tunnel.example/protected/tunnel?tenant=a#",
 	} {
 		if _, err := ProtectedResourceURL(resource); err == nil {
 			t.Fatalf("ProtectedResourceURL(%q): expected an error", resource)
@@ -220,8 +225,38 @@ func TestNormalizeResourceIdentifier(t *testing.T) {
 			t.Fatalf("normalisation collapsed %q and %q to %q", tt.a, tt.b, first)
 		}
 	}
+	// IPv6 and non-canonical literals. These were absent, and the branch that
+	// handles them is load-bearing rather than cosmetic: without the bracketing, a
+	// port-less IPv6 identifier fails to normalise at all, so every such tunnel URL
+	// would fail discovery outright.
+	for _, tt := range []struct{ in, want string }{
+		{"https://[::1]/x", "https://[::1]/x"},
+		{"https://[0:0:0:0:0:0:0:1]/x", "https://[::1]/x"},
+		{"https://[::1]:8443/x", "https://[::1]:8443/x"},
+		{"https://[::FFFF:127.0.0.1]/x", "https://127.0.0.1/x"},
+		// Left alone rather than canonicalised: net.ParseIP rejects leading zeros
+		// (they invite octal ambiguity), so this is not recognised as an address
+		// and stays verbatim — which keeps it *unequal* to 127.0.0.1, the
+		// conservative direction for an equality check.
+		{"https://127.000.000.1/x", "https://127.000.000.1/x"},
+	} {
+		got, err := NormalizeResourceIdentifier(tt.in)
+		if err != nil {
+			t.Fatalf("NormalizeResourceIdentifier(%q): %v", tt.in, err)
+		}
+		if got != tt.want {
+			t.Fatalf("NormalizeResourceIdentifier(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+	// And the derivation must survive them too.
+	if got, err := ProtectedResourceURL("https://[::1]/protected/tunnel"); err != nil || got != "https://[::1]/.well-known/oauth-protected-resource/protected/tunnel" {
+		t.Fatalf("ProtectedResourceURL for an IPv6 identifier = (%q, %v)", got, err)
+	}
+
 	for _, invalid := range []string{
 		"https://tunnel.example/t#frag",
+		"https://tunnel.example/t#",
+		"https://tunnel.example/t?q=1#",
 		"/relative",
 		"tunnel.example",
 		// Not merely un-idiomatic: a client derives the metadata location from
@@ -264,7 +299,7 @@ func TestValidateClientID(t *testing.T) {
 			t.Fatalf("ValidateClientID(%q) = %v, want accepted", valid, err)
 		}
 	}
-	for _, invalid := range []string{"", "tab\there", "newline\n", "café", strings.Repeat("a", maxClientIDBytes+1)} {
+	for _, invalid := range []string{"", "tab\there", "newline\n", "café", strings.Repeat("a", maxHintBytes+1)} {
 		if err := ValidateClientID(invalid); err == nil {
 			t.Fatalf("ValidateClientID(%q): expected rejection", invalid)
 		}
@@ -293,7 +328,15 @@ func TestValidateResourceIndicator(t *testing.T) {
 	if err := ValidateResourceIndicator("https://api.example/v1"); err != nil {
 		t.Fatalf("ValidateResourceIndicator: %v", err)
 	}
-	for _, invalid := range []string{"https://api.example#frag", "/api", "api.example"} {
+	for _, invalid := range []string{
+		"https://api.example#frag",
+		// This check was always raw-string based and so never had the
+		// empty-fragment hole that NormalizeResourceIdentifier briefly acquired.
+		// Pinned here so the two stay consistent.
+		"https://api.example#",
+		"/api",
+		"api.example",
+	} {
 		if err := ValidateResourceIndicator(invalid); err == nil {
 			t.Fatalf("ValidateResourceIndicator(%q): expected rejection", invalid)
 		}

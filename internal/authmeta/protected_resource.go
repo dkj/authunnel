@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -96,6 +95,16 @@ func ProtectedResourceURL(resourceURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return deriveProtectedResourceURL(normalized)
+}
+
+// deriveProtectedResourceURL applies the §3.1 derivation to an identifier already
+// known to satisfy NormalizeResourceIdentifier.
+//
+// Separate from the validation so a caller that has normalised once does not pay
+// for it again — and, more to the point, so it is obvious that the second call
+// cannot fail rather than leaving an unreachable error check to puzzle over.
+func deriveProtectedResourceURL(normalized string) (string, error) {
 	u, err := url.Parse(normalized)
 	if err != nil {
 		return "", err
@@ -106,7 +115,7 @@ func ProtectedResourceURL(resourceURL string) (string, error) {
 	// that RFC 3986 keeps distinct — see NormalizeResourceIdentifier.
 	derived, err := url.Parse(u.Scheme + "://" + u.Host + ProtectedResourcePath + strings.TrimSuffix(u.EscapedPath(), "/"))
 	if err != nil {
-		return "", fmt.Errorf("derive metadata URL for %q: %w", resourceURL, err)
+		return "", fmt.Errorf("derive metadata URL for %q: %w", normalized, err)
 	}
 	derived.RawQuery = u.RawQuery
 	return derived.String(), nil
@@ -138,7 +147,13 @@ func ProtectedResourceURL(resourceURL string) (string, error) {
 // one side is built from an HTTP Host header and the other from a command-line
 // URL. Path and query are compared verbatim.
 func FetchProtectedResource(ctx context.Context, httpClient *http.Client, resourceURL string) (*ProtectedResource, error) {
-	documentURL, err := ProtectedResourceURL(resourceURL)
+	// Normalised once: the derivation and the comparison both need it, and doing
+	// it twice left a second error check that could not fire.
+	using, err := NormalizeResourceIdentifier(resourceURL)
+	if err != nil {
+		return nil, err
+	}
+	documentURL, err := deriveProtectedResourceURL(using)
 	if err != nil {
 		return nil, err
 	}
@@ -152,10 +167,6 @@ func FetchProtectedResource(ctx context.Context, httpClient *http.Client, resour
 	declared, err := NormalizeResourceIdentifier(document.Resource)
 	if err != nil {
 		return nil, fmt.Errorf("protected resource metadata at %s: %w", documentURL, err)
-	}
-	using, err := NormalizeResourceIdentifier(resourceURL)
-	if err != nil {
-		return nil, err
 	}
 	if declared != using {
 		return nil, fmt.Errorf("protected resource metadata at %s describes %q, not %q; refusing to take configuration from a document about another resource",
@@ -190,28 +201,33 @@ func FetchProtectedResource(ctx context.Context, httpClient *http.Client, resour
 // silently discarding part of a value that is about to be compared for equality
 // is the wrong instinct here.
 func NormalizeResourceIdentifier(rawURL string) (string, error) {
-	u, err := url.Parse(rawURL)
+	// The shape rule lives in authhttp: http or https, absolute, with a host. It
+	// used to be re-implemented here, which is two definitions of one rule in a
+	// package whose whole argument is that there should be one.
+	u, err := authhttp.ParseAuthURL("resource identifier", rawURL)
 	if err != nil {
-		return "", fmt.Errorf("resource identifier %q is not a valid URL: %w", rawURL, err)
+		return "", err
 	}
-	if u.Host == "" || u.Opaque != "" {
-		return "", fmt.Errorf("resource identifier %q is not an absolute URL with a host", rawURL)
-	}
-	// http(s) only, and not merely as a syntax preference: an authunnel client
-	// derives the metadata location from this value and fetches it over HTTP, so
-	// any other scheme names a document nothing can retrieve. Enforced here rather
-	// than at each caller so the server cannot start advertising an identifier its
-	// own clients would refuse.
-	if scheme := strings.ToLower(u.Scheme); scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("resource identifier %q must use http or https, got %q", rawURL, u.Scheme)
-	}
+	// Refused rather than stripped: identifiers do not carry one, and silently
+	// discarding part of a value that is about to be compared for equality is the
+	// wrong instinct.
+	//
+	// **Both halves are needed, and the raw-string half is the one that is easy to
+	// talk yourself out of.** url.Parse only populates Fragment from a literal "#",
+	// so it is true that a non-empty Fragment implies a "#" was present — but the
+	// converse is what this check is for, and it does not hold: a URL ending in a
+	// bare "#" parses with Fragment == "" and leaves no other trace of the
+	// delimiter. Note the asymmetry with the query, where a bare "?" does record
+	// itself, in ForceQuery; there is no ForceFragment. So dropping the raw-string
+	// test made "https://h/x#" normalise to "https://h/x" — the silent discarding
+	// the paragraph above forbids — and made --resource-url accept it server-side.
 	if u.Fragment != "" || strings.Contains(rawURL, "#") {
 		return "", fmt.Errorf("resource identifier %q must not contain a fragment", rawURL)
 	}
 	scheme := strings.ToLower(u.Scheme)
-	// Re-parsed from the escaped path for the reason in the doc comment: assigning
-	// Path would re-encode from the decoded form and lose an encoded separator.
-	normalized, err := url.Parse(scheme + "://" + normalizeAuthority(scheme, u) + u.EscapedPath())
+	// Re-parsed from the escaped path so an encoded separator survives: assigning
+	// Path would re-encode from the decoded form and lose it.
+	normalized, err := url.Parse(scheme + "://" + authhttp.NormalizeAuthority(scheme, u) + u.EscapedPath())
 	if err != nil {
 		return "", fmt.Errorf("resource identifier %q could not be normalised: %w", rawURL, err)
 	}
@@ -219,34 +235,16 @@ func NormalizeResourceIdentifier(rawURL string) (string, error) {
 	return normalized.String(), nil
 }
 
-// normalizeAuthority lower-cases the host, canonicalises an IP literal, and drops
-// a port that is the scheme's default.
-func normalizeAuthority(scheme string, u *url.URL) string {
-	host := strings.ToLower(u.Hostname())
-	if ip := net.ParseIP(host); ip != nil {
-		host = ip.String()
-	}
-	port := u.Port()
-	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
-		port = ""
-	}
-	if port != "" {
-		return net.JoinHostPort(host, port)
-	}
-	if strings.Contains(host, ":") {
-		// A bracket-less IPv6 literal would be ambiguous against a host:port
-		// form once these are compared as strings.
-		return "[" + host + "]"
-	}
-	return host
-}
-
-// maxClientIDBytes and maxScopeBytes bound values that arrive in a metadata
-// document and leave in an authorization URL — which is handed to the OS scheme
-// dispatcher, not merely fetched. Both limits are far above any real value.
+// maxHintBytes and maxScopeBytes bound values that arrive in a metadata document
+// and leave in an authorization URL — which is handed to the OS scheme dispatcher,
+// not merely fetched. Both limits are far above any real value.
+//
+// maxHintBytes covers the client ID and the audience, which is why it is not named
+// for either: it was maxHintBytes while bounding both, so the name described
+// half its use.
 const (
-	maxClientIDBytes = 256
-	maxScopeBytes    = 1024
+	maxHintBytes  = 256
+	maxScopeBytes = 1024
 )
 
 // ValidateClientID applies RFC 6749 appendix A's *VSCHAR to a client identifier:
@@ -261,8 +259,8 @@ func ValidateClientID(clientID string) error {
 	if clientID == "" {
 		return errors.New("client ID is empty")
 	}
-	if len(clientID) > maxClientIDBytes {
-		return fmt.Errorf("client ID exceeds %d bytes", maxClientIDBytes)
+	if len(clientID) > maxHintBytes {
+		return fmt.Errorf("client ID exceeds %d bytes", maxHintBytes)
 	}
 	for _, r := range clientID {
 		if r < 0x20 || r > 0x7e {
@@ -312,8 +310,8 @@ func ValidateResourceIndicator(resource string) error {
 // registry rule to apply — the value is whatever the provider expects — so this
 // only refuses what would corrupt the authorization URL it is interpolated into.
 func ValidateAudience(audience string) error {
-	if len(audience) > maxClientIDBytes {
-		return fmt.Errorf("audience exceeds %d bytes", maxClientIDBytes)
+	if len(audience) > maxHintBytes {
+		return fmt.Errorf("audience exceeds %d bytes", maxHintBytes)
 	}
 	for _, r := range audience {
 		if unicode.IsControl(r) {

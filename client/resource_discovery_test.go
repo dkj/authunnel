@@ -13,6 +13,10 @@ import (
 	"authunnel/internal/authmeta"
 )
 
+// publishedScopes is what the fixture's resource server advertises. It differs from
+// defaultOIDCScopes on purpose: adoption is only observable when the two differ.
+const publishedScopes = "openid offline_access tunnel:open"
+
 // discoveryFixture is an authunnel-server-shaped resource server plus the
 // authorization server it names: enough to drive a real resolution, with both
 // documents under the test's control and every request counted.
@@ -89,7 +93,11 @@ func newDiscoveryFixture(t *testing.T) *discoveryFixture {
 		AuthorizationServers:   []string{fixture.Issuer},
 		BearerMethodsSupported: []string{"header"},
 		ClientID:               "published-cli",
-		ScopesSupported:        []string{"openid", "offline_access"},
+		// Deliberately *not* defaultOIDCScopes: while the fixture published the same
+		// set as the fallback, a test asserting "everything came from the resource
+		// server" passed even with scope adoption removed entirely. Tests that seed a
+		// cache must use publishedScopes, or the identity will correctly fail to match.
+		ScopesSupported: strings.Fields(publishedScopes),
 	}
 	// One client for both servers: they are both plain http test servers, so the
 	// default transport reaches either.
@@ -150,7 +158,7 @@ func TestDiscoveryResolvesEverythingFromTheResourceServer(t *testing.T) {
 		ClientID:    "published-cli",
 		Audience:    "https://api.example",
 		Resource:    "https://tunnel.example",
-		Scopes:      "openid offline_access",
+		Scopes:      publishedScopes,
 	}
 	if *source.effective != want {
 		t.Fatalf("resolved identity =\n%+v\nwant\n%+v", *source.effective, want)
@@ -323,7 +331,7 @@ func TestDiscoveryDrivesARefreshAndStampsTheCache(t *testing.T) {
 		ResourceURL:  fixture.ResourceURL,
 		Issuer:       fixture.Issuer,
 		ClientID:     "published-cli",
-		Scopes:       normalizeScopes("openid offline_access"),
+		Scopes:       normalizeScopes(publishedScopes),
 		AccessToken:  "expired-token",
 		RefreshToken: "cached-refresh-token",
 		TokenType:    "Bearer",
@@ -361,7 +369,7 @@ func TestCacheHitMakesNoRequestAtAll(t *testing.T) {
 		ResourceURL: fixture.ResourceURL,
 		Issuer:      fixture.Issuer,
 		ClientID:    "published-cli",
-		Scopes:      normalizeScopes("openid offline_access"),
+		Scopes:      normalizeScopes(publishedScopes),
 		AccessToken: "still-valid-token",
 		TokenType:   "Bearer",
 		Expiry:      time.Now().Add(time.Hour),
@@ -397,7 +405,7 @@ func TestPublishedClientIDChangeDiscardsTheCache(t *testing.T) {
 		ResourceURL:  fixture.ResourceURL,
 		Issuer:       fixture.Issuer,
 		ClientID:     "the-old-client",
-		Scopes:       normalizeScopes("openid offline_access"),
+		Scopes:       normalizeScopes(publishedScopes),
 		AccessToken:  "expired-token",
 		RefreshToken: "super-secret-refresh-token",
 		TokenType:    "Bearer",
@@ -455,7 +463,7 @@ func TestNewAuthTokenSourceWiresDiscovery(t *testing.T) {
 		ResourceURL:  fixture.ResourceURL,
 		Issuer:       fixture.Issuer,
 		ClientID:     "published-cli",
-		Scopes:       normalizeScopes("openid offline_access"),
+		Scopes:       normalizeScopes(publishedScopes),
 		AccessToken:  "expired-token",
 		RefreshToken: "cached-refresh-token",
 		TokenType:    "Bearer",
@@ -541,7 +549,7 @@ func TestNoResourceMetadataCompletesWithoutContactingTheServer(t *testing.T) {
 	writeTokenCacheForTest(t, cachePath, tokenCache{
 		Issuer:       fixture.Issuer,
 		ClientID:     "configured-cli",
-		Scopes:       normalizeScopes("openid offline_access"),
+		Scopes:       normalizeScopes(defaultOIDCScopes),
 		AccessToken:  "expired-token",
 		RefreshToken: "cached-refresh-token",
 		TokenType:    "Bearer",
@@ -595,7 +603,7 @@ func TestNoResourceMetadataCacheIsSeparateFromTheDiscoveredOne(t *testing.T) {
 		ResourceURL: fixture.ResourceURL,
 		Issuer:      fixture.Issuer,
 		ClientID:    "published-cli",
-		Scopes:      normalizeScopes("openid offline_access"),
+		Scopes:      normalizeScopes(publishedScopes),
 		AccessToken: "still-valid-token",
 		TokenType:   "Bearer",
 		Expiry:      time.Now().Add(time.Hour),
@@ -716,7 +724,7 @@ func TestQueryBearingTunnelURLsAreDistinctResources(t *testing.T) {
 		ResourceURL: fixture.ResourceURL + "?tenant=a",
 		Issuer:      fixture.Issuer,
 		ClientID:    "published-cli",
-		Scopes:      normalizeScopes("openid offline_access"),
+		Scopes:      normalizeScopes(publishedScopes),
 		AccessToken: "tenant-a-token",
 		TokenType:   "Bearer",
 		Expiry:      time.Now().Add(time.Hour),
@@ -813,7 +821,7 @@ func TestParseClientConfigSeparatesCachesByTunnelQuery(t *testing.T) {
 		ResourceURL: tenantA.ResourceURL,
 		Issuer:      fixture.Issuer,
 		ClientID:    "published-cli",
-		Scopes:      normalizeScopes("openid offline_access"),
+		Scopes:      normalizeScopes(publishedScopes),
 		AccessToken: "tenant-a-token",
 		TokenType:   "Bearer",
 		Expiry:      time.Now().Add(time.Hour),
@@ -1184,10 +1192,17 @@ func TestConfiguredMetadataURLIsNotFilteredEither(t *testing.T) {
 	}
 }
 
-// TestZeroConfigStillFiltersDiscoveredAddresses is the control that keeps the
-// predicate from being a blanket exemption: with nothing configured, the tunnel
-// server does choose where the authorization server is, and the guard applies.
-func TestZeroConfigStillFiltersDiscoveredAddresses(t *testing.T) {
+// TestZeroConfigInstallsTheAddressGuard is the control that keeps the predicate from
+// being a blanket exemption: with nothing configured, the tunnel server does choose
+// where the authorization server is, so the guard is installed.
+//
+// Named for the gate rather than for the discovered addresses, because that is what it
+// reaches. The fixture's resource server is itself on loopback, so the guard refuses
+// the protected-resource *fetch* and no address named by a document is ever examined —
+// mutating checkDiscoveredAddress to a no-op leaves this test green.
+// TestCheckDiscoveredAddressStates covers that check directly, and
+// TestDiscoveryRefusesInternalAddressesFromAPublicResource states the same limitation.
+func TestZeroConfigInstallsTheAddressGuard(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
 
 	source := fixture.discoverySource(t, failingOpener(t))
@@ -1292,5 +1307,61 @@ func TestMalformedHintStillFailsWhenItWouldBeUsed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "authunnel_authorization_server_metadata_url") {
 		t.Fatalf("error = %v, want it to name the field", err)
+	}
+}
+
+// TestPublishedScopesBeatTheDefaultButNotAFlag pins the guard on the scope default.
+//
+// The default is applied at parse time only when nothing will be discovered. Applying
+// it unconditionally would make the fallback indistinguishable from an explicit
+// choice, and the resource server's scopes_supported could then never win — which is
+// what the code comment says must not happen, and what no test checked.
+func TestPublishedScopesBeatTheDefaultButNotAFlag(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	tunnelURL := strings.Replace(fixture.ResourceURL, "http://", "ws://", 1)
+
+	// Discovering: the published set wins over the fallback.
+	cfg, err := parseClientConfig([]string{
+		"--tunnel-url", tunnelURL, "--insecure-tunnel-url", "--insecure-oidc-issuer",
+		"--oidc-cache", filepathForTest(t, "a.json"),
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("parseClientConfig: %v", err)
+	}
+	if cfg.OIDCScopes != "" {
+		t.Fatalf("OIDCScopes = %q, want it left empty so the published set can win", cfg.OIDCScopes)
+	}
+	source := fixture.discoverySource(t, failingOpener(t))
+	source.scopes = cfg.OIDCScopes
+	if err := source.resolve(context.Background()); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if source.effective.Scopes != publishedScopes {
+		t.Fatalf("scopes = %q, want the published %q", source.effective.Scopes, publishedScopes)
+	}
+
+	// An explicit flag still wins over both.
+	cfg, err = parseClientConfig([]string{
+		"--tunnel-url", tunnelURL, "--insecure-tunnel-url", "--insecure-oidc-issuer",
+		"--oidc-scopes", "openid email", "--oidc-cache", filepathForTest(t, "b.json"),
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("parseClientConfig: %v", err)
+	}
+	if cfg.OIDCScopes != "openid email" {
+		t.Fatalf("OIDCScopes = %q, want the flag value", cfg.OIDCScopes)
+	}
+
+	// Not discovering: the default is applied at parse time, since nothing else will.
+	cfg, err = parseClientConfig([]string{
+		"--tunnel-url", tunnelURL, "--insecure-tunnel-url", "--insecure-oidc-issuer",
+		"--oidc-issuer", fixture.Issuer, "--oidc-client-id", "cli",
+		"--oidc-cache", filepathForTest(t, "c.json"),
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("parseClientConfig: %v", err)
+	}
+	if cfg.OIDCScopes != normalizeScopes(defaultOIDCScopes) {
+		t.Fatalf("OIDCScopes = %q, want the default applied when nothing is discovered", cfg.OIDCScopes)
 	}
 }

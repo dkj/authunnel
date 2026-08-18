@@ -467,7 +467,9 @@ out to be the wrong one, which is more useful to a future reader than the diffs.
   therefore controls its DNS. Two scoping decisions keep it from over-blocking: private networks are
   not refused (an internal IdP is an ordinary deployment, and the existing `ipblock.Default()` set
   already excludes RFC1918 for the same reason), and the guard is lifted when the tunnel server is
-  itself internal, which is the local-development case. This is what moved the deny-list into
+  itself internal, which is the local-development case (narrowed in round five below to
+  loopback and `localhost` only — read that before treating this sentence as current).
+  This is what moved the deny-list into
   `internal/ipblock`: the server asking about SOCKS destinations and the client asking about
   discovered addresses are the same question, and a second copy of the answer would drift.
 - **P2: the tunnel URL's query was dropped from the resource identity.** The stated reason —
@@ -839,6 +841,37 @@ Three things this round corrected in my own understanding, all worth recording:
   `installSafeLogging` so the wiring has a name a test can reach, and stated plainly what remains
   uncovered: main's single call to it, which no test can reach.
 
+### Tenth review round: a "dead" check that was not
+
+One finding, and it is the only regression in this work that a review round *introduced*
+rather than found.
+
+**The empty-fragment case.** `NormalizeResourceIdentifier` refused a fragment with
+`u.Fragment != "" || strings.Contains(rawURL, "#")`. A review sweep reported the first
+disjunct as subsuming the second — "url.Parse only ever sets Fragment from a literal #,
+so a non-empty Fragment implies a # in the raw string" — and I removed the raw-string
+half on that basis. The implication is true and it is the wrong direction. The raw-string
+test was there for the converse: a URL ending in a *bare* `#` parses with `Fragment == ""`
+and leaves no other trace, so the parsed field alone accepts it and normalisation then
+drops the delimiter — the silent discarding the surrounding comment forbids — and
+`--resource-url https://example/path#` passed server validation.
+
+Note the asymmetry that makes this counter-intuitive: a bare `?` *does* record itself, in
+`url.URL.ForceQuery`. There is no `ForceFragment`. That is now written next to the check.
+
+Neither existing test could see it: every fragment case used `#frag`. Tests now cover the
+bare delimiter at all three layers — the identifier rule, the handler's `Validate`, and
+the server's startup — and the mutation fails all three.
+
+**How I came to do it.** The sweep's evidence was "over `%23`, `#b`, trailing `#` and
+no-`#` inputs there is no case with `Fragment != ""` and no `#` in the raw string" — which
+verifies the implication as *stated* and never asks what the second disjunct was written
+for. I checked the claim and not the purpose. That is the same error as every round from
+four onwards, arriving from the opposite side: not prose that lagged the code, but code
+deleted because a claim about it sounded right. **Before removing a check, state what it
+was for and construct the input it was guarding against.** If that input cannot be
+constructed, the check is genuinely dead; if it can, the claim was about something else.
+
 ### Mutation checks run
 
 Every security-relevant assertion in this work was verified by breaking the code and confirming the
@@ -893,6 +926,8 @@ test fails — the discipline the previous plan arrived at after shipping tests 
   control-message tests each fail on raw control bytes, so no sink is covered only by another's test;
 - the predicate widened to "discovery ran at all" → both configured-value tests fail; forced false
   entirely → the zero-config filtering tests fail, so the boundary is pinned from both sides;
+- the raw-string half of the fragment check dropped → the identifier, handler and server
+  tests each fail on a bare `#`, where the older `#frag` cases could not see it;
 - the metadata redirect pin removed → the open-redirect test adopts the attacker's endpoints again;
   the token-leg pin removed → the credential reaches the other origin; the origin comparison relaxed
   to ignore ports → both fail, which is how the hostname-only version was caught in the first place;
