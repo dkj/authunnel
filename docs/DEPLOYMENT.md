@@ -267,7 +267,9 @@ and client ID for a client asking about `/b/tunnel`. Two consequences for deploy
   this server routes on path alone and attaches no meaning to a query, so a client whose tunnel URL
   carries one is still talking about this same resource. Client-side those are distinct identifiers
   with distinct cached credentials, which is what stops a token obtained for `?tenant=a` being
-  presented for `?tenant=b`.
+  presented for `?tenant=b`. A bare `?` counts: `…/tunnel?` and `…/tunnel` are different request
+  targets — Go puts the delimiter on the wire — so they are different identifiers here too. A
+  fragment is the opposite case and is refused, since it is never sent at all.
 
 **The challenge header.** Unauthenticated `401` responses on the protected routes carry
 `WWW-Authenticate: Bearer resource_metadata="https://…"`, pointing at the document. This is for

@@ -21,6 +21,12 @@ func TestProtectedResourceURLDerivation(t *testing.T) {
 		{"http://127.0.0.1:8080/protected/tunnel", "http://127.0.0.1:8080/.well-known/oauth-protected-resource/protected/tunnel"},
 		// The query is part of the identifier and rides along.
 		{"https://tunnel.example/protected/tunnel?tenant=a", "https://tunnel.example/.well-known/oauth-protected-resource/protected/tunnel?tenant=a"},
+		// Including an empty one. A bare "?" is recorded in ForceQuery rather than
+		// RawQuery, so carrying only RawQuery drops the delimiter — and the dial does
+		// send it, which the "?tenant=a" case above cannot detect. Contrast the bare
+		// "#" in the rejection list below: a fragment is not part of an identifier,
+		// while an empty query is.
+		{"https://tunnel.example/protected/tunnel?", "https://tunnel.example/.well-known/oauth-protected-resource/protected/tunnel?"},
 		// Syntax normalisation is shared with the comparison, so a redundant
 		// default port and an upper-case host derive the same location as their
 		// canonical spellings.
@@ -214,6 +220,10 @@ func TestNormalizeResourceIdentifier(t *testing.T) {
 		{"https://tunnel.example/tunnel", "https://tunnel.example/tunnel/"},
 		{"https://tunnel.example/t?tenant=a", "https://tunnel.example/t?tenant=b"},
 		{"https://tunnel.example/t?tenant=a", "https://tunnel.example/t"},
+		// An empty query is still a query: `/t?` and `/t` are two request targets a
+		// proxy may route apart, and collapsing them here would put discovery and the
+		// token cache on a different resource from the one the dial requests.
+		{"https://tunnel.example/t?", "https://tunnel.example/t"},
 		// The finding this pins: an encoded separator is not a separator, so
 		// these are two resources and must not normalise to one.
 		{"https://tunnel.example/tenant%2Fone/tunnel", "https://tunnel.example/tenant/one/tunnel"},

@@ -222,7 +222,7 @@ func resourceURLForTunnel(tunnelURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("--tunnel-url %q is not a valid URL", tunnelURL)
 	}
-	resourceURL.RawQuery = u.RawQuery
+	authmeta.CarryQuery(resourceURL, u)
 	return resourceURL.String(), nil
 }
 

@@ -780,6 +780,20 @@ func TestParseClientConfigKeepsTheTunnelQueryInTheResourceIdentity(t *testing.T)
 			"https://tunnel.example/protected/tunnel?tenant=a",
 		},
 		{
+			// An empty query is a query. url.Parse records the bare delimiter in
+			// ForceQuery, not RawQuery, so carrying only RawQuery drops it — while the
+			// dial still requests /protected/tunnel?, which is a target a proxy may
+			// route apart from /protected/tunnel. None of the cases above can see this.
+			"https://tunnel.example/protected/tunnel?",
+			"https://tunnel.example/protected/tunnel?",
+		},
+		{
+			// And the fragment rule still applies over the top of it: inert, dropped,
+			// while the empty query it follows is kept.
+			"https://tunnel.example/protected/tunnel?#frag",
+			"https://tunnel.example/protected/tunnel?",
+		},
+		{
 			"https://tunnel.example/protected/tunnel",
 			"https://tunnel.example/protected/tunnel",
 		},

@@ -83,8 +83,10 @@ func (p *ProtectedResource) AuthorizationServer() string {
 // may carry one — so two tunnel URLs differing only in their query are two
 // resources, with their own metadata and their own cached credentials. Dropping it
 // would collapse them onto one identity, and discloses nothing in exchange: the
-// WebSocket dial already sends that query to this very host. The fragment is the
-// opposite case and is refused outright, since it is never sent anywhere.
+// WebSocket dial already sends that query to this very host. That includes an
+// *empty* query, which is why every reconstruction here goes through CarryQuery. The
+// fragment is the opposite case and is refused outright, since it is never sent
+// anywhere.
 func ProtectedResourceURL(resourceURL string) (string, error) {
 	// Via the identifier rule rather than a private copy of it: the value being
 	// derived from and the value being compared must be judged the same way, or
@@ -115,8 +117,23 @@ func deriveProtectedResourceURL(normalized string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("derive metadata URL for %q: %w", normalized, err)
 	}
-	derived.RawQuery = u.RawQuery
+	CarryQuery(derived, u)
 	return derived.String(), nil
+}
+
+// CarryQuery copies src's query onto dst, including the case where the query is
+// present but empty. A URL ending in a bare "?" records that in url.URL.ForceQuery,
+// not in RawQuery, so copying RawQuery alone drops the delimiter — and `/tunnel?` and
+// `/tunnel` are two request targets that a proxy or an origin server may route
+// differently. Losing it would put a client's discovery and its token-cache key on a
+// different resource from the one its WebSocket dial actually requests.
+//
+// Exported and used by every reconstruction on this path — the client's own
+// derivation, this package's two, and the server's — because a query rule that each
+// site restates is a query rule that eventually differs between them.
+func CarryQuery(dst, src *url.URL) {
+	dst.RawQuery = src.RawQuery
+	dst.ForceQuery = src.ForceQuery
 }
 
 // FetchProtectedResource retrieves the protected-resource metadata for
@@ -216,7 +233,9 @@ func NormalizeResourceIdentifier(rawURL string) (string, error) {
 	// converse is what this check is for, and it does not hold: a URL ending in a
 	// bare "#" parses with Fragment == "" and leaves no other trace of the
 	// delimiter. Note the asymmetry with the query, where a bare "?" does record
-	// itself, in ForceQuery; there is no ForceFragment. So dropping the raw-string
+	// itself, in ForceQuery — CarryQuery is what preserves it, since an empty query
+	// is kept where an empty fragment is refused. There is no ForceFragment, so
+	// nothing here can lean on the same trick. Dropping the raw-string
 	// test made "https://h/x#" normalise to "https://h/x" — the silent discarding
 	// the paragraph above forbids — and made --resource-url accept it server-side.
 	if u.Fragment != "" || strings.Contains(rawURL, "#") {
@@ -229,7 +248,7 @@ func NormalizeResourceIdentifier(rawURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resource identifier %q could not be normalised: %w", rawURL, err)
 	}
-	normalized.RawQuery = u.RawQuery
+	CarryQuery(normalized, u)
 	return normalized.String(), nil
 }
 

@@ -540,7 +540,21 @@ The composition order was also inverted while merging: the caller's inherited `C
 consulted **before** the origin pin, so a redirect that is both a downgrade and an origin change is
 reported as the downgrade — the more specific fault. The composed verdict is unchanged.
 
-**Round eleven found the split's own bug, and it is round six's pattern again.** The pin was recorded
+**Round eleven, second finding: an empty query was dropped from the identity.** A `--tunnel-url`
+ending in a bare `?` is recorded by `url.Parse` in `ForceQuery`, not `RawQuery`, so all four
+reconstructions on this path — the client's derivation, the §3.1 derivation, the identifier rule and
+the server's published identifier — carried only `RawQuery` and lost the delimiter. Verified on the
+wire rather than argued: Go's client sends `RequestURI="/protected/tunnel?"`, so the dial and the
+cache key were describing different resources, and because `--resource-url` is published *verbatim* a
+declared identifier ending in `?` would have failed the client's exact §3.3 comparison outright.
+
+This is round ten's asymmetry collecting its debt. That round wrote down that a bare `?` records
+itself in `ForceQuery` while a bare `#` does not — as an argument for keeping the fragment's
+raw-string check — and did not ask whether anything *used* the record it had just described. Fixed
+with one exported `CarryQuery(dst, src)` called at all four sites, rather than a fifth restatement of
+the query rule; each site's mutation now fails a test on its own.
+
+**Round eleven, first finding — the split's own bug, and round six's pattern again.** The pin was recorded
 on the source when the published URL was adopted, and `TokenAfterRejection` discards `s.effective` and
 re-resolves — so a server that stopped publishing a metadata URL left a stale pin on the *derived*
 fetch, refusing the very delegation this split exists to permit. Fixed by deleting the field:

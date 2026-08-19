@@ -340,6 +340,25 @@ func TestChallengeCarriesTheQueryOfTheRequestedResource(t *testing.T) {
 	}
 }
 
+// TestPublishedIdentifierKeepsAnEmptyQuery is the degenerate case of the test above,
+// and it needs its own: a bare "?" reaches the handler in url.URL.ForceQuery rather
+// than RawQuery, so a reconstruction that carries only RawQuery drops it. The client
+// compares this identifier byte for byte against the URL it dialled, and that dial
+// does send the delimiter — Go's own client puts `/protected/tunnel?` on the wire.
+func TestPublishedIdentifierKeepsAnEmptyQuery(t *testing.T) {
+	mux := resourceMetadataHandler(t, HandlerOptions{
+		ResourceMetadata: &ResourceMetadataConfig{Issuer: "https://idp.example"},
+	})
+
+	served, document := fetchDocumentForTest(t, mux, "/.well-known/oauth-protected-resource/protected/tunnel?", nil)
+	if served.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", served.Code)
+	}
+	if !strings.HasSuffix(document.Resource, "/protected/tunnel?") {
+		t.Fatalf("published resource = %q, want the empty query preserved", document.Resource)
+	}
+}
+
 // TestResourceURLValidatedAsFetchable covers the other half of "published" — a
 // value no client could retrieve is not a usable identifier, however well-formed.
 func TestResourceURLValidatedAsFetchable(t *testing.T) {

@@ -154,11 +154,14 @@ func (c *ResourceMetadataConfig) resourceIdentity(r *http.Request, trustForwarde
 		}
 	}
 	requested := url.URL{
-		Scheme:   requestScheme(r, trustForwardedProto),
-		Host:     requestHost(r, trustForwardedProto),
-		Path:     tunnelResourcePath,
-		RawQuery: r.URL.RawQuery,
+		Scheme: requestScheme(r, trustForwardedProto),
+		Host:   requestHost(r, trustForwardedProto),
+		Path:   tunnelResourcePath,
 	}
+	// Including a bare "?", which arrives in ForceQuery rather than RawQuery: the
+	// identifier published here is compared byte for byte against the URL the client
+	// dialled, and that dial does send the delimiter.
+	authmeta.CarryQuery(&requested, r.URL)
 	document := requested
 	document.Path = authmeta.ProtectedResourcePath + tunnelResourcePath
 	return requested.String(), document.String()
