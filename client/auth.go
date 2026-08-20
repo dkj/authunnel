@@ -40,18 +40,15 @@ type authTokenSource interface {
 	// rejected the last one *because the configuration it was obtained under is
 	// no longer the configuration in force*, and "" when that is not the case.
 	//
-	// It exists because a cached token that is still valid by its own `exp`
-	// bypasses resolution entirely — that is the fast path working as intended —
-	// so a server that changes issuer, client ID or audience leaves every client
-	// presenting a credential it will keep refusing until the cache expires. The
-	// rejection is the only signal available, and re-resolving on it is what
-	// turns a lockout into one extra round trip.
+	// A cached token still valid by its own `exp` bypasses resolution — the fast path
+	// working as intended — so a server that changes issuer, client ID or audience
+	// keeps refusing every such client until its cache expires. The rejection is the
+	// only signal available, and this turns that window into one extra round trip.
 	//
-	// Returning "" rather than a fresh token when nothing changed is the whole
-	// discipline here: an account that was disabled, or a scope that was revoked,
-	// also produces a rejection, and re-authenticating cannot fix either. A
-	// client that logged in again on every rejection would open a browser on
-	// every ssh invocation for as long as the real problem lasted.
+	// Returning "" when nothing changed is the discipline: a disabled account or a
+	// revoked scope produces the same rejection and re-authenticating fixes neither,
+	// so a client that logged in on every rejection would open a browser on every ssh
+	// invocation for as long as the real problem lasted.
 	TokenAfterRejection(ctx context.Context) (string, error)
 }
 
@@ -86,11 +83,10 @@ type oidcIdentity struct {
 	// is the *only* configured input: everything else was derived from it, so it
 	// is what a cached credential is actually scoped to.
 	//
-	// Deliberately empty rather than "always the tunnel URL" outside discovery
-	// mode. Recording it unconditionally would key every existing cache on a
-	// value it does not contain, logging every user out once on upgrade, and
-	// would newly require one login per tunnel URL for configurations that
-	// legitimately share an issuer and client across several.
+	// Empty rather than "always the tunnel URL" outside discovery mode: recording it
+	// unconditionally would key every existing cache on a value it does not contain,
+	// and would require a login per tunnel URL for configurations that legitimately
+	// share one issuer and client across several.
 	ResourceURL string
 	Issuer      string
 	MetadataURL string
@@ -101,7 +97,7 @@ type oidcIdentity struct {
 }
 
 // defaultOIDCScopes is the fallback when neither --oidc-scopes nor the resource
-// server's scopes_supported supplies one. offline_access is in it because
+// server's authunnel_default_scopes supplies one. offline_access is in it because
 // without a refresh token every ssh invocation past the access token's lifetime
 // would open a browser.
 const defaultOIDCScopes = "openid offline_access"
@@ -144,10 +140,16 @@ type managedOIDCTokenSource struct {
 	cachePath       string
 	noBrowser       bool
 	redirectPort    int
-	httpClient      *http.Client
-	output          io.Writer
-	openBrowser     browserOpener
-	now             func() time.Time
+	// httpClient is the base for every fetch this source makes, and nothing reassigns
+	// it: each policy wrapper applies to *this* client, never to another wrapper's
+	// output. See authhttp.RefuseInternalAddresses for why that is a requirement.
+	httpClient *http.Client
+	// guarded is httpClient with the internal-address guard layered on, built at most
+	// once so every resolution shares one connection pool. Read through fetchClient.
+	guarded     *http.Client
+	output      io.Writer
+	openBrowser browserOpener
+	now         func() time.Time
 
 	mu sync.Mutex
 	// effective is the configured identity plus whatever resolution supplied. nil
@@ -421,15 +423,7 @@ func (s *managedOIDCTokenSource) resolveIdentity(ctx context.Context) (*oidcIden
 			isLocal = authhttp.HostIsAlwaysLocal
 		}
 		s.allowInternalTargets = isLocal(s.resourceURL)
-		// Guarded only when the tunnel server is the one choosing where this
-		// client's auth traffic goes. With --oidc-issuer or --oidc-metadata-url
-		// supplied it is not, and wrapping the shared client would then refuse the
-		// operator's own loopback issuer — contingently, depending on whether
-		// --oidc-client-id happened to be missing too.
-		if !s.allowInternalTargets && s.authorizationServerIsRemotelyChosen() {
-			s.httpClient = authhttp.RefuseInternalAddresses(s.httpClient)
-		}
-		document, err := authmeta.FetchProtectedResource(ctx, s.httpClient, s.resourceURL)
+		document, err := authmeta.FetchProtectedResource(ctx, s.fetchClient(), s.resourceURL)
 		if err != nil {
 			// The hint matters because reaching here at all means the client had
 			// nothing else to go on: the likeliest cause is a server running
@@ -443,7 +437,7 @@ func (s *managedOIDCTokenSource) resolveIdentity(ctx context.Context) (*oidcIden
 			if errors.Is(err, authhttp.ErrUnsafeTransport) {
 				return nil, fmt.Errorf("discover configuration from %s: %w", s.resourceURL, err)
 			}
-			return nil, fmt.Errorf("discover configuration from %s: %w (pass --oidc-issuer and --oidc-client-id if this server does not publish protected-resource metadata)", s.resourceURL, err)
+			return nil, fmt.Errorf("discover configuration from %s: %w (pass --oidc-client-id and either --oidc-issuer or --oidc-metadata-url if this server does not publish protected-resource metadata)", s.resourceURL, err)
 		}
 		if err := s.applyResourceMetadata(ctx, &identity, document); err != nil {
 			return nil, fmt.Errorf("discover configuration from %s: %w", s.resourceURL, err)
@@ -492,7 +486,7 @@ func (s *managedOIDCTokenSource) resolveEndpoints(ctx context.Context) error {
 	// of the pin, and an open redirect on the issuer's host would defeat it.
 	// Elsewhere an HTTPS-rooted chain may delegate to another HTTPS host, which the
 	// discovery simplification plan lists as a non-goal to prevent.
-	metadataClient := s.httpClient
+	metadataClient := s.fetchClient()
 	if s.metadataOriginIsPinned() {
 		metadataClient = authhttp.PinRedirectOrigin(metadataClient)
 	}
@@ -530,21 +524,17 @@ func (s *managedOIDCTokenSource) resolveEndpoints(ctx context.Context) error {
 // authorizationServerIsRemotelyChosen reports whether the *tunnel server* decided
 // where this client's authorization server is.
 //
-// It is the condition that governs discovery-input policy, and it is deliberately
-// about what the tunnel server got to choose rather than about whether discovery
-// ran. Discovery may run only to collect a client ID while --oidc-issuer or
-// --oidc-metadata-url fixes the authorization server's location; the addresses
-// reached thereafter are then the operator's own choice or the choice of the
-// authorization server the operator named, and this documentation's promise that a
-// configured issuer "is not filtered" has to hold whether or not some other flag
-// happened to be supplied too.
+// It governs discovery-input policy, and is keyed on what the tunnel server got to
+// *choose* rather than on whether discovery ran: discovery may run only to collect a
+// client ID while --oidc-issuer or --oidc-metadata-url fixes the authorization
+// server's location. Keying it on "discovery ran" would make the promise that a
+// configured issuer is not filtered depend on whether an unrelated flag was supplied.
 //
-// When it is false, nothing the client fetches was located by the tunnel server:
-// the resource URL is typed by the operator, the authorization server's document
-// comes from the operator's issuer or metadata URL, and a *published* metadata URL
-// is only adopted within that issuer's own origin (see adoptMetadataURL). What the
-// tunnel server may still supply in that mode — client ID, audience, scopes — names
-// no address at all.
+// When false, nothing the client fetches was located by the tunnel server: the
+// resource URL was typed by the operator, the authorization server's document comes
+// from their issuer or metadata URL, and a published metadata URL is adopted only
+// within that issuer's origin (adoptMetadataURL). What the tunnel server may still
+// supply — client ID, audience, scopes — names no address.
 func (s *managedOIDCTokenSource) authorizationServerIsRemotelyChosen() bool {
 	return s.resourceURL != "" && s.issuer == "" && s.metadataURL == ""
 }
@@ -554,33 +544,19 @@ func (s *managedOIDCTokenSource) authorizationServerIsRemotelyChosen() bool {
 //
 // Two rules, and the difference between them is deliberate:
 //
-//   - **A configured value always wins**, and — the part that was missing —
-//     wins over every published field that could undermine what it guarantees,
-//     not merely over the field of the same name. A pinned --oidc-issuer
-//     guarantees "the endpoints come from this issuer", so the published
-//     *metadata URL* is part of that guarantee: it decides which document the
-//     endpoints are read from. Gated in adoptMetadataURL below.
+//   - **A configured value wins over every published field that could undermine what
+//     it guarantees**, not merely over the field of the same name. "Explicit wins" is
+//     evaluated per guarantee: a pinned --oidc-issuer guarantees the endpoints come
+//     from that issuer, and the published *metadata URL* decides which document they
+//     are read from, so it is part of that guarantee. Gated in adoptMetadataURL.
+//   - **A contradicted issuer is an error, a contradicted metadata URL is not.** An
+//     issuer is an identity: two different answers means one is wrong, and continuing
+//     costs a browser login that ends in a rejected token. A location is not, so an
+//     operator override there is a workaround rather than a contradiction.
 //
-//     The earlier version reasoned field by field — explicit issuer beats
-//     published issuer, explicit metadata URL beats published metadata URL — and
-//     that is how a hostile tunnel server echoed the expected issuer, relocated
-//     its document, and chose the endpoints anyway. "Explicit wins" has to be
-//     evaluated per guarantee, not per field.
-//
-//   - **A contradicted issuer is an error, a contradicted metadata URL is not.**
-//     The issuer is an identity: if the operator names one and the resource
-//     server names another, one of them is wrong, and continuing means a browser
-//     login that ends in a token this very server rejects. Failing locally with
-//     both values is strictly better than that. A metadata URL is a location, so
-//     an operator override there is a legitimate workaround rather than a
-//     contradiction — but a *published* one is now bounded, which is the point
-//     above.
-//
-// Every URL taken from the document is checked for shape — a usable http(s) URL —
-// whoever chose it. The transport, downgrade and address rules apply on top of that
-// only when the tunnel server is the party that chose where the authorization server
-// is; see authorizationServerIsRemotelyChosen for why that distinction is the subject
-// of the rule rather than an exemption from it.
+// Every URL from the document is shape-checked whoever chose it; the transport,
+// downgrade and address rules apply on top only when the tunnel server chose where the
+// authorization server is. See authorizationServerIsRemotelyChosen.
 func (s *managedOIDCTokenSource) applyResourceMetadata(ctx context.Context, identity *oidcIdentity, document *authmeta.ProtectedResource) error {
 	if err := s.adoptAuthorizationServer(ctx, identity, document.AuthorizationServer()); err != nil {
 		return err
@@ -595,14 +571,20 @@ func (s *managedOIDCTokenSource) applyResourceMetadata(ctx context.Context, iden
 		{"authunnel_audience", &identity.Audience, document.Audience, authmeta.ValidateAudience},
 		{"authunnel_resource", &identity.Resource, document.ResourceIndicator, authmeta.ValidateResourceIndicator},
 		{
-			label:     "scopes_supported",
-			target:    &identity.Scopes,
-			published: normalizeScopes(strings.Join(document.ScopesSupported, " ")),
+			label:  "authunnel_default_scopes",
+			target: &identity.Scopes,
+			// The extension field, not the registered scopes_supported. Under RFC 9728
+			// §7.2 that one is a resource *disclosing* the scopes it supports, which
+			// is not the same question as which of them this client should request —
+			// reading it as the latter is how a client ends up asking for more
+			// privilege than the job needs. This field is the recommendation, so it is
+			// the one that may be adopted. See the DefaultScopes field comment.
+			published: normalizeScopes(strings.Join(document.DefaultScopes, " ")),
 			// Validated against the original slice rather than the joined
 			// string: joining and re-splitting would turn a scope containing a
 			// space into two valid ones, which is the malformed case worth
 			// catching.
-			validate: func(string) error { return authmeta.ValidateScopes(document.ScopesSupported) },
+			validate: func(string) error { return authmeta.ValidateScopes(document.DefaultScopes) },
 		},
 	} {
 		if *hint.target != "" || hint.published == "" {
@@ -620,19 +602,16 @@ func (s *managedOIDCTokenSource) applyResourceMetadata(ctx context.Context, iden
 // metadata document, unless doing so would let the resource server decide which
 // endpoints a *pinned* issuer resolves to.
 //
-// The published value is accepted when no issuer was configured — there is then
-// nothing for it to undermine, and the trade is the one the whole feature makes —
-// and when it shares an origin with the configured issuer, which is where TLS makes
-// the issuer's own host answer for the document. That keeps the case the flag
-// exists for: an authorization server publishing RFC 8414 metadata at a path the
-// OIDC derivation cannot construct puts it on its own host, so it is same-origin.
+// Accepted when no issuer was configured — nothing to undermine, and that is the
+// trade the feature makes — and when it shares an origin with the configured issuer,
+// where TLS makes the issuer's own host answer for the document. That keeps the case
+// the flag exists for: RFC 8414 metadata at a path the OIDC derivation cannot
+// construct still sits on the issuer's host, so it is same-origin.
 //
-// A cross-origin value with an issuer configured is disregarded rather than
-// treated as an error. It is not necessarily an attack — a deployment may
-// legitimately host metadata elsewhere — and the operator's own
-// --oidc-metadata-url is the way to say so. It is said out loud, because the
-// alternative is an operator debugging a 404 on the derived path while the server
-// publishes a location the client silently declined to use.
+// A cross-origin value under a configured issuer is disregarded rather than refused —
+// it may be a legitimate deployment, and --oidc-metadata-url is how an operator says
+// so — but announced, since the alternative is debugging a 404 on the derived path
+// while the server advertises a location the client silently declined.
 func (s *managedOIDCTokenSource) adoptMetadataURL(ctx context.Context, identity *oidcIdentity, published string) error {
 	if identity.MetadataURL != "" || published == "" {
 		return nil
@@ -654,8 +633,8 @@ func (s *managedOIDCTokenSource) adoptMetadataURL(ctx context.Context, identity 
 				reason = "it could not be compared with"
 			}
 			// %q on the published value, which is the one thing here that has not
-			// been through url.Parse — deliberately, since round seven moved the
-			// decision ahead of the validation. A value that fails SameOrigin
+			// been through url.Parse, because the decision to ignore it deliberately
+			// precedes validation. A value that fails SameOrigin
 			// *because* it contains control characters is precisely the one that
 			// reaches this line, so it is quoted; the operator's own resource URL
 			// and issuer passed CheckConfiguredURL and cannot carry any.
@@ -701,13 +680,13 @@ func (s *managedOIDCTokenSource) adoptAuthorizationServer(ctx context.Context, i
 	if advertised == "" {
 		return nil
 	}
-	// Compared before anything is validated. What keeps the operator's own issuer
-	// out of discovery-input policy is authorizationServerIsRemotelyChosen, inside
-	// checkDiscoveredURL — not this early return, which is unobservable next to it
-	// and is here only because an advertised value equal to a configured one is
-	// nothing to adopt and so nothing to judge. Verified unobservable rather than
-	// assumed: with the return removed, no test changes, because the only value
-	// that reaches the check is the configured issuer, which was validated at parse
+	// Compared before anything is validated. What keeps the operator's own issuer out
+	// of discovery-input policy is authorizationServerIsRemotelyChosen inside
+	// checkDiscoveredURL — not this early return, which is unobservable beside it and
+	// is here only for readability: an advertised value equal to a configured one is
+	// nothing to adopt, so nothing to judge. Verified unobservable, not assumed —
+	// removing it changes no test, since the only value reaching the check is the
+	// configured issuer, already validated at parse
 	// time.
 	//
 	// The comparison itself is observable, and worth doing first: an unusable value
@@ -746,7 +725,7 @@ func (s *managedOIDCTokenSource) checkDiscoveredURL(ctx context.Context, label, 
 // internal address. A no-op outside discovery, and when the resource server is
 // itself internal.
 //
-// The dial guard on s.httpClient covers the same ground for fetches we make, and
+// The dial guard fetchClient installs covers the same ground for fetches we make, and
 // covers it better, since it cannot be beaten by re-resolution. This static check
 // is not redundant with it: authorization_endpoint is never dialled by us — it
 // goes to the OS URL dispatcher — so for that endpoint this is the only check
@@ -905,15 +884,42 @@ func (s *managedOIDCTokenSource) saveCache(cache tokenCache) error {
 	return nil
 }
 
+// fetchClient is the client every fetch this source makes goes through: httpClient
+// guarded by authhttp.RefuseInternalAddresses when the *tunnel server* chose the
+// addresses being reached, and httpClient itself otherwise — a configured issuer or
+// metadata URL is the operator's own decision and is not filtered. See
+// authorizationServerIsRemotelyChosen.
+//
+// Three invariants, each load-bearing:
+//
+//   - the guard is built from httpClient, never from what this returns. See that
+//     field, and RefuseInternalAddresses, for what a second application produces.
+//   - it is kept, so every resolution in a process shares one connection pool.
+//   - only the *positive* verdict is memoised. A cached "no guard needed" is the one
+//     shape here that could silently disable the guard, and a caller arriving before
+//     allowInternalTargets is set should get a guard rather than a lasting absence.
+//
+// Callers hold s.mu on every path, so the memo needs no synchronisation of its own.
+func (s *managedOIDCTokenSource) fetchClient() *http.Client {
+	if s.allowInternalTargets || !s.authorizationServerIsRemotelyChosen() {
+		return s.httpClient
+	}
+	if s.guarded == nil {
+		s.guarded = authhttp.RefuseInternalAddresses(s.httpClient)
+	}
+	return s.guarded
+}
+
 // credentialClient is the client for the two requests that carry a credential in
-// their body — the refresh and the code exchange. Both are pinned to the origin they
-// start on: a 307 preserves method and body, so an open redirect on the token
-// endpoint's own host would otherwise post the refresh token or the authorization
-// code to a third party, and https-to-https is not a downgrade for the transport rule
-// to catch. Verified by TestTokenEndpointCrossOriginRedirectIsRefused, which records
-// the body the other origin would have received.
+// their body — the refresh and the code exchange. Layered on fetchClient, since the
+// token endpoint was named by a document the tunnel server located, and pinned to the
+// origin it starts on: a 307 preserves method and body, so an open redirect on the
+// token endpoint's own host would otherwise post the refresh token or the
+// authorization code to a third party, and https-to-https is not a downgrade for the
+// transport rule to catch. Verified by TestTokenEndpointCrossOriginRedirectIsRefused,
+// which records the body the other origin would have received.
 func (s *managedOIDCTokenSource) credentialClient() *http.Client {
-	return authhttp.PinRedirectOrigin(s.httpClient)
+	return authhttp.PinRedirectOrigin(s.fetchClient())
 }
 
 func (s *managedOIDCTokenSource) refreshToken(ctx context.Context, cache tokenCache) (*oauth2.Token, error) {

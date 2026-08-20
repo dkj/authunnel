@@ -2,8 +2,10 @@ package tunnelserver
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -110,7 +112,7 @@ func TestResourceMetadataPublishesHintsOnlyWhenSet(t *testing.T) {
 	})
 	_, document := fetchDocumentForTest(t, bare, authmeta.ProtectedResourcePath, nil)
 	if document.ClientID != "" || document.Audience != "" || document.ResourceIndicator != "" ||
-		document.AuthorizationServerMetadataURL != "" || len(document.ScopesSupported) != 0 {
+		document.AuthorizationServerMetadataURL != "" || len(document.DefaultScopes) != 0 {
 		t.Fatalf("unset hints should be absent, got %+v", document)
 	}
 	if len(document.BearerMethodsSupported) != 1 || document.BearerMethodsSupported[0] != "header" {
@@ -124,7 +126,7 @@ func TestResourceMetadataPublishesHintsOnlyWhenSet(t *testing.T) {
 			ClientID:                       "authunnel-cli",
 			Audience:                       "https://api.example",
 			ResourceIndicator:              "https://tunnel.example",
-			Scopes:                         []string{"openid", "offline_access"},
+			DefaultScopes:                  []string{"openid", "offline_access"},
 		},
 	})
 	_, document = fetchDocumentForTest(t, full, authmeta.ProtectedResourcePath, nil)
@@ -137,8 +139,51 @@ func TestResourceMetadataPublishesHintsOnlyWhenSet(t *testing.T) {
 	if document.Audience != "https://api.example" || document.ResourceIndicator != "https://tunnel.example" {
 		t.Fatalf("audience hints = %q / %q", document.Audience, document.ResourceIndicator)
 	}
-	if strings.Join(document.ScopesSupported, " ") != "openid offline_access" {
-		t.Fatalf("scopes = %v", document.ScopesSupported)
+	if strings.Join(document.DefaultScopes, " ") != "openid offline_access" {
+		t.Fatalf("scopes = %v", document.DefaultScopes)
+	}
+}
+
+// TestPublishedWireKeysAreTheAgreedOnes asserts the JSON keys rather than the Go
+// fields, which is the only way this side can pin a wire contract: every other test
+// here decodes into authmeta.ProtectedResource, so it would follow a renamed tag
+// wherever it went and still pass.
+//
+// The scope key is the one that matters, and `scopes_supported` must be *absent*.
+// Under RFC 9728 §7.2 that field is the protected resource disclosing the scopes it
+// supports — and this server supports no scope requirement at all: it accepts a token
+// on its signature, audience and standard claims and never reads the `scope` claim. So
+// publishing anything there would be a false disclosure, quite apart from inviting a
+// client to request the whole list. What is published instead is a recommendation about
+// the request, under an extension name, since §7.2 has no field for one.
+func TestPublishedWireKeysAreTheAgreedOnes(t *testing.T) {
+	mux := resourceMetadataHandler(t, HandlerOptions{
+		ResourceMetadata: &ResourceMetadataConfig{
+			Issuer:                         "https://idp.example",
+			AuthorizationServerMetadataURL: "https://idp.example/.well-known/oauth-authorization-server/tenant1",
+			ClientID:                       "authunnel-cli",
+			Audience:                       "https://api.example",
+			ResourceIndicator:              "https://tunnel.example",
+			DefaultScopes:                  []string{"openid", "offline_access"},
+		},
+	})
+	recorder, _ := fetchDocumentForTest(t, mux, authmeta.ProtectedResourcePath, nil)
+
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("response is not a JSON object: %v", err)
+	}
+	for _, key := range []string{
+		"resource", "authorization_servers", "bearer_methods_supported",
+		"authunnel_client_id", "authunnel_authorization_server_metadata_url",
+		"authunnel_audience", "authunnel_resource", "authunnel_default_scopes",
+	} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("published document is missing %q; keys were %v", key, slices.Sorted(maps.Keys(raw)))
+		}
+	}
+	if _, ok := raw["scopes_supported"]; ok {
+		t.Fatal("scopes_supported must not be published: this server enforces no scope requirement, so it has no supported set to disclose; what it publishes is a recommendation for the request")
 	}
 }
 
@@ -274,8 +319,8 @@ func TestResourceMetadataConfigValidate(t *testing.T) {
 		"no issuer":          {},
 		"client ID with tab": {Issuer: "https://idp.example", ClientID: "authunnel\tcli"},
 		"client ID too long": {Issuer: "https://idp.example", ClientID: strings.Repeat("a", 300)},
-		"scope with space":   {Issuer: "https://idp.example", Scopes: []string{"openid profile"}},
-		"empty scope":        {Issuer: "https://idp.example", Scopes: []string{""}},
+		"scope with space":   {Issuer: "https://idp.example", DefaultScopes: []string{"openid profile"}},
+		"empty scope":        {Issuer: "https://idp.example", DefaultScopes: []string{""}},
 		"resource fragment":  {Issuer: "https://idp.example", ResourceIndicator: "https://api.example#frag"},
 		"resource relative":  {Issuer: "https://idp.example", ResourceIndicator: "/api"},
 		"audience control":   {Issuer: "https://idp.example", Audience: "api\nexample"},
@@ -290,7 +335,7 @@ func TestResourceMetadataConfigValidate(t *testing.T) {
 	valid := &ResourceMetadataConfig{
 		Issuer:            "https://idp.example",
 		ClientID:          "authunnel-cli",
-		Scopes:            []string{"openid", "offline_access"},
+		DefaultScopes:     []string{"openid", "offline_access"},
 		Audience:          "https://api.example",
 		ResourceIndicator: "https://tunnel.example",
 	}

@@ -45,16 +45,20 @@ type ResourceMetadataConfig struct {
 	// tolerated; tolerating it is what would let one host's resources impersonate
 	// each other.
 	ResourceURL string
-	// AuthorizationServerMetadataURL is the server's own --oidc-metadata-url,
-	// published so a client reaches the same document rather than deriving a
-	// path that does not exist. Empty when the server used the derived path,
-	// in which case the client derives it too.
+	// AuthorizationServerMetadataURL tells a client where the authorization server's
+	// own metadata document lives, for when the OIDC derivation cannot construct that
+	// path. Empty means the client derives it, which is the common case.
+	//
+	// Filled from --client-oidc-metadata-url, else this server's own
+	// --oidc-metadata-url; the two are separate because a server pinned to a JWKS
+	// endpoint reads no metadata document itself while its clients still need one. See
+	// serverConfig.ClientOIDCMetadataURL.
 	AuthorizationServerMetadataURL string
-	// ClientID, Audience, ResourceIndicator and Scopes are the optional hints.
+	// ClientID, Audience, ResourceIndicator and DefaultScopes are the optional hints.
 	ClientID          string
 	Audience          string
 	ResourceIndicator string
-	Scopes            []string
+	DefaultScopes     []string
 }
 
 // Validate checks the hints at startup so a malformed value fails for the
@@ -83,9 +87,9 @@ func (c *ResourceMetadataConfig) Validate() error {
 			return fmt.Errorf("--client-id: %w", err)
 		}
 	}
-	if len(c.Scopes) > 0 {
-		if err := authmeta.ValidateScopes(c.Scopes); err != nil {
-			return fmt.Errorf("--client-scopes: %w", err)
+	if len(c.DefaultScopes) > 0 {
+		if err := authmeta.ValidateScopes(c.DefaultScopes); err != nil {
+			return fmt.Errorf("--client-default-scopes: %w", err)
 		}
 	}
 	if c.Audience != "" {
@@ -109,7 +113,7 @@ func (c *ResourceMetadataConfig) document(r *http.Request, trustForwardedProto b
 		Resource:                       identifier,
 		AuthorizationServers:           []string{c.Issuer},
 		BearerMethodsSupported:         []string{"header"},
-		ScopesSupported:                c.Scopes,
+		DefaultScopes:                  c.DefaultScopes,
 		ClientID:                       c.ClientID,
 		AuthorizationServerMetadataURL: c.AuthorizationServerMetadataURL,
 		Audience:                       c.Audience,

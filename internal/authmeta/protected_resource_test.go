@@ -16,7 +16,15 @@ func TestProtectedResourceURLDerivation(t *testing.T) {
 		// §3.1 inserts the well-known segment between authority and path.
 		{"https://tunnel.example/protected/tunnel", "https://tunnel.example/.well-known/oauth-protected-resource/protected/tunnel"},
 		{"https://tunnel.example", "https://tunnel.example/.well-known/oauth-protected-resource"},
+		// §3.1 removes the terminating slash *following the host component*, so a root
+		// path contributes nothing.
 		{"https://tunnel.example/", "https://tunnel.example/.well-known/oauth-protected-resource"},
+		// A non-root trailing slash is part of the path and stays. It had been
+		// stripped, which sent /tenant/ and /tenant to one document while the
+		// comparison below keeps them apart as two identifiers.
+		{"https://tunnel.example/tenant/", "https://tunnel.example/.well-known/oauth-protected-resource/tenant/"},
+		{"https://tunnel.example/a/b/", "https://tunnel.example/.well-known/oauth-protected-resource/a/b/"},
+		{"https://tunnel.example/tenant/?x=1", "https://tunnel.example/.well-known/oauth-protected-resource/tenant/?x=1"},
 		{"https://tunnel.example:8443/protected/tunnel", "https://tunnel.example:8443/.well-known/oauth-protected-resource/protected/tunnel"},
 		{"http://127.0.0.1:8080/protected/tunnel", "http://127.0.0.1:8080/.well-known/oauth-protected-resource/protected/tunnel"},
 		// The query is part of the identifier and rides along.
@@ -42,6 +50,44 @@ func TestProtectedResourceURLDerivation(t *testing.T) {
 		if got != tt.want {
 			t.Fatalf("ProtectedResourceURL(%q) = %q, want %q", tt.resource, got, tt.want)
 		}
+	}
+}
+
+// TestProtectedResourceURLKeepsDistinctIdentifiersDistinct closes the loop between
+// the two halves of this package. NormalizeResourceIdentifier treats /tenant and
+// /tenant/ as different identifiers — asserted in the must-not-collapse list in
+// TestNormalizeResourceIdentifier — so the derivation must not send them to one
+// document. It did, and neither test could see it: one only compared identifiers, the
+// other only derived from paths without a trailing slash.
+func TestProtectedResourceURLKeepsDistinctIdentifiersDistinct(t *testing.T) {
+	for _, tt := range []struct{ a, b string }{
+		{"https://tunnel.example/tenant", "https://tunnel.example/tenant/"},
+		{"https://tunnel.example/a/b", "https://tunnel.example/a/b/"},
+	} {
+		first, err := ProtectedResourceURL(tt.a)
+		if err != nil {
+			t.Fatalf("ProtectedResourceURL(%q): %v", tt.a, err)
+		}
+		second, err := ProtectedResourceURL(tt.b)
+		if err != nil {
+			t.Fatalf("ProtectedResourceURL(%q): %v", tt.b, err)
+		}
+		if first == second {
+			t.Fatalf("%q and %q are distinct identifiers but both derive %q", tt.a, tt.b, first)
+		}
+	}
+	// The root pair is the exception, and it is the one §3.1 names: "https://h" and
+	// "https://h/" are the same resource, so one location is correct.
+	bare, err := ProtectedResourceURL("https://tunnel.example")
+	if err != nil {
+		t.Fatalf("ProtectedResourceURL: %v", err)
+	}
+	slashed, err := ProtectedResourceURL("https://tunnel.example/")
+	if err != nil {
+		t.Fatalf("ProtectedResourceURL: %v", err)
+	}
+	if bare != slashed {
+		t.Fatalf("root forms derived %q and %q, want one location", bare, slashed)
 	}
 }
 
@@ -86,7 +132,7 @@ func protectedResourceServer(t *testing.T, declaredResource func(base string) st
 			AuthorizationServers:   []string{"https://idp.example/realms/main"},
 			BearerMethodsSupported: []string{"header"},
 			ClientID:               "authunnel-cli",
-			ScopesSupported:        []string{"openid", "offline_access"},
+			DefaultScopes:          []string{"openid", "offline_access"},
 		}
 		writeJSON(t, w, document)
 	})

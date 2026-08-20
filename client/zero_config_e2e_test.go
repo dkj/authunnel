@@ -62,10 +62,10 @@ func TestZeroConfigProxyCommandE2E(t *testing.T) {
 	metadataRequests := 0
 	server, wsHTTPClient := newDiscoverableTunnelServer(t, provider.issuer(), "authunnel-server", provider.server.Client(),
 		&tunnelserver.ResourceMetadataConfig{
-			Issuer:   provider.issuer(),
-			ClientID: "authunnel-cli",
-			Audience: "authunnel-server",
-			Scopes:   []string{"openid", "offline_access"},
+			Issuer:        provider.issuer(),
+			ClientID:      "authunnel-cli",
+			Audience:      "authunnel-server",
+			DefaultScopes: []string{"openid", "offline_access"},
 		})
 
 	// The auth client has to reach both the tunnel server (for the document) and
@@ -197,7 +197,7 @@ func TestZeroConfigFailsClearlyWhenServerPublishesNothing(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected discovery against a server publishing nothing to fail")
 	}
-	for _, want := range []string{"--oidc-issuer", "--oidc-client-id"} {
+	for _, want := range []string{"--oidc-client-id", "--oidc-issuer", "--oidc-metadata-url"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %v, want it to name %q", err, want)
 		}

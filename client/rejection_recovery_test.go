@@ -1,12 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"authunnel/internal/authhttp"
 	"authunnel/internal/authmeta"
 )
 
@@ -144,6 +151,208 @@ func TestTokenAfterRejectionDropsTheMetadataOriginPin(t *testing.T) {
 	if source.metadataOriginIsPinned() {
 		t.Fatal("with no published metadata URL in force the derived fetch must not be pinned")
 	}
+}
+
+// TestRecoveryReusesOneGuardedClient is the structural half of the double-wrap
+// finding: that the guard is installed at all, that recovery does not layer a second
+// one, and that the base client never acquires the policy.
+//
+// Each assertion is worth something different, and conflating them is how the bug
+// survived. The base being untouched is the *correctness* invariant — rebuilding the
+// guard from a wrapper rather than from the base is precisely what produced the fault,
+// since RefuseInternalAddresses reads the proxy policy off the transport it is handed.
+// Pointer reuse is not a correctness property: rebuilding from the immutable base
+// would yield an equivalent policy. It is pinned for two narrower reasons — one
+// connection pool across resolutions, and a guard that later acquires state of its own
+// would otherwise be silently re-created. TestTokenAfterRejectionKeepsTheAddressGuard
+// covers what goes wrong behaviourally when the base is not the starting point.
+func TestRecoveryReusesOneGuardedClient(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	source := fixture.discoverySource(t, completingOpener(new(int)))
+	// A public tunnel server, so the guard is installed at all. Without this the
+	// fixture's loopback resource URL classifies as local and every assertion below
+	// passes vacuously — the reason the existing double-resolution test could not see
+	// this bug.
+	source.resourceIsLocal = func(string) bool { return false }
+	base := source.httpClient
+	baseTransport := base.Transport
+
+	// The first resolution is refused: a loopback issuer chosen by a public tunnel
+	// server is exactly what the guard exists to stop. The refusal is incidental here —
+	// what matters is that the guard was built on the way to it.
+	if err := source.resolve(context.Background()); !errors.Is(err, authhttp.ErrUnsafeTransport) {
+		t.Fatalf("error = %v, want the guard to refuse the fixture's loopback issuer", err)
+	}
+	if source.guarded == nil {
+		t.Fatal("guarded is nil after a resolution that needed filtering; nothing below would mean anything")
+	}
+	first := source.guarded
+
+	// Recovery re-resolves from scratch. It fails for the same reason as above, which
+	// is not what this test is about: the question is what the second resolution built.
+	if _, err := source.TokenAfterRejection(context.Background()); err == nil {
+		t.Fatal("expected the recovery's own resolution to be refused too")
+	}
+	if source.guarded != first {
+		t.Fatal("recovery rebuilt the guarded client; one client and one connection pool should serve every resolution")
+	}
+	if source.httpClient != base || source.httpClient.Transport != baseTransport {
+		t.Fatal("the base client acquired the guard; every wrapper must be layered on it, never onto another wrapper's output")
+	}
+	if source.fetchClient() == source.httpClient {
+		t.Fatal("fetchClient returned the base client for a configuration that needs filtering")
+	}
+}
+
+// TestTokenAfterRejectionKeepsTheAddressGuard is the functional half: what the stacked
+// guard actually costs, and why the pointer reuse above matters rather than merely
+// holding.
+//
+// RefuseInternalAddresses reads the proxy policy off the *http.Transport it is handed.
+// Layered onto its own output it finds a destinationGuard there instead, keeps the
+// destination check, and loses the classification that decides whether that check
+// describes the connection. A proxied request then has its destination resolved
+// locally — the one thing internal/authhttp's TestProxiedHTTPSNeedsNoLocalResolution
+// says must never be required, because in a proxied network that name is the proxy's to
+// resolve. So behind a CONNECT proxy the recovery's own resolution fails and the
+// rotation window this path exists to cover never opens.
+//
+// No resolver stub is needed, which is what makes this assertable from package main at
+// all: every request goes through a CONNECT relay, and the tunnel server's address is
+// loopback, which is not merely unresolvable-locally but refused outright by the check
+// that must not run.
+func TestTokenAfterRejectionKeepsTheAddressGuard(t *testing.T) {
+	const (
+		// Reached through the relay, and covered by httptest's certificate, so the
+		// handshake the proxy cannot see into still verifies. Not loopback, because
+		// checkDiscoveredAddress inspects an advertised issuer statically and would
+		// refuse one before any of this.
+		issuer     = "https://example.com"
+		directPath = "/left-direct-for-the-control"
+	)
+	var fetches atomic.Int64
+	var resourceURL string
+	server := newIPv4TLSTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, authmeta.ProtectedResourcePath):
+			fetches.Add(1)
+			writeJSONForTest(t, w, authmeta.ProtectedResource{
+				Resource:               resourceURL,
+				AuthorizationServers:   []string{issuer},
+				BearerMethodsSupported: []string{"header"},
+				ClientID:               "published-cli",
+				DefaultScopes:          strings.Fields(publishedScopes),
+			})
+		case r.URL.Path == "/.well-known/openid-configuration":
+			writeJSONForTest(t, w, map[string]string{
+				"issuer":                 issuer,
+				"authorization_endpoint": issuer + "/auth",
+				"token_endpoint":         issuer + "/token",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	resourceURL = server.URL + "/protected/tunnel"
+
+	// Installed before the source is built, because the guard clones the transport when
+	// it is created and copies Proxy by value as it does.
+	relay := connectRelayForTest(t, server.Listener.Addr().String())
+	client := server.Client()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("fixture client should carry an *http.Transport")
+	}
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req.URL.Path == directPath {
+			return nil, nil // one destination left direct, for the control below
+		}
+		return relay, nil
+	}
+
+	source := newTestSource(t, "", client, failingOpener(t))
+	source.clientID, source.scopes = "", ""
+	source.resourceURL = resourceURL
+	source.resourceIsLocal = func(string) bool { return false }
+
+	// Seeded to match what resolution finds, so the recovery re-resolves and then
+	// reports "nothing changed" without a login: this test is about the resolution.
+	cachePath := filepathForTest(t, "tokens.json")
+	writeTokenCacheForTest(t, cachePath, tokenCache{
+		ResourceURL:  resourceURL,
+		Issuer:       issuer,
+		ClientID:     "published-cli",
+		Scopes:       normalizeScopes(publishedScopes),
+		AccessToken:  "token-the-server-now-refuses",
+		RefreshToken: "refresh-token-1",
+		TokenType:    "Bearer",
+		Expiry:       time.Now().Add(time.Hour),
+	})
+	source.cachePath = cachePath
+
+	if err := source.resolve(context.Background()); err != nil {
+		t.Fatalf("first resolution through the proxy: %v", err)
+	}
+	replacement, err := source.TokenAfterRejection(context.Background())
+	if err != nil {
+		t.Fatalf("the recovery must reach the same documents the first resolution did: %v", err)
+	}
+	if replacement != "" {
+		t.Fatalf("replacement = %q, want none: the configuration is unchanged", replacement)
+	}
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("protected-resource document fetched %d times, want one per resolution", got)
+	}
+
+	// The control, so the two successes above are a proxied request being exempt rather
+	// than no policy being in force at all: the proxy function declines this one
+	// destination, and a direct request to a loopback address is refused on its address.
+	if _, err := source.fetchClient().Get(server.URL + directPath); !errors.Is(err, authhttp.ErrUnsafeTransport) {
+		t.Fatalf("direct request error = %v, want %v; the address guard must be installed", err, authhttp.ErrUnsafeTransport)
+	}
+}
+
+// connectRelayForTest is a blind CONNECT proxy: every tunnel is relayed to one address,
+// whatever host was asked for. internal/authhttp keeps an equivalent fixture for its own
+// tests and cannot export it across packages, and a proxy is the only shape in which the
+// address checks are *skipped* rather than merely satisfied — so a test about that skip
+// needs one on this side too.
+func connectRelayForTest(t *testing.T, to string) *url.URL {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the CONNECT relay: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			downstream, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = downstream.Close() }()
+				if _, err := http.ReadRequest(bufio.NewReader(downstream)); err != nil {
+					return
+				}
+				upstream, err := net.Dial("tcp", to)
+				if err != nil {
+					return
+				}
+				defer func() { _ = upstream.Close() }()
+				if _, err := io.WriteString(downstream, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+					return
+				}
+				go func() { _, _ = io.Copy(upstream, downstream) }()
+				_, _ = io.Copy(downstream, upstream)
+			}()
+		}
+	}()
+	relay, err := url.Parse("http://" + listener.Addr().String())
+	if err != nil {
+		t.Fatalf("parse relay URL: %v", err)
+	}
+	return relay
 }
 
 // completingOpener drives the loopback callback to completion, so a test about

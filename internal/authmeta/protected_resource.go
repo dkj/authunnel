@@ -38,8 +38,6 @@ type ProtectedResource struct {
 	// resource. authunnel publishes exactly one, the issuer it validates
 	// against, and a client reading more than one uses the first.
 	AuthorizationServers []string `json:"authorization_servers,omitempty"`
-	// ScopesSupported are the scopes a client should request.
-	ScopesSupported []string `json:"scopes_supported,omitempty"`
 	// BearerMethodsSupported is ["header"]: the Authorization header is the only
 	// way this server accepts a token.
 	BearerMethodsSupported []string `json:"bearer_methods_supported,omitempty"`
@@ -47,9 +45,25 @@ type ProtectedResource struct {
 	// ClientID is the public client registered for this resource at the
 	// authorization server above.
 	ClientID string `json:"authunnel_client_id,omitempty"`
-	// AuthorizationServerMetadataURL locates the authorization server's own
-	// metadata document when it is not at the path derived from the issuer.
-	// Present only when the resource server itself needed that override.
+	// DefaultScopes are the scopes this server recommends a client request when the
+	// operator configured none — advice about the authorization request, which is why
+	// it is an extension: RFC 9728 has no field for one.
+	//
+	// **Not the registered scopes_supported**, for two reasons. Under §7.2 that field
+	// is a protected resource disclosing the scopes it supports, which is a different
+	// claim from what a client should ask for; adopting such a list wholesale requests
+	// more privilege than the job needs. And authunnel has nothing to disclose there —
+	// it enforces no scope requirement, accepting a token on its signature, audience
+	// and standard claims without reading the `scope` claim at all.
+	DefaultScopes []string `json:"authunnel_default_scopes,omitempty"`
+	// AuthorizationServerMetadataURL locates the authorization server's own metadata
+	// document when it is not at the path derived from the issuer. Absent when the
+	// derivation is enough, which is the common case.
+	//
+	// Not necessarily a location the publishing server fetches itself: it may be
+	// configured for clients alone, since a server pinned to a JWKS endpoint reads no
+	// metadata document at all. So this is "where a client should look", not evidence
+	// of where anything has already been read from.
 	AuthorizationServerMetadataURL string `json:"authunnel_authorization_server_metadata_url,omitempty"`
 	// Audience is the value to send as the provider-specific `audience`
 	// authorization parameter (the Auth0 style).
@@ -109,11 +123,19 @@ func deriveProtectedResourceURL(normalized string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Only a *root* path is dropped: §3.1 removes the terminating slash following the
+	// host component, which is the slash of "https://host/" and not the one in
+	// "https://host/tenant/". Trimming any trailing slash would send two identifiers
+	// this package's own comparison keeps distinct to one document.
+	path := u.EscapedPath()
+	if path == "/" {
+		path = ""
+	}
 	// Assembled from the *escaped* path, then re-parsed, so that an encoded
 	// separator survives. Setting url.URL.Path alone would re-encode from the
 	// decoded form and turn %2F into /, which silently merges two identifiers
 	// that RFC 3986 keeps distinct — see NormalizeResourceIdentifier.
-	derived, err := url.Parse(u.Scheme + "://" + u.Host + ProtectedResourcePath + strings.TrimSuffix(u.EscapedPath(), "/"))
+	derived, err := url.Parse(u.Scheme + "://" + u.Host + ProtectedResourcePath + path)
 	if err != nil {
 		return "", fmt.Errorf("derive metadata URL for %q: %w", normalized, err)
 	}
@@ -128,9 +150,8 @@ func deriveProtectedResourceURL(normalized string) (string, error) {
 // differently. Losing it would put a client's discovery and its token-cache key on a
 // different resource from the one its WebSocket dial actually requests.
 //
-// Exported and used by every reconstruction on this path — the client's own
-// derivation, this package's two, and the server's — because a query rule that each
-// site restates is a query rule that eventually differs between them.
+// Used by every reconstruction on this path — the client's derivation, this package's
+// two, and the server's — so the rule has one definition rather than four.
 func CarryQuery(dst, src *url.URL) {
 	dst.RawQuery = src.RawQuery
 	dst.ForceQuery = src.ForceQuery
@@ -145,17 +166,14 @@ func CarryQuery(dst, src *url.URL) {
 // certificate for that host can supply it — and its `resource` value must equal
 // the identifier the client is actually using.
 //
-// **The comparison is over the whole identifier, not just the origin**, which
-// RFC 9728 §3.3 requires and an earlier version of this function got wrong. It
-// compared scheme, host and port only, on the reasoning that a path-rewriting
-// reverse proxy legitimately sees a different path. The consequence was that one
-// host serving several protected resources could hand a client asking about
-// /a/tunnel a document describing /b/tunnel, and the client would adopt /b's
-// authorization server and client ID — impersonation between resources that share
-// a hostname, which is the case the requirement exists for. A deployment whose
-// externally visible identifier differs from the one the request implies declares
-// it with the server's --resource-url instead; that is configuration, not a reason
-// to weaken the check for everyone.
+// **The comparison is over the whole identifier, not just the origin**, as RFC 9728
+// §3.3 requires. An origin-only comparison lets one host serving several protected
+// resources hand a client asking about /a/tunnel a document describing /b/tunnel,
+// whose authorization server and client ID the client would then adopt —
+// impersonation between resources sharing a hostname, which is the case the
+// requirement exists for. A deployment whose externally visible identifier differs
+// from the one the request implies declares it with the server's --resource-url:
+// that is configuration, not a reason to weaken the check for everyone.
 //
 // Only syntax-based normalisation is applied before comparing (RFC 3986 §6.2.2):
 // scheme and host are case-folded and a redundant default port is dropped, because

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -35,6 +36,7 @@ type discoveryFixture struct {
 	metadataRequests int
 	tokenBodies      []string
 	document         authmeta.ProtectedResource
+	rawDocument      func(map[string]any)
 	redirects        map[string]string
 }
 
@@ -84,8 +86,25 @@ func newDiscoveryFixture(t *testing.T) *discoveryFixture {
 		fixture.mu.Lock()
 		fixture.metadataRequests++
 		document := fixture.document
+		mutate := fixture.rawDocument
 		fixture.mu.Unlock()
-		writeJSONForTest(t, w, document)
+		if mutate == nil {
+			writeJSONForTest(t, w, document)
+			return
+		}
+		// Round-tripped through a map so a test can publish a field the Go type does
+		// not have — a legacy or unknown wire field — which is the only way to assert
+		// that such a field is *not* read.
+		encoded, err := json.Marshal(document)
+		if err != nil {
+			t.Fatalf("marshal fixture document: %v", err)
+		}
+		raw := map[string]any{}
+		if err := json.Unmarshal(encoded, &raw); err != nil {
+			t.Fatalf("unmarshal fixture document: %v", err)
+		}
+		mutate(raw)
+		writeJSONForTest(t, w, raw)
 	}))
 	fixture.ResourceURL = resource.URL + "/protected/tunnel"
 	fixture.document = authmeta.ProtectedResource{
@@ -97,12 +116,20 @@ func newDiscoveryFixture(t *testing.T) *discoveryFixture {
 		// set as the fallback, a test asserting "everything came from the resource
 		// server" passed even with scope adoption removed entirely. Tests that seed a
 		// cache must use publishedScopes, or the identity will correctly fail to match.
-		ScopesSupported: strings.Fields(publishedScopes),
+		DefaultScopes: strings.Fields(publishedScopes),
 	}
 	// One client for both servers: they are both plain http test servers, so the
 	// default transport reaches either.
 	fixture.client = resource.Client()
 	return fixture
+}
+
+// setRawDocument registers a mutation applied to the document's JSON *after* the typed
+// value is encoded, for publishing fields authmeta.ProtectedResource does not carry.
+func (f *discoveryFixture) setRawDocument(mutate func(map[string]any)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rawDocument = mutate
 }
 
 // setRedirect makes path on the authorization server's host redirect elsewhere.
@@ -175,7 +202,7 @@ func TestConfiguredValuesWinOverPublishedOnes(t *testing.T) {
 	fixture.setDocument(func(d *authmeta.ProtectedResource) {
 		d.Audience = "https://published-api.example"
 		d.ResourceIndicator = "https://published-tunnel.example"
-		d.ScopesSupported = []string{"openid"}
+		d.DefaultScopes = []string{"openid"}
 	})
 
 	source := fixture.discoverySource(t, failingOpener(t))
@@ -249,7 +276,7 @@ func TestDiscoveryRefusesPlaintextIssuerWithoutTheOverride(t *testing.T) {
 func TestDiscoveryRefusesMalformedHints(t *testing.T) {
 	for name, mutate := range map[string]func(*authmeta.ProtectedResource){
 		"client ID with a newline": func(d *authmeta.ProtectedResource) { d.ClientID = "cli\n" },
-		"scope with a space":       func(d *authmeta.ProtectedResource) { d.ScopesSupported = []string{"openid profile"} },
+		"scope with a space":       func(d *authmeta.ProtectedResource) { d.DefaultScopes = []string{"openid profile"} },
 		"resource with fragment":   func(d *authmeta.ProtectedResource) { d.ResourceIndicator = "https://api.example#f" },
 		"audience with a newline":  func(d *authmeta.ProtectedResource) { d.Audience = "api\nexample" },
 		"file:// metadata URL": func(d *authmeta.ProtectedResource) {
@@ -314,7 +341,12 @@ func TestUnpublishedMetadataNamesTheFlagsToUse(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected resolution against a server publishing nothing to fail")
 	}
-	for _, want := range []string{"404", "--oidc-issuer", "--oidc-client-id"} {
+	// The advice must name the client ID *and* both ways of locating the authorization
+	// server: an operator told only about --oidc-issuer would not learn that
+	// --oidc-metadata-url stands in for it, which is the whole of this feature's
+	// configuration surface. Asserting only the first two passed even before the
+	// alternative was offered.
+	for _, want := range []string{"404", "--oidc-client-id", "--oidc-issuer", "--oidc-metadata-url"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %v, want it to mention %q", err, want)
 		}
@@ -1328,7 +1360,7 @@ func TestMalformedHintStillFailsWhenItWouldBeUsed(t *testing.T) {
 //
 // The default is applied at parse time only when nothing will be discovered. Applying
 // it unconditionally would make the fallback indistinguishable from an explicit
-// choice, and the resource server's scopes_supported could then never win — which is
+// choice, and the resource server's published default could then never win — which is
 // what the code comment says must not happen, and what no test checked.
 func TestPublishedScopesBeatTheDefaultButNotAFlag(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
@@ -1377,5 +1409,36 @@ func TestPublishedScopesBeatTheDefaultButNotAFlag(t *testing.T) {
 	}
 	if cfg.OIDCScopes != normalizeScopes(defaultOIDCScopes) {
 		t.Fatalf("OIDCScopes = %q, want the default applied when nothing is discovered", cfg.OIDCScopes)
+	}
+}
+
+// TestRegisteredScopesSupportedIsNotAdopted is what makes the field rename real
+// rather than cosmetic: a document publishing only the registered scopes_supported
+// must be ignored, and the client falls back to its own default.
+//
+// RFC 9728 §7.2 is the reason. scopes_supported is a protected resource disclosing
+// the scopes *it* supports — a statement about the resource, not advice about the
+// request — so an authorization request must not be built from it, or the client asks
+// for whatever happens to be supported. Only the extension field, which a publisher
+// sets to say "ask for these", is adopted.
+//
+// The published set differs from defaultOIDCScopes on purpose. Were they equal, this
+// test would pass whether the field was adopted or ignored.
+func TestRegisteredScopesSupportedIsNotAdopted(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	fixture.setRawDocument(func(document map[string]any) {
+		delete(document, "authunnel_default_scopes")
+		document["scopes_supported"] = []string{"openid", "offline_access", "admin:everything"}
+	})
+
+	source := fixture.discoverySource(t, failingOpener(t))
+	if err := source.resolve(context.Background()); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if source.effective.Scopes != normalizeScopes(defaultOIDCScopes) {
+		t.Fatalf("scopes = %q, want the client's own default: scopes_supported is a resource's disclosure of what it supports, not advice on what to request", source.effective.Scopes)
+	}
+	if strings.Contains(source.effective.Scopes, "admin:everything") {
+		t.Fatal("a scope advertised as merely supported was requested")
 	}
 }

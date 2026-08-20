@@ -338,7 +338,8 @@ curl -s https://localhost:8443/.well-known/oauth-protected-resource --cacert dev
 The client flags below are all optional. Anything not passed is read from the
 tunnel server's protected-resource metadata, so `--tunnel-url` alone is a working
 configuration when the server publishes the hints (`--client-id`,
-`--client-scopes`, `--client-audience`, `--client-resource`). Passing a value
+`--client-default-scopes`, `--client-audience`, `--client-resource`,
+`--client-oidc-metadata-url`). Passing a value
 overrides what the server publishes. The examples above keep `--oidc-issuer` and
 `--oidc-client-id` explicit because they predate publication and still work; adding
 `--no-resource-metadata` to them turns "the client happens not to need the lookup"

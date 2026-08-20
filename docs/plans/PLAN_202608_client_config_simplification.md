@@ -148,7 +148,7 @@ Standard fields, all derived from configuration the server already has:
 | `resource` | Request scheme and host (honouring `X-Forwarded-Proto`/`-Host` under `--plaintext-behind-reverse-proxy`, via the existing `requestScheme`/`requestHost` helpers) plus the canonical tunnel path. |
 | `authorization_servers` | `--oidc-issuer`. |
 | `bearer_methods_supported` | `["header"]`. It is the only method the server accepts. |
-| `scopes_supported` | `--client-scopes` when set. |
+| `authunnel_default_scopes` | `--client-default-scopes` when set. Round twelve moved this off the registered `scopes_supported`; see that section for why. |
 
 Deriving `resource` from the request rather than from a new `--public-url` flag is deliberate. The
 Host header is client-controllable, so a caller can make the document describe a resource identifier
@@ -249,7 +249,7 @@ applies unchanged here.
 
 The hint fields need their own bounds, because they end up in places a URL check does not cover.
 `authunnel_client_id` is interpolated into an authorization URL that is handed to the OS scheme
-dispatcher, and `scopes_supported` into the same URL's query: both are length-capped and restricted
+dispatcher, and the published scope list into the same URL's query: both are length-capped and restricted
 to the character sets RFC 6749 already defines for them (`client_id` as `*VSCHAR`, each scope token
 as `NQCHAR`). `authunnel_resource` gets the RFC 8707 rule the flag already enforces — absolute URI,
 no fragment.
@@ -387,7 +387,7 @@ Anchors verified programmatically, as in the previous plan.
 
    The scopes default had to move. `parseClientConfig` applied `openid offline_access` whenever
    `--oidc-scopes` was unset, which makes "unset" and "explicitly the default" indistinguishable —
-   and `scopes_supported` could then never win. The default is now applied at parse time only when
+   and the server-published default could then never win. The default is now applied at parse time only when
    nothing will be discovered, and by the resolver otherwise. Keeping it at parse time in the
    non-discovery case is deliberate: it leaves the load-time cache comparison strict there, exactly
    as before.
@@ -562,3 +562,202 @@ fetch, refusing the very delegation this split exists to permit. Fixed by deleti
 so there is nothing left to forget. A property established at one moment and stored outlives the thing
 it described — the fix for that is to compute it from the state it is a property *of*, not to add
 another line to a reset.
+
+## Round twelve: external review before the PR
+
+An external review of the branch raised five P2 findings and a simplification recommendation. All
+five were verified against the code before any decision was taken; two of them contradict choices
+recorded earlier in this plan, and those were put back to the operator rather than settled here.
+Two of the five are cases where a *comment in this repository argued for the wrong behaviour*, which
+is the failure mode rounds four to eleven kept finding, so they are treated as such.
+
+### Verified verdicts
+
+| # | Finding | Verdict |
+|---|---------|---------|
+| 1 | `scopes_supported` treated as "request all of these" | **True.** `applyResourceMetadata` adopts `strings.Join(document.ScopesSupported, " ")` verbatim — no intersection, no cap beyond `maxScopeBytes`. Under RFC 9728 §7.2 the field is the *protected resource* disclosing the scopes it supports; it does not mean every listed scope should be requested, and a client asks only for what it needs. The wire field's own doc comment read "the scopes a client should request", which is the reading §7.2 warns against. |
+| 2 | Server validation config coupled to client publication | **True, and unavoidable today.** `--oidc-metadata-url` and `--oidc-jwks-uri` are mutually exclusive (`server.go:885`), and the published hint is `cfg.OIDCMetadataURL` verbatim (`server.go:1029`), so pinned-JWKS isolation forces the hint to be absent. The comment defending this ("a separate value could only ever be set inconsistently") rests on a premise `pinned_jwks` mode explicitly breaks — and `DEVELOPMENT.md` already says so elsewhere. |
+| 3 | Proxied HTTPS bypasses the address guard | **True. Deliberate in code; incompletely described in the deployment documentation** — which is what work item E exists to correct, so "documented" would contradict this plan's own remedy. TLS authenticates a hostname, which is not proof the address is public. |
+| 4 | Guard stacking on re-resolution | **True, and worse than reported.** The second wrap finds a `*destinationGuard` rather than an `*http.Transport`, takes the fallback branch with `proxyFor == nil`, and so applies `CheckPublicAddress` to *proxied HTTPS* — the one check that path exists to skip. Behind a CONNECT proxy the lockout recovery therefore fails on local DNS. Zero test coverage: the only double-resolution test never installs the guard. |
+| 5 | §3.1 trailing-slash derivation | **True, and internally inconsistent.** `TrimSuffix(EscapedPath(), "/")` sends `/tenant` and `/tenant/` to one metadata location, while `protected_resource_test.go:220` pins those two as identifiers that must *not* collapse. Masked against authunnel's own server by subtree routing; it bites a conformant third-party resource server. |
+
+The reviewer also confirmed the empty-query finding as already fixed at head, and re-raised guard
+stacking and the trailing slash as previously-noted-but-open. Both were open. That is the cost of
+recording a finding without a failing test.
+
+### Decisions taken
+
+1. **Scopes — publish a namespaced field.** `scopes_supported` is dropped from the document, and
+   note *why* rather than only that it was misread: §7.2's field is a disclosure by the resource of
+   the scopes it supports, and authunnel supports no scope requirement at all — it reads no `scope`
+   claim — so it has nothing truthful to put there. What it can offer is advice about the request;
+   `authunnel_default_scopes` replaces it, and only that field is adopted. The registered field's
+   meaning is left to the registry. The flag is renamed `--client-default-scopes` so the operator
+   interface mirrors the wire field, and "default" says what the precedence already does: a client's
+   own `--oidc-scopes` still wins.
+2. **Split the metadata URL by *question*, not by process.** New `--client-oidc-metadata-url` for
+   publication, falling back to `--oidc-metadata-url` when unset, and permitted alongside
+   `--oidc-jwks-uri`. The two flags answer "where does *this process* fetch keys" and "where should
+   *clients* fetch metadata"; the mutual exclusion is right for the first and was wrongly extended
+   to the second.
+3. **Proxied HTTPS stays allowed, on stated preconditions.** A non-intercepting CONNECT proxy
+   preserves end-to-end certificate verification, and that — not the proxy's egress policy — is what
+   the trust rests on. The residual discovery-driven SSRF case is an internal endpoint presenting a
+   certificate trusted for its requested hostname.
+
+   **What `--oidc-issuer` does and does not answer.** It stops the *resource server* from selecting
+   that hostname, which is the only part of this a client-side flag can reach. It is **not** a
+   defence against TLS interception: a proxy holding a client-trusted CA can forge metadata carrying
+   the configured issuer, so an intercepting proxy is trusted with the OAuth exchange and must either
+   be accepted as such or bypassed for these destinations. Nor does it make an operator-configured
+   internal issuer *safe* — that is simply a destination the operator has chosen to trust, which is
+   the documented position on configured values everywhere else in this work. No code change; the
+   documentation stops implying the guard covers this path.
+4. **Keep the 401/403 recovery; fix the wrapper.** The requirement it meets, stated so the
+   complexity is auditable: **seamless server-configuration rotation during the lifetime of a cached
+   access token.** It is not an unbounded lockout — once the cached access token expires the ordinary
+   slow path re-resolves and recovers on its own, so what the recovery buys is the window before
+   that, not eventual recovery. If seamless mid-token rotation is not a requirement, this remains
+   the largest removable piece of complexity in the branch, and that is the trade to revisit first.
+
+   The bug is separate from the question of whether to keep it: the accidental second wrapper, whose
+   local DNS check breaks otherwise valid proxy-side resolution — the very thing decision 3's trust
+   model depends on. Fixed by making `httpClient` immutable and building the guarded client once.
+5. **One PR.** The safe-logging boundary is a prerequisite of this feature rather than a tangent:
+   zero-config means the tunnel server chooses the token endpoint whose errors reach the terminal,
+   and a dependency renders some of that text itself. The `internal/ipblock` move exists because
+   client and server now ask one question. Splitting either would land discovery with a known
+   unescaped-output path.
+
+### Work items
+
+**A. Scopes (finding 1).** Rename the wire field to `authunnel_default_scopes` in
+`internal/authmeta/protected_resource.go` and correct its doc comment to say what it is — a default
+the publisher suggests, not a capability list. Rename `ResourceMetadataConfig.Scopes` usage in
+`internal/tunnelserver/resourcemeta.go:112`, and the flag/env in `server/server.go` (`--client-scopes`
+→ `--client-default-scopes`, `CLIENT_SCOPES` → `CLIENT_DEFAULT_SCOPES`), including the usage text and
+the `--no-resource-metadata` hint-rejection list. The client's hint-table entry in
+`applyResourceMetadata` (`client/auth.go:597`) changes field and label only — the precedence chain,
+the validate-the-slice-not-the-joined-string note, and the `defaultOIDCScopes` fallback all stand.
+Update the `scopes_supported` row in `docs/DEPLOYMENT.md:223`.
+
+**B. Metadata URL split (finding 2).** Add `ClientOIDCMetadataURL` to `serverConfig` with flag and
+env, validated by the same `authhttp.CheckConfiguredURL` rule as the server's own. In
+`resourceMetadata()` (`server/server.go:1029`) publish `cfg.ClientOIDCMetadataURL` when set, else
+`cfg.OIDCMetadataURL`. Delete the "could only ever be set inconsistently" comment and rewrite
+`TestAuthorizationServerMetadataURLHintTracksServerConfig`'s premise; add cases for the new flag
+alone, the fallback, and the previously impossible `--oidc-jwks-uri` + published-hint combination.
+Remove the pinned-JWKS caveat from `docs/DEPLOYMENT.md` § *Issuer metadata and key discovery*.
+
+**C. Client HTTP-client lifecycle (finding 4).** `httpClient` becomes write-once; add a `guarded`
+field and one accessor:
+
+```go
+func (s *managedOIDCTokenSource) fetchClient() *http.Client {
+	if s.allowInternalTargets || !s.authorizationServerIsRemotelyChosen() {
+		return s.httpClient
+	}
+	if s.guarded == nil {
+		s.guarded = authhttp.RefuseInternalAddresses(s.httpClient)
+	}
+	return s.guarded
+}
+```
+
+Delete the assignment at `client/auth.go:430`; route the protected-resource fetch, the
+authorization-server fetch (`:495`, still origin-pinned on top where applicable) and
+`credentialClient()` (`:916`) through it. The condition is a pure function of *configured* fields —
+`authorizationServerIsRemotelyChosen` reads only `s.resourceURL`/`s.issuer`/`s.metadataURL`, none
+assigned after construction, and `allowInternalTargets` comes from the syntactic
+`HostIsAlwaysLocal` — so one client is correct for every resolution. Memoise only the positive
+verdict: a cached "no guard needed" is the one way this shape could silently disable the guard. No
+extra synchronisation — every path already holds `s.mu`. Add a paragraph to
+`RefuseInternalAddresses`' doc saying it must be applied to a base client and never to its own
+output, because `authmeta.fetchDocument` documents the opposite rule for the `CheckRedirect`
+wrappers and that is what invited this.
+
+**D. Trailing slash (finding 5).** In `deriveProtectedResourceURL`, strip the path only when it is
+exactly `/` — §3.1 removes the terminating slash *following the host component*, which is also why
+it mentions the query case. Table-drive the derivation over `/`, `/tenant`, `/tenant/`, `/a/b/`, and
+assert that the two identifiers the must-not-collapse list keeps distinct derive distinct locations.
+`NormalizeResourceIdentifier` is already correct and does not change.
+
+**E. Documentation (finding 3 and the comment sweep).** In `docs/DEPLOYMENT.md` § *Discovered
+addresses and the internal-address guard*, replace the current proxy passage with decision 3 as
+written above: allowed because a non-intercepting CONNECT proxy preserves end-to-end certificate
+verification; the residual case is an internal endpoint with a certificate trusted for its requested
+hostname; `--oidc-issuer` removes the resource server's ability to *name* that host and is not a
+defence against interception, which is a separate trust decision about the proxy itself.
+
+Three specific sentences to correct, all already located: `DEPLOYMENT.md:301` ("TLS is the binding")
+overstates what a certificate proves — it binds the hostname; `DEPLOYMENT.md:391` ("Three layers,
+because each sees something the others cannot") is true only of the direct path and must say so; and
+`DEPLOYMENT.md:413` offers "the proxy's own egress policy" as the control for a TLS-terminating proxy,
+which is the wrong control — an intercepting proxy is trusted with the OAuth exchange itself, and the
+choice is to accept that or bypass it for these destinations. `README.md`'s "Enforced at three
+layers" bullet inherits the same overstatement, as does `docs/DEVELOPMENT.md`'s summary. The three
+preconditions belong in DEPLOYMENT as the conditions under which the model holds, not as a footnote.
+
+Then the comment sweep: `internaladdr.go`'s package doc and `protected_resource.go` still argue cases
+rather than state invariants, and `internaladdr.go`'s claim that "TLS binds the origin" needs the
+same correction as the prose — it binds the *hostname*, which is a different and weaker statement.
+
+### Verification
+
+Per work item, and every security-relevant assertion mutation-checked as in the rounds above:
+
+- **A**: a client configured with `--oidc-scopes` still overrides; a document with no
+  `authunnel_default_scopes` falls back to `openid offline_access`; a document carrying only the old
+  `scopes_supported` is *ignored* — that last one is the mutation that proves the field rename took
+  effect rather than both being read.
+- **B**: `--oidc-jwks-uri` with `--client-oidc-metadata-url` starts, publishes the hint, and makes
+  no startup metadata fetch. Assert the fetch count, not just the config.
+- **C**: two tests, because "the recovery succeeded" and "the guard was installed at all" are
+  different claims and success alone can satisfy the first while failing the second.
+
+  *Structural.* After the first resolution, `s.guarded` is non-nil — the guard really was installed,
+  so nothing below is vacuous. After `TokenAfterRejection`, it is the **same pointer**, and
+  `s.httpClient.Transport` is unchanged from construction. Note what each assertion is worth, so a
+  later reader does not mistake one for the other: the base being untouched is the *correctness*
+  invariant, since rebuilding from a wrapper is what produced the bug. Pointer reuse is not — a
+  rebuild from the immutable base would yield an equivalent policy — and it is pinned for two
+  narrower reasons: one connection pool across resolutions, and a guard that later acquires state of
+  its own would otherwise be silently re-created. The test says which is which.
+
+  *Functional*, and retained because it is what makes pointer reuse matter rather than merely hold:
+  `TestTokenAfterRejectionKeepsTheAddressGuardUnwrapped` — resolve, then recover through the real
+  `TokenAfterRejection`, every request via a blind CONNECT relay to a loopback `httptest` server. One
+  wrap: the proxy branch skips the checks and both fetches succeed. Two wraps: `CheckPublicAddress`
+  refuses `127.0.0.1`. No resolver stub needed, which is what makes this assertable from package
+  `main` at all. Two anti-vacuity mutations: drop `resourceIsLocal` (the control must fail) and drop
+  `transport.Proxy` (the *first* resolution must fail).
+- **D**: the derivation table above, plus the existing exact-comparison test still passing.
+- Whole tree: `gofmt`, `go vet`, `go test ./...`, `-race`, `make lint`, link/anchor check, `make
+  build` help output for the two renamed/added flags, and the zero-config e2e.
+
+### Outcome
+
+All five items landed, each mutation-verified. What the mutations showed, beyond "the tests fail":
+
+- **C**: restoring the cumulative wrap fails the two new tests and **nothing else in the repo** —
+  which is exactly why the bug survived review twice. The functional test reproduces the reported
+  failure verbatim: `refusing to reach an internal address named by a remote metadata document` on
+  the *second* resolution, for a proxied request whose address should never have been checked.
+  Rebuilding the guard from the base rather than from its own output leaves the functional test green
+  and trips only the pointer-reuse assertion, confirming those two assertions pin different
+  properties — as the test comments now say.
+- **A**: the field rename is caught by `TestRegisteredScopesSupportedIsNotAdopted` (client) and
+  `TestPublishedWireKeysAreTheAgreedOnes` (server). The latter was added because every other server
+  test decodes into the Go type and would follow a renamed tag anywhere; it asserts JSON keys, and
+  that `scopes_supported` is absent. The client fixture gained a raw-JSON hook, since publishing a
+  field the Go type does not carry is the only way to assert that such a field is *not* read.
+- **B**: pinned both directions — dropping the new flag fails three tests, dropping the fallback to
+  `--oidc-metadata-url` fails the fourth. `TestPinnedJWKSSkipsDiscovery` already pinned zero metadata
+  fetches in that mode, and the published value never reaches `NewJWTTokenValidator`, so the
+  isolation property is untouched; the new test asserts that explicitly.
+- **D**: pinned from both sides — the blanket `TrimSuffix` fails the derivation and distinctness
+  tests, and stripping nothing fails the root case.
+
+`gofmt`, `go vet`, full suite, `-race`, `make lint` (0 gosec issues), link/anchor check, complexity
+gate, both binaries' help text, and the e2e suite all pass; only the Keycloak e2e skips, as it always
+does without a live server.

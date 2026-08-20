@@ -187,14 +187,11 @@ Development / unsafe overrides (do not use in production):
 // upgrade request over http(s) — and RFC 9728's derivation is defined for http
 // and https.
 //
-// **The query is part of the identifier and is kept.** It had been dropped here,
-// with a comment claiming the derivation dropped it anyway; that stopped being
-// true when the derivation was corrected to carry it, and the consequence was
-// worse than an inconsistency. The WebSocket dial sends the query, so
-// `?tenant=a` and `?tenant=b` are two resources as far as the server is
-// concerned, while this function collapsed them to one identifier — one set of
-// discovered configuration and, because the identifier is the cache key, one set
-// of cached credentials. A token obtained for one tenant would be presented for
+// **The query is part of the identifier and is kept.** The WebSocket dial sends it,
+// so `?tenant=a` and `?tenant=b` are two resources as far as the server is
+// concerned. Dropping it here would collapse them to one identifier — one set of
+// discovered configuration and, since the identifier is the cache key, one set of
+// cached credentials — so a token obtained for one tenant would be presented for
 // the other.
 //
 // The fragment is dropped rather than refused, because this is where the client
@@ -297,7 +294,7 @@ func parseClientConfig(args []string, getenv func(string) string) (clientConfig,
 	fs.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Auth0-style 'audience' parameter requested during managed login")
 	fs.StringVar(&cfg.OIDCResource, "oidc-resource", "", "RFC 8707 'resource' parameter requested during managed login; sets the token 'aud' on providers that bind it (e.g. AWS Cognito)")
 	// Empty rather than the default value, so "not set" stays distinguishable
-	// from "set to the default": the resource server's scopes_supported must be
+	// from "set to the default": the resource server's published default must be
 	// able to win over the fallback but not over an explicit choice.
 	fs.StringVar(&cfg.OIDCScopes, "oidc-scopes", "", "Space-delimited OIDC scopes for managed login (default: the scopes the tunnel server publishes, else \"openid offline_access\")")
 	fs.StringVar(&cfg.OIDCCache, "oidc-cache", "", "Token cache path for managed OIDC login")
@@ -420,7 +417,7 @@ func applyManagedOIDCDefaults(cfg *clientConfig, needsDiscovery bool) error {
 	cfg.OIDCScopes = normalizeScopes(cfg.OIDCScopes)
 	// The scope default is applied here only when nothing will be discovered.
 	// Applying it unconditionally would make the fallback indistinguishable from
-	// an explicit choice, and the resource server's scopes_supported could then
+	// an explicit choice, and the resource server's published default could then
 	// never win — the resolver applies the same default itself when the document
 	// offers none.
 	if cfg.OIDCScopes == "" && !needsDiscovery {

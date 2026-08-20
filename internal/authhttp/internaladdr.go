@@ -28,10 +28,19 @@ import (
 //     connection, dials the address it checked. The attacker chose the hostname and
 //     so controls its DNS: a name that resolves publicly during the check can resolve
 //     to loopback a moment later.
-//   - A proxied request skips the address checks rather than applying them, because
-//     the proxy resolves the destination and the local answer describes nothing.
-//     https is allowed, since TLS binds the origin instead; plaintext is refused,
-//     since nothing does.
+//   - A proxied request skips *these* checks rather than applying them, because the
+//     proxy resolves the destination and a local answer describes nothing. https is
+//     allowed, on certificate verification instead; plaintext is refused, since
+//     nothing binds it at all. Only the two layers in this file are proxy-aware —
+//     CheckPublicAddress, called by a caller against a value it was handed, runs
+//     regardless.
+//
+// The proxied-https limit, stated exactly because it is easy to over-read: the
+// handshake binds the *hostname*, not the address, so an internal service holding a
+// certificate valid for a name a document supplied still passes. Accepted on three
+// conditions — a non-intercepting CONNECT proxy, https-only endpoints, and internal
+// services not presenting client-trusted certificates under remotely guessable names —
+// which DEPLOYMENT.md states. Do not call this TLS "binding the origin".
 
 // resolveTimeout bounds the lookup CheckPublicAddress performs. Short: it is one
 // DNS query, and it sits on the interactive login path.
@@ -98,7 +107,9 @@ func CheckPublicAddress(ctx context.Context, label, rawURL string) error {
 //
 // The cost is that a development host reached through a private alias in /etc/hosts is
 // not recognised, so a loopback authorization server discovered from it is refused.
-// Such setups configure --oidc-issuer and --oidc-client-id, which are not filtered.
+// Such setups configure the values instead: --oidc-client-id, plus either
+// --oidc-issuer or --oidc-metadata-url — an authorization-server location the operator
+// chose is not filtered.
 func HostIsAlwaysLocal(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -129,6 +140,16 @@ func HostIsAlwaysLocal(rawURL string) bool {
 // The copy matters for the same reason it does in RefuseTransportDowngrade: the
 // caller's client is shared with other auth traffic and must not acquire this
 // policy as a side effect.
+//
+// **Apply it to a base client, never to the client it returns.** Unlike the
+// CheckRedirect wrappers in this package — where a second application is the same
+// policy layered twice, as authmeta.fetchDocument's comment describes — this one reads
+// the proxy policy off the *http.Transport underneath. A second call finds a
+// destinationGuard there instead, takes the no-dialer branch below with a nil
+// proxyFor, and so keeps the destination check while losing the classification that
+// decides whether that check describes the connection at all. The result silently
+// resolves proxied destinations locally, which is the one thing the proxy branch of
+// destinationGuard.RoundTrip exists to avoid.
 func RefuseInternalAddresses(base *http.Client) *http.Client {
 	guarded := *base
 	inner := base.Transport
@@ -178,16 +199,17 @@ func (g *destinationGuard) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		if proxyURL != nil {
 			if req.URL.Scheme != "https" {
-				return nil, refusef("refusing to reach %s over %s via the proxy at %s: a proxy resolves the destination itself, and plaintext offers nothing to verify it against, so this client cannot tell where configuration discovered from a remote party would send its traffic. Add the host to NO_PROXY if it is directly reachable, or configure --oidc-issuer and --oidc-client-id explicitly",
+				return nil, refusef("refusing to reach %s over %s via the proxy at %s: a proxy resolves the destination itself, and plaintext offers nothing to verify it against, so this client cannot tell where configuration discovered from a remote party would send its traffic. Add the host to NO_PROXY if it is directly reachable, or configure --oidc-client-id and either --oidc-issuer or --oidc-metadata-url explicitly",
 					req.URL.Host, req.URL.Scheme, proxyURL.Host)
 			}
 			// https via a proxy: the transport issues CONNECT and then handshakes
 			// with the origin itself, validating the certificate against this
-			// name, so the origin is bound without help from us. The address
-			// checks are skipped rather than applied — the local resolver's answer
-			// is not the one the connection will use, and a proxied network often
-			// has no local answer to give — and the dial is exempted, since it goes
-			// to the proxy.
+			// name. That binds the hostname and nothing more — it is not evidence
+			// the destination is external, which is the accepted limit recorded at
+			// the top of this file. The address checks are skipped rather than
+			// applied, since the local resolver's answer is not the one the
+			// connection will use and a proxied network often has no local answer
+			// to give, and the dial is exempted because it goes to the proxy.
 			return g.next.RoundTrip(req.WithContext(context.WithValue(req.Context(), proxiedDialKey{}, true)))
 		}
 	}

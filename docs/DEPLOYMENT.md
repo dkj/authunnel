@@ -90,11 +90,12 @@ For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origi
 - `--oidc-metadata-url` or `OIDC_METADATA_URL` — authorization server metadata document URL, overriding the well-known path derived from the issuer. Use this for an authorization server that publishes RFC 8414 metadata at a path the OIDC derivation cannot construct (RFC 8414 inserts the well-known segment *before* the path component, so an issuer of `https://as.example/tenant1` publishes at `https://as.example/.well-known/oauth-authorization-server/tenant1`), or whose metadata sits off the issuer path entirely. The document's `issuer` is compared against `--oidc-issuer`, but that self-asserted value catches an honestly-wrong URL rather than a hostile one. Trust the configured URL as much as the issuer. Mutually exclusive with `--oidc-jwks-uri`
 - `--oidc-jwks-uri` or `OIDC_JWKS_URI` — pinned JWKS endpoint. Skips metadata discovery so the resource server's auth egress can be restricted to the key endpoint instead of the issuer's discovery, authorization, and token services. Requires runtime JWKS egress as described below. Because no metadata document supplies the endpoint, the issuer-to-keys binding is asserted by your configuration. Mutually exclusive with `--oidc-metadata-url`
 - `--token-audience` or `TOKEN_AUDIENCE`
+- `--client-oidc-metadata-url` or `CLIENT_OIDC_METADATA_URL` — authorization server metadata document URL published to clients. Defaults to `--oidc-metadata-url`. Unlike it, may be combined with `--oidc-jwks-uri`: this server never fetches the published value, so pinned-JWKS isolation and a non-derivable client metadata location can coexist
 - `--client-id` or `CLIENT_ID` — public OIDC client ID published to clients, so they need no `--oidc-client-id` of their own. This is the client you registered at the IdP for authunnel; it is not a secret. See [Protected-resource metadata and zero-configuration clients](#protected-resource-metadata-and-zero-configuration-clients)
-- `--client-scopes` or `CLIENT_SCOPES` — space-delimited scopes clients should request. Include `offline_access` unless you want every `ssh` past the access token's lifetime to open a browser
+- `--client-default-scopes` or `CLIENT_DEFAULT_SCOPES` — space-delimited scopes clients should request when they configure none; a client's own `--oidc-scopes` wins. Include `offline_access` unless you want every `ssh` past the access token's lifetime to open a browser. Published as the extension field `authunnel_default_scopes`, not as `scopes_supported`. Under RFC 9728 §7.2 that registered field is the *protected resource* disclosing the scopes it supports, which is a different question from which of them a client should ask for — and authunnel discloses none there, because it enforces no scope requirement: a token is accepted on its signature, audience and standard claims, and its `scope` claim is never read. This flag is advice about the authorization request, which is what a client actually needs to know
 - `--client-audience` or `CLIENT_AUDIENCE` — value clients should send as the provider-specific `audience` authorization parameter (the Auth0 style)
 - `--client-resource` or `CLIENT_RESOURCE` — value clients should send as the RFC 8707 `resource` authorization parameter, for providers that bind the token `aud` to it (e.g. AWS Cognito). Set whichever of these two your IdP implements: this server knows what audience it requires, but not how yours wants it asked for, and a provider ignores the parameter it does not implement silently — producing a login that succeeds and a token this server then rejects
-- `--no-resource-metadata` or `NO_RESOURCE_METADATA=true` — do not publish the protected-resource document, and omit the `WWW-Authenticate` challenge that points at it. Clients then need their own `--oidc-issuer` and `--oidc-client-id`. Setting any `--client-*` hint alongside this is a startup error, since nothing would publish it
+- `--no-resource-metadata` or `NO_RESOURCE_METADATA=true` — do not publish the protected-resource document, and omit the `WWW-Authenticate` challenge that points at it. Clients then need their own `--oidc-client-id` and either `--oidc-issuer` or `--oidc-metadata-url`. Setting any `--client-*` hint alongside this is a startup error, since nothing would publish it
 - `--listen-addr` or `LISTEN_ADDR` (default varies by TLS mode; see above)
 - `--log-level` or `LOG_LEVEL` with default `info`
 - `--tls-cert` or `TLS_CERT_FILE` — path to TLS certificate PEM
@@ -190,6 +191,16 @@ when it cannot reuse a valid cached access token, the configured or derived meta
 authorization endpoint, and token endpoint. Server-side JWKS pinning does not reduce client
 egress and has no client-side equivalent.
 
+Because the requirements differ, so do the flags. `--oidc-metadata-url` is where *this server*
+fetches the document for JWT validation, and `--client-oidc-metadata-url` is the location published
+to clients; the second defaults to the first, which is right whenever both read the same document.
+Set them apart when the authorization server publishes RFC 8414 metadata at a path the OIDC
+derivation cannot construct **and** you are pinning JWKS: this server then reads no metadata document
+at all, so an egress policy can deny it the discovery host, while clients are still told where their
+document lives. `--oidc-jwks-uri` remains mutually exclusive with `--oidc-metadata-url` — one process
+cannot both skip discovery and be given a document to fetch — but not with the client-facing flag,
+which this server never requests.
+
 ## Protected-resource metadata and zero-configuration clients
 
 This section spans both binaries: the server publishes the document, the client reads it.
@@ -206,9 +217,9 @@ $ curl -s https://tunnel.example/.well-known/oauth-protected-resource | jq
 {
   "resource": "https://tunnel.example/protected/tunnel",
   "authorization_servers": ["https://idp.example/realms/main"],
-  "scopes_supported": ["openid", "offline_access"],
   "bearer_methods_supported": ["header"],
-  "authunnel_client_id": "authunnel-cli"
+  "authunnel_client_id": "authunnel-cli",
+  "authunnel_default_scopes": ["openid", "offline_access"]
 }
 ```
 
@@ -220,9 +231,9 @@ has no room for but a client cannot start without:
 | --- | --- | --- |
 | `resource` | derived from the request's scheme and host | — (checked by the client against the URL it used) |
 | `authorization_servers` | `--oidc-issuer` | `--oidc-issuer` |
-| `scopes_supported` | `--client-scopes` | `--oidc-scopes` |
+| `authunnel_default_scopes` | `--client-default-scopes` | `--oidc-scopes` |
 | `authunnel_client_id` | `--client-id` | `--oidc-client-id` |
-| `authunnel_authorization_server_metadata_url` | the server's own `--oidc-metadata-url` | `--oidc-metadata-url` |
+| `authunnel_authorization_server_metadata_url` | `--client-oidc-metadata-url`, else `--oidc-metadata-url` | `--oidc-metadata-url` |
 | `authunnel_audience` | `--client-audience` | `--oidc-audience` |
 | `authunnel_resource` | `--client-resource` | `--oidc-resource` |
 
@@ -285,34 +296,52 @@ missing — no client ID, or neither issuer nor metadata URL — so an invocatio
 everything makes no additional request, and no fetch ever happens on a cache hit. Discovered URLs
 are held to the same rules as configured ones: `https` unless `--insecure-oidc-issuer`, `file://`
 refused either way, and no downgrade relative to the tunnel URL, so an `https` tunnel cannot send
-a client to a plaintext authorization server. **A metadata fetch also may not leave the origin it
-started on**: a check on where a fetch begins pins nothing if the fetch may end elsewhere, and an open
-redirect on the expected host would otherwise let a third party supply the document. The same pin
-applies to the token request, where a 307 preserves the body and a cross-origin hop would forward a
-refresh token or an authorization code.
+a client to a plaintext authorization server. Redirects may not downgrade onto plaintext either, and
+the **token requests may not change origin at all**: a 307 preserves the body, so that hop would
+forward a refresh token or an authorization code. A metadata fetch is pinned the same way in the one
+case where an origin was promised — see [What `--oidc-issuer` pins, precisely](#what---oidc-issuer-pins-precisely).
 
 They are additionally held to the resolved-IP deny-list (RFC 9728 §7.7): a client that reached its
 tunnel server over a public address refuses to follow that server to loopback, a link-local address,
-or a cloud instance-metadata service. **Clients behind an HTTP proxy keep working** because it is
-what decides how much the address checks are carrying. Through a proxy the destination is resolved by
-the proxy, so those checks report on a lookup the connection will not use — but for an `https`
-destination the client issues `CONNECT` and then performs its own TLS handshake with the origin,
-validating the certificate against the name it asked for. A rebound internal service cannot complete
-that handshake, since the attacker owns the name but not that service's key. TLS is the binding, and
-address pinning was standing in for it.
+or a cloud instance-metadata service.
 
-So proxied `https` is allowed, with the address checks skipped rather than applied — a proxied network
-often resolves external names only at the proxy, and demanding a local answer would break exactly the
-clients that can reach the destination. Proxied *plaintext* is refused: there is nothing to verify the
-result against, and a proxy fetching an internal `http` endpoint on the client's behalf is the
-RFC 9728 §7.7 pivot. Since a plaintext discovered endpoint already requires `--insecure-oidc-issuer`,
-that refusal does not arise in a normal deployment; if it does, the message names both ways forward
-(`NO_PROXY` for a directly-reachable host, or explicit `--oidc-issuer` and `--oidc-client-id`).
+**Behind a forward proxy the connection-level half of this deny-list does not apply, and what
+replaces it is certificate verification.** Through a proxy the destination is resolved by the proxy,
+so a local lookup describes a connection that will not happen; those checks are therefore skipped
+rather than applied, because a proxied network often resolves external names only at the proxy and
+demanding a local answer would break exactly the clients that can reach the destination. The static
+check on the discovered value keeps running either way — see
+[Discovered addresses and the internal-address guard](#discovered-addresses-and-the-internal-address-guard)
+for which layer survives what. For an `https` destination the client issues
+`CONNECT` and then performs its own TLS handshake with the origin, validating the certificate against
+the name it asked for. That is a real guarantee, and a narrower one than an address check: it binds
+the *hostname*, not the address, so it does not establish that the destination is external. **The
+residual case is an internal endpoint holding a certificate valid for the hostname a document named.**
 
-One limit stated rather than glossed: a TLS-terminating proxy with its CA installed on the client *is*
-the origin as far as certificate validation is concerned, so it can serve internal content under any
-name. That is a trust the operator established deliberately, and the control for it is the proxy's own
-egress policy, not anything this client can check.
+The model holds under three conditions, which are worth checking against your environment rather than
+assuming:
+
+1. the proxy issues `CONNECT` and does **not** intercept TLS;
+2. authorization and token endpoints are `https`, which is enforced unless `--insecure-oidc-issuer`
+   is set;
+3. internal services do not present client-trusted certificates under hostnames a remote party could
+   name.
+
+Where (3) is doubtful, `--oidc-issuer` takes the choice of *authorization-server origin* away from
+the tunnel server — the part a client-side control can reach. It does not silence the server
+entirely: it may still publish non-address hints (client ID, audience, scopes), and a metadata path
+on that same pinned origin. It is **not** a defence against (1): a proxy holding
+a CA the client trusts can forge any document, including one carrying the configured issuer, so an
+intercepting proxy is trusted with the whole OAuth exchange. That trust is either acceptable or the
+proxy must be bypassed for these destinations; no flag here changes it. Nor does configuring an
+internal issuer make it *safe* — it makes it a destination the operator has chosen to trust, which is
+the position on configured values everywhere else in this document.
+
+Proxied *plaintext* is refused outright: nothing binds the origin, and a proxy fetching an internal
+`http` endpoint on the client's behalf is the §7.7 pivot exactly. Since a plaintext discovered
+endpoint already requires `--insecure-oidc-issuer`, that refusal does not arise in a normal
+deployment; if it does, the message names both ways forward (`NO_PROXY` for a directly-reachable host,
+or an explicit `--oidc-client-id` plus either `--oidc-issuer` or `--oidc-metadata-url`).
 
 These rules apply only to discovered values; `--oidc-issuer` is the operator's own decision and is
 not filtered. See
@@ -390,27 +419,43 @@ authorization server on an internal network is an ordinary deployment.
 
 Three layers, because each sees something the others cannot:
 
-1. a resolution check on the value itself — the only protection for the
+1. a resolution check on the discovered value itself — the only protection for the
    `authorization_endpoint`, which is handed to the OS URL dispatcher rather than fetched;
 2. a per-request destination check, which also covers each redirect hop;
 3. a dial-time check that connects to the address it verified, so a name cannot resolve
    differently a moment later.
 
-**Behind an HTTP proxy** the address checks describe a lookup the connection will not
-use, and what protects the client instead is TLS: the transport issues `CONNECT` and then
-validates the origin's certificate against the name it asked for, which a rebound internal
-service cannot present. So proxied `https` is allowed and bound by the certificate, with
-the address checks skipped rather than applied — a proxied network often resolves external
-names only at the proxy, and demanding a local answer would break exactly the clients that
-can reach the destination. Proxied *plaintext* is refused: nothing binds the origin, and a
-proxy fetching an internal `http` endpoint on the client's behalf is the pivot this guard
-exists for. Since a plaintext discovered endpoint already requires `--insecure-oidc-issuer`,
-that refusal does not arise in a normal deployment.
+**A forward proxy changes what layers 2 and 3 are worth; layer 1 is unaffected.** Layers 2 and
+3 concern a connection this client makes itself, and past a proxy it does not make one: the
+proxy resolves the destination, so both would describe a connection that never happens. For an
+`https` destination they are therefore skipped rather than applied — a proxied network often
+resolves external names only at the proxy, and demanding a local answer would break exactly
+the clients that can reach the destination.
 
-One limit, stated rather than glossed: a TLS-terminating proxy with its CA installed on the
-client *is* the origin as far as certificate validation is concerned, so it can serve
-internal content under any name. That is a trust the operator established deliberately, and
-the control for it is the proxy's own egress policy.
+Layer 1 has no proxy awareness at all and keeps running. It resolves the name locally and
+refuses an answer inside the protected set, whatever the transport does afterwards, so it still
+catches a document naming a host that resolves to loopback or IMDS *on this machine*. What it
+cannot do is decide anything when there is no local answer: a resolution failure is not treated
+as a refusal, because in a split-DNS or proxy-resolved network the absence of an answer is
+normal rather than evidence. So behind a proxy the guarantee is "refused if local DNS can see
+it is internal", not "refused if it is internal".
+
+For the rest, what holds is the certificate: the transport issues `CONNECT` and then validates
+the origin's certificate against the name it asked for. That binds the **hostname** — it is not
+evidence the address is external, so an internal service holding a certificate valid for the
+name a document supplied still passes layers 2 and 3, and passes layer 1 too whenever local DNS
+does not resolve it. See
+[Discovery inputs and the transport rules](#protected-resource-metadata-and-zero-configuration-clients)
+for the three conditions this rests on and what `--oidc-issuer` does and does not answer.
+
+The `authorization_endpoint` sits outside all of this: it is opened in a browser, which uses the
+system's own proxy settings rather than this client's transport, so layer 1 is both the first and
+the last check applied to it.
+
+Proxied *plaintext* is refused: nothing binds the origin, and a proxy fetching an internal
+`http` endpoint on the client's behalf is the pivot this guard exists for. Since a plaintext
+discovered endpoint already requires `--insecure-oidc-issuer`, that refusal does not arise
+in a normal deployment.
 
 **The relaxation is narrow.** The guard is lifted only when the tunnel URL names the
 client's own machine *by spelling* — a **loopback** literal, or a name RFC 6761 reserves for
@@ -502,10 +547,10 @@ For managed client mode, register a **public** OIDC client with:
 - an access-token audience that includes the Authunnel resource, for example `authunnel-server`
 
 Once registered, publish the client ID and scopes from the server with `--client-id` and
-`--client-scopes` so users do not each transcribe them into an `ssh_config` line. See
+`--client-default-scopes` so users do not each transcribe them into an `ssh_config` line. See
 [Protected-resource metadata and zero-configuration clients](#protected-resource-metadata-and-zero-configuration-clients).
 
-Some providers require an explicit audience/resource parameter on the authorization request before they will populate the access-token `aud` claim. The parameter name differs by provider: Auth0 custom APIs use `audience` (pass `--oidc-audience` on the client, or publish it with `--client-audience` on the server), while providers implementing RFC 8707 resource indicators — notably AWS Cognito — use `resource` (pass `--oidc-resource <url>` or publish `--client-resource <url>`, whose value becomes the `aud`). For Cognito also request the resource server's custom scope, e.g. `--oidc-scopes 'openid https://your-resource/tunnel'`, or publish it with `--client-scopes`.
+Some providers require an explicit audience/resource parameter on the authorization request before they will populate the access-token `aud` claim. The parameter name differs by provider: Auth0 custom APIs use `audience` (pass `--oidc-audience` on the client, or publish it with `--client-audience` on the server), while providers implementing RFC 8707 resource indicators — notably AWS Cognito — use `resource` (pass `--oidc-resource <url>` or publish `--client-resource <url>`, whose value becomes the `aud`). For Cognito also request the resource server's custom scope, e.g. `--oidc-scopes 'openid https://your-resource/tunnel'`, or publish it with `--client-default-scopes`.
 
 Some providers require an exact loopback callback URL instead of allowing a random local port. Use `--oidc-redirect-port` when you need to register a fixed callback URL in the IdP.
 
