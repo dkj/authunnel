@@ -840,11 +840,89 @@ func TestParseClientConfigKeepsTheTunnelQueryInTheResourceIdentity(t *testing.T)
 	}
 }
 
-// TestParseClientConfigSeparatesCachesByTunnelQuery is the consequence that
-// matters, asserted end to end through the production config path: two tunnel
-// URLs differing only in their query must not share a cache entry, because the
-// server treats them as different resources and the dial sends the query.
-func TestParseClientConfigSeparatesCachesByTunnelQuery(t *testing.T) {
+// TestParseClientConfigNormalisesTheResourceIdentity pins that equivalent authority
+// spellings produce one identifier, so a token cached under either is reusable by the
+// other.
+//
+// The identifier is part of the cache identity, and cacheMatchesConfigured compares it
+// byte for byte, unconditionally — the one field with no "resolvable" exemption. There
+// is a single stored record, so a mismatch is not a second entry: the stored token is
+// simply not reused, and a fresh login overwrites it. Without normalisation an operator
+// whose ssh_config says TUNNEL.example:443 and whose script says tunnel.example logged
+// in again on every switch, for one resource.
+//
+// Driven through parseClientConfig rather than resourceURLForTunnel directly, because
+// the production path is what computes the value that reaches the cache.
+func TestParseClientConfigNormalisesTheResourceIdentity(t *testing.T) {
+	const canonical = "https://tunnel.example/protected/tunnel"
+	for _, spelling := range []string{
+		canonical,
+		"https://TUNNEL.example/protected/tunnel",
+		"https://tunnel.example:443/protected/tunnel",
+		"https://TUNNEL.Example:443/protected/tunnel",
+		"HTTPS://tunnel.example/protected/tunnel",
+		// The websocket scheme rewrite composes with normalisation rather than
+		// bypassing it.
+		"wss://TUNNEL.example:443/protected/tunnel",
+	} {
+		cfg, err := parseClientConfig([]string{"--tunnel-url", spelling}, func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("parseClientConfig(%q): %v", spelling, err)
+		}
+		if cfg.ResourceURL != canonical {
+			t.Fatalf("--tunnel-url %q gave ResourceURL %q, want the canonical %q: equivalent spellings must yield one identity, so a cached token stays reusable",
+				spelling, cfg.ResourceURL, canonical)
+		}
+	}
+
+	// And normalisation stays syntax-based: none of the distinctions this identifier
+	// deliberately keeps may be folded away. Each pair is two resources.
+	for _, tt := range []struct{ a, b string }{
+		{"https://tunnel.example/protected/tunnel", "https://tunnel.example/protected/tunnel/"},
+		{"https://tunnel.example/a%2Fb/tunnel", "https://tunnel.example/a/b/tunnel"},
+		{"https://tunnel.example/protected/tunnel?tenant=a", "https://tunnel.example/protected/tunnel?tenant=b"},
+		{"https://tunnel.example/protected/tunnel?", "https://tunnel.example/protected/tunnel"},
+		{"https://tunnel.example:8443/protected/tunnel", "https://tunnel.example/protected/tunnel"},
+	} {
+		first, err := parseClientConfig([]string{"--tunnel-url", tt.a}, func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("parseClientConfig(%q): %v", tt.a, err)
+		}
+		second, err := parseClientConfig([]string{"--tunnel-url", tt.b}, func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("parseClientConfig(%q): %v", tt.b, err)
+		}
+		if first.ResourceURL == second.ResourceURL {
+			t.Fatalf("%q and %q both gave %q; these are two resources", tt.a, tt.b, first.ResourceURL)
+		}
+	}
+
+	// Userinfo never reaches the identifier. It is dropped because the authority is
+	// rebuilt from host and port, which is worth pinning here rather than inferring:
+	// this value is written to the cache file on disk, so a credential surviving into
+	// it would be a disclosure, and the code that drops it is not in this package.
+	cfg, err := parseClientConfig(
+		[]string{"--tunnel-url", "https://user:s3cret@tunnel.example/protected/tunnel"},
+		func(string) string { return "" },
+	)
+	if err != nil {
+		t.Fatalf("parseClientConfig: %v", err)
+	}
+	if cfg.ResourceURL != canonical {
+		t.Fatalf("ResourceURL = %q, want %q with the userinfo removed", cfg.ResourceURL, canonical)
+	}
+	if strings.Contains(cfg.ResourceURL, "s3cret") || strings.Contains(cfg.ResourceURL, "user") {
+		t.Fatalf("ResourceURL = %q still carries userinfo; it is persisted to the token cache", cfg.ResourceURL)
+	}
+}
+
+// TestParseClientConfigScopesCacheIdentityToTheTunnelQuery is the consequence that
+// matters, asserted end to end through the production config path: two tunnel URLs
+// differing only in their query must not produce one identity, because the server
+// treats them as different resources and the dial sends the query. With one stored
+// record, sharing an identity would mean the token minted for one being presented for
+// the other rather than a fresh login.
+func TestParseClientConfigScopesCacheIdentityToTheTunnelQuery(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
 	cachePath := filepathForTest(t, "tokens.json")
 
@@ -904,8 +982,8 @@ func TestParseClientConfigSeparatesCachesByTunnelQuery(t *testing.T) {
 
 // TestParseClientConfigKeepsEscapedPathSegments goes through the production config
 // path, which is the only place this was observable: the derivation carried the
-// decoded path, so /tenant%2Fone/tunnel and /tenant/one/tunnel produced one
-// identifier — one discovery result and one cache entry — for two resources a
+// decoded path, so /tenant%2Fone/tunnel and /tenant/one/tunnel produced one identifier
+// — one discovery result, and one cached token reused across both — for two resources a
 // path-routing proxy keeps apart.
 func TestParseClientConfigKeepsEscapedPathSegments(t *testing.T) {
 	for _, tt := range []struct{ tunnelURL, want string }{

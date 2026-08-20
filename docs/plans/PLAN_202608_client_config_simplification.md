@@ -761,3 +761,24 @@ All five items landed, each mutation-verified. What the mutations showed, beyond
 `gofmt`, `go vet`, full suite, `-race`, `make lint` (0 gosec issues), link/anchor check, complexity
 gate, both binaries' help text, and the e2e suite all pass; only the Keycloak e2e skips, as it always
 does without a live server.
+
+**A later finding on the same seam.** `resourceURLForTunnel` returned the authority as written, so
+`https://TUNNEL.example:443/…` and `https://tunnel.example/…` were two identities for one resource —
+and `cacheMatchesConfigured` compares that field byte for byte with no "resolvable" exemption, so
+switching spellings meant the stored token was not reused and a browser opened. (There is one
+`tokenCache` per cache file, not one per identity: a mismatch discards and overwrites rather than
+adding an entry, and several comments here previously implied otherwise.) Fixed by returning
+`authmeta.NormalizeResourceIdentifier`'s output, which is the rule the document comparison already
+used: one definition rather than a second, looser copy on the client side.
+
+Handing it the URL as a string also removed the plumbing that had accumulated around it. The
+function had been reconstructing `scheme://host + EscapedPath`, re-parsing, and copying the query
+across — all of which the identifier rule does itself — so it now clears the fragment and passes
+`u.String()`. Userinfo is dropped as before, though by a different line: the authority is rebuilt
+from host and port. That is pinned by a test, since this value is written to disk.
+
+The test pins it from **both** directions, because over-normalising is the worse failure: equivalent
+authority spellings must collapse to one identifier, and the five distinctions this identifier keeps
+deliberately — trailing slash, `%2F`, differing query, empty-versus-absent query, non-default port —
+must not. Mutation-checked accordingly: reverting the call fails it, and folding the trailing slash
+into the authority rule fails it too, along with three tests in authmeta.

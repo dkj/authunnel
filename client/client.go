@@ -178,8 +178,8 @@ Development / unsafe overrides (do not use in production):
 `)
 }
 
-// resourceURLForTunnel turns the tunnel URL into the resource identifier the
-// protected-resource metadata is looked up under, and which the cached
+// resourceURLForTunnel turns the tunnel URL into the normalised resource identifier
+// the protected-resource metadata is looked up under, and which the cached
 // credentials for that tunnel are scoped to.
 //
 // The websocket schemes are rewritten to their HTTP equivalents because that is
@@ -210,17 +210,26 @@ func resourceURLForTunnel(tunnelURL string) (string, error) {
 	case "ws":
 		u.Scheme = "http"
 	}
-	// Built from the escaped path so an encoded separator survives: assigning
-	// url.URL.Path would re-encode from the decoded form, turning
-	// /tenant%2Fone/tunnel into /tenant/one/tunnel and merging two resources a
-	// path-routing proxy keeps apart — into one discovery result and one cache
-	// entry. The fragment is dropped by omission, which is the intent.
-	resourceURL, err := url.Parse(u.Scheme + "://" + u.Host + u.EscapedPath())
+	// Cleared rather than left for the identifier rule to refuse: a fragment is never
+	// sent on the wire, so one in --tunnel-url is inert, and failing discovery over it
+	// would be the worse answer. RawFragment goes too, since that is what String()
+	// prefers when it is a valid encoding of Fragment.
+	u.Fragment, u.RawFragment = "", ""
+	// Handed to the identifier rule as a string, which does the reconstruction: it
+	// already builds from the escaped path and carries the query, including an empty
+	// one, so doing either here first would be a second copy of the same rule. What it
+	// adds is authority normalisation, and that matters because this value is the cache
+	// identity and is compared byte for byte — url.Parse keeps host case and a
+	// redundant default port, so https://TUNNEL.example:443/… would not match a token
+	// stored under https://tunnel.example/…, and the login would happen again for what
+	// is one resource. Normalisation is syntax-based only, so the path and query
+	// distinctions the cache identity depends on all survive. Userinfo is dropped,
+	// because the authority is rebuilt from host and port.
+	normalized, err := authmeta.NormalizeResourceIdentifier(u.String())
 	if err != nil {
-		return "", fmt.Errorf("--tunnel-url %q is not a valid URL", tunnelURL)
+		return "", fmt.Errorf("--tunnel-url %q: %w", tunnelURL, err)
 	}
-	authmeta.CarryQuery(resourceURL, u)
-	return resourceURL.String(), nil
+	return normalized, nil
 }
 
 func main() {

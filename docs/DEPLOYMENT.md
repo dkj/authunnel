@@ -246,7 +246,10 @@ compares `resource` against the URL it actually used and refuses a mismatch. Tha
 self-consistency check is what makes the derived value safe without a flag.
 
 **The client's comparison is exact** — scheme, host, path and query, after RFC 3986
-syntax-based normalisation only (case folding and redundant default ports). RFC 9728 §3.3
+syntax-based normalisation only (case folding and redundant default ports). That same
+normalisation is applied to the identifier derived from `--tunnel-url`, so writing the
+authority a different way — upper-case host, redundant `:443` — still matches the
+cached token rather than forcing a fresh login. RFC 9728 §3.3
 requires it, and the reason is concrete: one hostname can serve several protected resources, and
 an origin-only comparison would let a document about `/a/tunnel` supply the authorization server
 and client ID for a client asking about `/b/tunnel`. Two consequences for deployments:
@@ -277,8 +280,9 @@ and client ID for a client asking about `/b/tunnel`. Two consequences for deploy
   client that follows the challenge lands on the document describing the identifier it is using;
   this server routes on path alone and attaches no meaning to a query, so a client whose tunnel URL
   carries one is still talking about this same resource. Client-side those are distinct identifiers
-  with distinct cached credentials, which is what stops a token obtained for `?tenant=a` being
-  presented for `?tenant=b`. A bare `?` counts: `…/tunnel?` and `…/tunnel` are different request
+  and part of the token cache's identity, which is what stops a token obtained for
+  `?tenant=a` being presented for `?tenant=b`: the stored token is not reused, and a fresh login
+  replaces it. A bare `?` counts: `…/tunnel?` and `…/tunnel` are different request
   targets — Go puts the delimiter on the wire — so they are different identifiers here too. A
   fragment is the opposite case and is refused, since it is never sent at all.
 

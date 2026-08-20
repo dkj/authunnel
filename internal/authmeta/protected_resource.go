@@ -94,9 +94,9 @@ func (p *ProtectedResource) AuthorizationServer() string {
 // path, and the query is carried through.
 //
 // The query is part of the identifier — §3.1 retains it, and a resource identifier
-// may carry one — so two tunnel URLs differing only in their query are two
-// resources, with their own metadata and their own cached credentials. Dropping it
-// would collapse them onto one identity, and discloses nothing in exchange: the
+// may carry one — so two tunnel URLs differing only in their query are two resources,
+// each with its own metadata and its own cache identity. Dropping it would collapse
+// them onto one identity, and discloses nothing in exchange: the
 // WebSocket dial already sends that query to this very host. That includes an
 // *empty* query, which is why every reconstruction here goes through CarryQuery. The
 // fragment is the opposite case and is refused outright, since it is never sent
@@ -222,7 +222,8 @@ func FetchProtectedResource(ctx context.Context, httpClient *http.Client, resour
 // path was carried through url.URL.Path, the *decoded* form, so String() re-encoded
 // it and /tenant%2Fone/tunnel came back as /tenant/one/tunnel: two identifiers
 // that RFC 3986 §2.2 keeps distinct, collapsed onto one — one discovery result and
-// one cache entry for two resources a path-routing proxy would treat separately.
+// one identity, and so one reused token, for two resources a path-routing proxy would
+// treat separately.
 // The escaped form is preserved instead.
 //
 // One consequence of not decoding: escapings that RFC 3986 §6.2.2.2 would call
