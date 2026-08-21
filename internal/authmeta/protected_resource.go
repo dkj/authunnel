@@ -175,10 +175,18 @@ func CarryQuery(dst, src *url.URL) {
 // from the one the request implies declares it with the server's --resource-url:
 // that is configuration, not a reason to weaken the check for everyone.
 //
-// Only syntax-based normalisation is applied before comparing (RFC 3986 §6.2.2):
-// scheme and host are case-folded and a redundant default port is dropped, because
-// one side is built from an HTTP Host header and the other from a command-line
-// URL. Path and query are compared verbatim.
+// **The declared value is compared by code-point equality**, which is what §3.3's
+// "identical" means: the document must echo the identifier the well-known suffix was
+// inserted into, verbatim. Nothing about the remote value is normalised first.
+// Normalising it would mean deciding that two different strings denote one resource
+// on the strength of a rule the document's author never agreed to — a leniency inside
+// the check that makes the document trustworthy, which is the wrong place for one.
+//
+// The client's *own* identifier is normalised, before it gets here (see
+// resourceURLForTunnel), because it is also a cache key and an operator may spell one
+// authority several ways. That is a local decision about local input. authunnel's
+// server publishes the normalised form for the same reason, so the two agree without
+// either side being lenient about what the other sent.
 func FetchProtectedResource(ctx context.Context, httpClient *http.Client, resourceURL string) (*ProtectedResource, error) {
 	// Normalised once: the derivation and the comparison both need it, and doing
 	// it twice left a second error check that could not fire.
@@ -197,13 +205,12 @@ func FetchProtectedResource(ctx context.Context, httpClient *http.Client, resour
 	if document.Resource == "" {
 		return nil, fmt.Errorf("protected resource metadata at %s names no resource", documentURL)
 	}
-	declared, err := NormalizeResourceIdentifier(document.Resource)
-	if err != nil {
-		return nil, fmt.Errorf("protected resource metadata at %s: %w", documentURL, err)
-	}
-	if declared != using {
+	if document.Resource != using {
+		// `using`, not the caller's raw resourceURL: that is the value compared, and
+		// reporting the input instead can print "describes X, not X" when the declared
+		// value happens to match the input but not its normalised form.
 		return nil, fmt.Errorf("protected resource metadata at %s describes %q, not %q; refusing to take configuration from a document about another resource",
-			documentURL, document.Resource, resourceURL)
+			documentURL, document.Resource, using)
 	}
 	return document, nil
 }

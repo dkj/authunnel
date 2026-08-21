@@ -354,11 +354,17 @@ func NewHandler(validator TokenValidator, socks SOCKSServer, opts ...HandlerOpti
 	// paths that are about to write one: WWW-Authenticate is defined for 401,
 	// and putting it on a 200 or a WebSocket upgrade would be noise asserting
 	// something untrue.
-	setChallenge := func(w http.ResponseWriter, r *http.Request) {
+	setChallenge := func(w http.ResponseWriter, r *http.Request, errorCode string) {
+		// Always a challenge, whatever --no-resource-metadata says. That flag governs
+		// the RFC 9728 hint — one parameter — not whether this server announces the
+		// scheme it authenticates with. Suppressing the header entirely left a 401
+		// that RFC 9110 §11.6.1 forbids and that a client could not read an
+		// error code from.
 		if opt.ResourceMetadata == nil {
+			w.Header().Set("WWW-Authenticate", bearerChallenge(errorCode, ""))
 			return
 		}
-		w.Header().Set("WWW-Authenticate", opt.ResourceMetadata.challenge(r, opt.TrustForwardedProto))
+		w.Header().Set("WWW-Authenticate", opt.ResourceMetadata.challenge(r, opt.TrustForwardedProto, errorCode))
 	}
 
 	// applyPreAuthGate runs the per-IP pre-auth limiter (when configured)
@@ -814,9 +820,13 @@ func checkWebSocketRequest(w http.ResponseWriter, r *http.Request, trustForwarde
 // verification to the configured validator. The caller decides which routes
 // require protection and how to continue once validation succeeds.
 func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator) bool {
-	// No challenge: this helper has no access to the handler options that decide
-	// whether metadata is published or where it lives.
-	_, ok := validateRequestToken(w, r, validator, nil)
+	// A challenge without the RFC 9728 parameter: this helper has no access to the
+	// handler options that decide whether metadata is published or where it lives, but
+	// that governs one parameter rather than whether a 401 carries a challenge at all.
+	setChallenge := func(w http.ResponseWriter, _ *http.Request, errorCode string) {
+		w.Header().Set("WWW-Authenticate", bearerChallenge(errorCode, ""))
+	}
+	_, ok := validateRequestToken(w, r, validator, setChallenge)
 	return ok
 }
 
@@ -824,12 +834,29 @@ func CheckToken(w http.ResponseWriter, r *http.Request, validator TokenValidator
 // need the validated claims for downstream logging. The public CheckToken
 // helper intentionally keeps the older bool-only contract for existing tests
 // and handlers that only need admission control.
-func validateRequestToken(w http.ResponseWriter, r *http.Request, validator TokenValidator, setChallenge func(http.ResponseWriter, *http.Request)) (*oidc.AccessTokenClaims, bool) {
+func validateRequestToken(w http.ResponseWriter, r *http.Request, validator TokenValidator, setChallenge func(http.ResponseWriter, *http.Request, string)) (*oidc.AccessTokenClaims, bool) {
+	// No credentials, or none this server can parse as a Bearer token: 401 with no
+	// error code, per RFC 6750 §3.1.
 	unauthorized := func(message string) {
 		if setChallenge != nil {
-			setChallenge(w, r)
+			setChallenge(w, r, "")
 		}
 		http.Error(w, message, http.StatusUnauthorized)
+	}
+	// A token was presented and is not usable: 401 with error="invalid_token", which
+	// is what §3.1 defines the code for — a bad signature, a wrong issuer or
+	// audience, or an expired or not-yet-valid token. 403 is for a *valid* token with
+	// insufficient scope, which this server never decides, so it is not used here.
+	//
+	// The distinction is load-bearing on the client, not cosmetic: the challenge is
+	// what tells it the rejection was about the token rather than about the origin
+	// check or something in front of this server, so it re-reads metadata on that
+	// signal alone instead of guessing from a status code.
+	invalidToken := func() {
+		if setChallenge != nil {
+			setChallenge(w, r, "invalid_token")
+		}
+		http.Error(w, "invalid token", http.StatusUnauthorized)
 	}
 	auth := r.Header.Get("authorization")
 	if auth == "" {
@@ -866,7 +893,7 @@ func validateRequestToken(w http.ResponseWriter, r *http.Request, validator Toke
 		loggerFromContext(r.Context()).Warn("auth_failure",
 			slog.String("error", err.Error()),
 		)
-		http.Error(w, "forbidden", http.StatusForbidden)
+		invalidToken()
 		return nil, false
 	}
 	// Admission requires the token to be usable right now. The small
@@ -878,7 +905,7 @@ func validateRequestToken(w http.ResponseWriter, r *http.Request, validator Toke
 		loggerFromContext(r.Context()).Warn("auth_failure",
 			slog.String("error", err.Error()),
 		)
-		http.Error(w, "forbidden", http.StatusForbidden)
+		invalidToken()
 		return nil, false
 	}
 	return claims, true

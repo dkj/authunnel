@@ -2,6 +2,7 @@ package tunnelserver
 
 import (
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -144,18 +145,78 @@ func TestResourceMetadataPublishesHintsOnlyWhenSet(t *testing.T) {
 	}
 }
 
+// TestBearerChallengeAlwaysCarriesAParameter pins the invariant across every
+// combination the two optional parameters produce: never a bare scheme. See
+// bearerChallenge for the grammar that requires it.
+func TestBearerChallengeAlwaysCarriesAParameter(t *testing.T) {
+	for name, tt := range map[string]struct {
+		errorCode, metadataURL, want string
+	}{
+		"neither":    {"", "", `Bearer realm="authunnel"`},
+		"error only": {"invalid_token", "", `Bearer error="invalid_token"`},
+		"hint only":  {"", "https://tunnel.example/.well-known/x", `Bearer resource_metadata="https://tunnel.example/.well-known/x"`},
+		"both":       {"invalid_token", "https://tunnel.example/.well-known/x", `Bearer error="invalid_token", resource_metadata="https://tunnel.example/.well-known/x"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := bearerChallenge(tt.errorCode, tt.metadataURL)
+			if got != tt.want {
+				t.Fatalf("challenge = %q, want %q", got, tt.want)
+			}
+			// The property, independent of the exact strings above.
+			scheme, params, found := strings.Cut(got, " ")
+			if scheme != "Bearer" {
+				t.Fatalf("challenge = %q, want the Bearer scheme", got)
+			}
+			if !found || strings.TrimSpace(params) == "" {
+				t.Fatalf("challenge = %q carries no auth-param; RFC 6750 §3 requires at least one", got)
+			}
+		})
+	}
+}
+
+// TestCheckTokenChallengesEvenWithoutMetadata covers the exported helper, which has no
+// access to the handler options and so cannot name a document — but a 401 must carry a
+// challenge regardless, and the client reads the error code from it.
+func TestCheckTokenChallengesEvenWithoutMetadata(t *testing.T) {
+	for name, tt := range map[string]struct {
+		auth      string
+		validator TokenValidator
+		want      string
+	}{
+		"no credential": {"", nil, `Bearer realm="authunnel"`},
+		"rejected token": {
+			"Bearer nope",
+			staticFailValidator{err: errors.New("signature mismatch")},
+			`Bearer error="invalid_token"`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
+			if tt.auth != "" {
+				request.Header.Set("Authorization", tt.auth)
+			}
+			recorder := httptest.NewRecorder()
+			if ok := CheckToken(recorder, request, tt.validator); ok {
+				t.Fatal("expected the check to fail")
+			}
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", recorder.Code)
+			}
+			if got := recorder.Header().Get("WWW-Authenticate"); got != tt.want {
+				t.Fatalf("WWW-Authenticate = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestPublishedWireKeysAreTheAgreedOnes asserts the JSON keys rather than the Go
 // fields, which is the only way this side can pin a wire contract: every other test
 // here decodes into authmeta.ProtectedResource, so it would follow a renamed tag
 // wherever it went and still pass.
 //
-// The scope key is the one that matters, and `scopes_supported` must be *absent*.
-// Under RFC 9728 §7.2 that field is the protected resource disclosing the scopes it
-// supports — and this server supports no scope requirement at all: it accepts a token
-// on its signature, audience and standard claims and never reads the `scope` claim. So
-// publishing anything there would be a false disclosure, quite apart from inviting a
-// client to request the whole list. What is published instead is a recommendation about
-// the request, under an extension name, since §7.2 has no field for one.
+// The scope key is the one that matters, and `scopes_supported` must be *absent* — see
+// authmeta.ProtectedResource.DefaultScopes for why this server has nothing to disclose
+// under that name.
 func TestPublishedWireKeysAreTheAgreedOnes(t *testing.T) {
 	mux := resourceMetadataHandler(t, HandlerOptions{
 		ResourceMetadata: &ResourceMetadataConfig{
@@ -184,6 +245,48 @@ func TestPublishedWireKeysAreTheAgreedOnes(t *testing.T) {
 	}
 	if _, ok := raw["scopes_supported"]; ok {
 		t.Fatal("scopes_supported must not be published: this server enforces no scope requirement, so it has no supported set to disclose; what it publishes is a recommendation for the request")
+	}
+}
+
+// TestDeclaredResourceURLIsPublishedNormalised is the publication half of RFC 9728
+// §3.3's identity requirement, and the two halves only work together.
+//
+// A client compares `resource` against its own identifier by code-point equality, and
+// normalises what it derives from its tunnel URL because that value is also a cache
+// key. So an operator writing --resource-url with an upper-case host or a redundant
+// :443 must not produce a document that fails that comparison for what is one
+// resource. Publishing the normalised form is what prevents it; the alternative would
+// be a client lenient about a remote value, inside the very check that decides whether
+// the document can be trusted.
+//
+// The path is untouched, which is the part the flag exists for: normalisation is
+// syntax-based, so a prefix a reverse proxy strips is still declared verbatim.
+func TestDeclaredResourceURLIsPublishedNormalised(t *testing.T) {
+	mux := resourceMetadataHandler(t, HandlerOptions{
+		ResourceMetadata: &ResourceMetadataConfig{
+			Issuer:      "https://idp.example",
+			ResourceURL: "HTTPS://TUNNEL.Example:443/authunnel/protected/tunnel",
+		},
+	})
+
+	recorder, document := fetchDocumentForTest(t, mux, authmeta.ProtectedResourcePath, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	const want = "https://tunnel.example/authunnel/protected/tunnel"
+	if document.Resource != want {
+		t.Fatalf("published resource = %q, want %q: a client compares this byte for byte", document.Resource, want)
+	}
+
+	// The challenge must point at the document *for that same identifier*, or a client
+	// following it lands on a document describing something else and refuses it.
+	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	challengeRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(challengeRecorder, request)
+	challenge := challengeRecorder.Header().Get("WWW-Authenticate")
+	const wantMetadata = "https://tunnel.example/.well-known/oauth-protected-resource/authunnel/protected/tunnel"
+	if !strings.Contains(challenge, wantMetadata) {
+		t.Fatalf("challenge = %q, want it to name %q", challenge, wantMetadata)
 	}
 }
 
@@ -228,11 +331,33 @@ func TestResourceMetadataDisabled(t *testing.T) {
 		}
 	}
 
-	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
-	recorder := httptest.NewRecorder()
-	mux.ServeHTTP(recorder, request)
-	if challenge := recorder.Header().Get("WWW-Authenticate"); challenge != "" {
-		t.Fatalf("WWW-Authenticate = %q, want no challenge pointing at a document that is not published", challenge)
+	// The challenge survives --no-resource-metadata; only the RFC 9728 parameter goes.
+	// See setChallenge for why the header is not optional.
+	for name, tt := range map[string]struct {
+		auth string
+		want string
+	}{
+		"no credential":  {"", `Bearer realm="authunnel"`},
+		"rejected token": {"Bearer nope", `Bearer error="invalid_token"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+			if tt.auth != "" {
+				request.Header.Set("Authorization", tt.auth)
+			}
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", recorder.Code)
+			}
+			if got := recorder.Header().Get("WWW-Authenticate"); got != tt.want {
+				t.Fatalf("WWW-Authenticate = %q, want %q", got, tt.want)
+			}
+			if strings.Contains(recorder.Header().Get("WWW-Authenticate"), "resource_metadata") {
+				t.Fatal("the challenge must not point at a document this server does not publish")
+			}
+		})
 	}
 }
 
@@ -282,35 +407,79 @@ func TestChallengePointsAtAServedDocument(t *testing.T) {
 	}
 }
 
-// TestChallengeAbsentOnSuccessAndOnForbidden keeps the header where RFC 7235
-// defines it. A 403 from a validated-but-rejected token is authorization, not a
-// missing credential, and this server's 403 is deliberately uninformative.
-func TestChallengeAbsentOnSuccessAndOnForbidden(t *testing.T) {
+// TestChallengeMatchesTheReasonForTheRejection pins the three shapes a caller can
+// get, because the client keys its recovery on the challenge rather than on a status
+// code. RFC 6750 §3.1: no credential means no error code, a credential that failed
+// means invalid_token, and success means no challenge at all.
+//
+// The middle case is the one that carries weight. It used to be a 403 with no
+// challenge, on the reasoning that a validated-but-rejected token is an authorization
+// decision — but the token had not validated, so `invalid_token` is exactly what §3.1
+// defines, and 403 belongs to a *valid* token with insufficient scope, which this
+// server never decides. Without the error code a client cannot tell a bad token from
+// an origin-check failure, and had to treat both as a possible configuration change.
+func TestChallengeMatchesTheReasonForTheRejection(t *testing.T) {
 	mux := resourceMetadataHandler(t, HandlerOptions{
 		ResourceMetadata: &ResourceMetadataConfig{Issuer: "https://idp.example"},
 	})
 
 	for _, tt := range []struct {
-		name       string
-		auth       string
-		wantStatus int
+		name          string
+		auth          string
+		wantStatus    int
+		wantChallenge string
 	}{
-		{"authenticated", "Bearer good", http.StatusOK},
-		{"rejected token", "Bearer nope", http.StatusForbidden},
+		{"authenticated", "Bearer good", http.StatusOK, ""},
+		{
+			"no credential", "", http.StatusUnauthorized,
+			`Bearer resource_metadata="http://example.com/.well-known/oauth-protected-resource/protected/tunnel"`,
+		},
+		{
+			"rejected token", "Bearer nope", http.StatusUnauthorized,
+			`Bearer error="invalid_token", resource_metadata="http://example.com/.well-known/oauth-protected-resource/protected/tunnel"`,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, "/protected", nil)
-			request.Header.Set("Authorization", tt.auth)
+			if tt.auth != "" {
+				request.Header.Set("Authorization", tt.auth)
+			}
 			recorder := httptest.NewRecorder()
 			mux.ServeHTTP(recorder, request)
 
 			if recorder.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, tt.wantStatus)
 			}
-			if challenge := recorder.Header().Get("WWW-Authenticate"); challenge != "" {
-				t.Fatalf("WWW-Authenticate = %q, want it absent on a %d", challenge, recorder.Code)
+			if got := recorder.Header().Get("WWW-Authenticate"); got != tt.wantChallenge {
+				t.Fatalf("WWW-Authenticate = %q, want %q", got, tt.wantChallenge)
 			}
 		})
+	}
+}
+
+// TestChallengeAbsentOnAnOriginRefusal is the distinction the client depends on: an
+// origin-check refusal is not about the token, so it stays a 403 and carries no
+// challenge. A client seeing it must not re-read metadata.
+func TestChallengeAbsentOnAnOriginRefusal(t *testing.T) {
+	mux := resourceMetadataHandler(t, HandlerOptions{
+		ResourceMetadata: &ResourceMetadataConfig{Issuer: "https://idp.example"},
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)
+	request.Header.Set("Authorization", "Bearer good")
+	request.Header.Set("Origin", "https://attacker.example")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d for a cross-origin upgrade", recorder.Code, http.StatusForbidden)
+	}
+	if challenge := recorder.Header().Get("WWW-Authenticate"); challenge != "" {
+		t.Fatalf("WWW-Authenticate = %q, want none: this refusal is not about the token", challenge)
 	}
 }
 

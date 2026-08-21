@@ -61,7 +61,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 1. Reads OIDC issuer, audience, listen address, TLS mode, and connection longevity configuration from flags or environment.
 2. Locates the issuer's JWKS endpoint once at startup — by OIDC discovery unless configured otherwise. The mode in effect is reported as `discovery_mode` on the `token_validator_ready` startup log line; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#issuer-metadata-and-key-discovery) for the three modes and their trade-offs.
 3. Publishes RFC 9728 protected-resource metadata at `GET /.well-known/oauth-protected-resource`, unauthenticated, naming the issuer it validates against so clients need no OIDC configuration of their own. Disabled by `--no-resource-metadata`.
-4. Accepts `GET /protected/tunnel`, verifies the bearer token's signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission), then checks the WebSocket upgrade headers. Unauthenticated `GET` requests under `/protected/` receive `401`; other HTTP methods receive `405` from the router.
+4. Accepts `GET /protected/tunnel`, verifies the bearer token's signature, issuer, expiration, audience, subject presence, `iat` sanity, and `nbf` (the token must be usable now at admission), then checks the WebSocket upgrade headers. Per RFC 6750 §3.1, a missing credential and a failed token both get `401` — the latter with `error="invalid_token"` — while `403` is reserved for the origin check, since this server enforces no scopes. Other HTTP methods receive `405` from the router.
 5. Applies admission controls (concurrent-tunnel caps and per-user rate limits) when configured, rejecting over-limit requests with `429`/`503` and a `Retry-After` header.
 6. Upgrades the connection to WebSocket.
 7. Hands each upgraded connection to the SOCKS5 server implementation.
@@ -73,7 +73,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 1. Either:
    - uses a bearer token supplied via the `ACCESS_TOKEN` environment variable, or
    - runs managed OIDC mode, which is the default whenever `ACCESS_TOKEN` is unset.
-2. In managed mode, any OIDC value not passed as a flag is read from the tunnel server's RFC 9728 protected-resource metadata, so `--tunnel-url` on its own is a complete configuration. The fetch happens only when something essential is missing, and never on a cache hit — a configuration that supplies everything makes no extra request. A value you pass always wins over the published one. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients).
+2. In managed mode, missing OIDC values are read from the tunnel server's RFC 9728 protected-resource metadata, so `--tunnel-url` on its own is a complete configuration. The lookup runs only when an *essential* value is absent — the client ID, or both the issuer and metadata URL — and never on a cache hit, so a client that supplies those makes no extra request and adopts no published hints either. A value you pass always wins over the published one. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients).
 3. In managed mode the client:
    - reuses a cached token when it remains valid for more than 60 seconds,
    - otherwise refreshes it when a refresh token is available,

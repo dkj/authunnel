@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"authunnel/internal/authmeta"
 )
@@ -15,10 +16,15 @@ import (
 // document is about the tunnel endpoint, not about the server as a whole.
 const tunnelResourcePath = "/protected/tunnel"
 
+// challengeRealm satisfies RFC 6750 §3's requirement that a Bearer challenge carry at
+// least one parameter, for the one case with nothing else to say. It is a label, not a
+// scope: this server has exactly one protected resource.
+const challengeRealm = "authunnel"
+
 // ResourceMetadataConfig turns on RFC 9728 protected-resource metadata and
 // carries what the document says. A nil *ResourceMetadataConfig in
-// HandlerOptions disables both the document and the WWW-Authenticate challenge
-// that points at it.
+// HandlerOptions disables the document and the resource_metadata parameter that points
+// at it. The Bearer challenge itself is not optional — see bearerChallenge.
 //
 // Everything here except the hints is already required configuration: a server
 // that validates tokens knows its issuer. The hints exist so a client needs no
@@ -34,9 +40,9 @@ const tunnelResourcePath = "/protected/tunnel"
 type ResourceMetadataConfig struct {
 	// Issuer is published as the sole entry in authorization_servers.
 	Issuer string
-	// ResourceURL is the externally visible resource identifier, published
-	// verbatim as `resource`. Empty means derive it from each request, which is
-	// correct whenever the path a client uses is the path this server sees.
+	// ResourceURL is the externally visible resource identifier, published as
+	// `resource` after syntax normalisation. Empty means derive it from each request,
+	// which is correct whenever the path a client uses is the path this server sees.
 	//
 	// It exists for the case where that is false — a reverse proxy that strips a
 	// path prefix — because the client compares `resource` against the identifier
@@ -153,8 +159,16 @@ func (c *ResourceMetadataConfig) document(r *http.Request, trustForwardedProto b
 // the only value that can match is the one the client already had.
 func (c *ResourceMetadataConfig) resourceIdentity(r *http.Request, trustForwardedProto bool) (identifier, metadataURL string) {
 	if c.ResourceURL != "" {
-		if derived, err := authmeta.ProtectedResourceURL(c.ResourceURL); err == nil {
-			return c.ResourceURL, derived
+		// Published in normalised form, not verbatim. RFC 9728 §3.3 has the client
+		// compare `resource` against its own identifier for identity, and a client
+		// normalises what it derives from its tunnel URL, so publishing a
+		// differently-spelled authority — upper-case host, a redundant :443 — would
+		// fail that comparison for what is one resource. Normalisation is
+		// syntax-based, so the path this flag exists to declare is untouched.
+		if identifier, err := authmeta.NormalizeResourceIdentifier(c.ResourceURL); err == nil {
+			if derived, err := authmeta.ProtectedResourceURL(identifier); err == nil {
+				return identifier, derived
+			}
 		}
 	}
 	requested := url.URL{
@@ -181,11 +195,43 @@ func (c *ResourceMetadataConfig) resourceIdentity(r *http.Request, trustForwarde
 // request can see where the configuration was meant to come from. Do not replace the
 // client's derivation with a probe for this header on the grounds that the header
 // exists.
-func (c *ResourceMetadataConfig) challenge(r *http.Request, trustForwardedProto bool) string {
-	_, metadataURL := c.resourceIdentity(r, trustForwardedProto)
+// bearerChallenge builds the RFC 6750 §3 challenge. Both parameters are optional and
+// independent, which is the point: the *scheme* announcement is mandatory on every 401
+// (RFC 9110 §11.6.1, and §3 requires it to name Bearer), while the two parameters
+// describe circumstances that may or may not apply.
+//
+// errorCode is §3.1's `error`, omitted when no credential was presented — §3.1 says a
+// challenge SHOULD NOT carry an error code then, since nothing was wrong with a token
+// that was never sent — and set to invalid_token when one was presented and failed.
+//
+// metadataURL is the RFC 9728 §5.1 hint, omitted under --no-resource-metadata. Omitting
+// it must not take the challenge with it: a 401 with no WWW-Authenticate at all is
+// malformed, and a client keying its recovery on `error="invalid_token"` would be unable
+// to tell a stale configuration from any other refusal.
+func bearerChallenge(errorCode, metadataURL string) string {
 	// The quoted-string form: RFC 6750 §3 auth-param values are quoted-string, and a
 	// URL contains characters (":", "/") that are not valid tokens.
-	return fmt.Sprintf("Bearer resource_metadata=%q", metadataURL)
+	var params []string
+	if errorCode != "" {
+		params = append(params, fmt.Sprintf("error=%q", errorCode))
+	}
+	if metadataURL != "" {
+		params = append(params, fmt.Sprintf("resource_metadata=%q", metadataURL))
+	}
+	if len(params) == 0 {
+		// RFC 6750 §3's ABNF is `challenge = "Bearer" RWS 1#param`, so the scheme
+		// needs at least one parameter — a bare "Bearer" is legal under RFC 7235's
+		// looser grammar but not under this one, and a strict client may reject it.
+		// realm is the parameter §3 names for exactly this purpose, and it carries no
+		// information a caller could not already infer.
+		return `Bearer realm="` + challengeRealm + `"`
+	}
+	return "Bearer " + strings.Join(params, ", ")
+}
+
+func (c *ResourceMetadataConfig) challenge(r *http.Request, trustForwardedProto bool, errorCode string) string {
+	_, metadataURL := c.resourceIdentity(r, trustForwardedProto)
+	return bearerChallenge(errorCode, metadataURL)
 }
 
 // serveResourceMetadata answers the well-known request. Unauthenticated by

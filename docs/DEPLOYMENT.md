@@ -95,7 +95,8 @@ For `X-Forwarded-Proto` and `X-Forwarded-Host` (used only by the WebSocket origi
 - `--client-default-scopes` or `CLIENT_DEFAULT_SCOPES` — space-delimited scopes clients should request when they configure none; a client's own `--oidc-scopes` wins. Include `offline_access` unless you want every `ssh` past the access token's lifetime to open a browser. Published as the extension field `authunnel_default_scopes`, not as `scopes_supported`. Under RFC 9728 §7.2 that registered field is the *protected resource* disclosing the scopes it supports, which is a different question from which of them a client should ask for — and authunnel discloses none there, because it enforces no scope requirement: a token is accepted on its signature, audience and standard claims, and its `scope` claim is never read. This flag is advice about the authorization request, which is what a client actually needs to know
 - `--client-audience` or `CLIENT_AUDIENCE` — value clients should send as the provider-specific `audience` authorization parameter (the Auth0 style)
 - `--client-resource` or `CLIENT_RESOURCE` — value clients should send as the RFC 8707 `resource` authorization parameter, for providers that bind the token `aud` to it (e.g. AWS Cognito). Set whichever of these two your IdP implements: this server knows what audience it requires, but not how yours wants it asked for, and a provider ignores the parameter it does not implement silently — producing a login that succeeds and a token this server then rejects
-- `--no-resource-metadata` or `NO_RESOURCE_METADATA=true` — do not publish the protected-resource document, and omit the `WWW-Authenticate` challenge that points at it. Clients then need their own `--oidc-client-id` and either `--oidc-issuer` or `--oidc-metadata-url`. Setting any `--client-*` hint alongside this is a startup error, since nothing would publish it
+- `--no-resource-metadata` or `NO_RESOURCE_METADATA=true` — do not publish the protected-resource document, and omit the `resource_metadata` parameter from the `WWW-Authenticate` challenge — the challenge
+  itself stays, since every `401` must carry one. Clients then need their own `--oidc-client-id` and either `--oidc-issuer` or `--oidc-metadata-url`. Setting any `--client-*` hint alongside this is a startup error, since nothing would publish it
 - `--listen-addr` or `LISTEN_ADDR` (default varies by TLS mode; see above)
 - `--log-level` or `LOG_LEVEL` with default `info`
 - `--tls-cert` or `TLS_CERT_FILE` — path to TLS certificate PEM
@@ -245,19 +246,25 @@ describe an origin of its choosing — but only in the response to its own reque
 compares `resource` against the URL it actually used and refuses a mismatch. That
 self-consistency check is what makes the derived value safe without a flag.
 
-**The client's comparison is exact** — scheme, host, path and query, after RFC 3986
-syntax-based normalisation only (case folding and redundant default ports). That same
-normalisation is applied to the identifier derived from `--tunnel-url`, so writing the
-authority a different way — upper-case host, redundant `:443` — still matches the
-cached token rather than forcing a fresh login. RFC 9728 §3.3
-requires it, and the reason is concrete: one hostname can serve several protected resources, and
-an origin-only comparison would let a document about `/a/tunnel` supply the authorization server
-and client ID for a client asking about `/b/tunnel`. Two consequences for deployments:
+**The client's comparison is exact.** RFC 9728 §3.3 requires the document's `resource` to be
+*identical* to the identifier the well-known suffix was inserted into, and the client compares them
+by code point — nothing about the document is normalised first. The reason is concrete: one hostname
+can serve several protected resources, and a looser comparison would let a document about
+`/a/tunnel` supply the authorization server and client ID for a client asking about `/b/tunnel`.
+
+Normalisation happens on each side's *own* input, before the comparison, so that identity holds
+without either side being lenient about what the other sent. The client normalises the identifier it
+derives from `--tunnel-url` (it is also a token-cache key, and an operator may spell one authority
+several ways — upper-case host, a redundant `:443`); this server publishes `--resource-url`
+normalised for the same reason. Both are RFC 3986 syntax-based normalisation only: case folding and
+redundant default ports, never the path or query. Two consequences for deployments:
 
 - **A path-rewriting reverse proxy needs `--resource-url`.** If the proxy strips a prefix, the
   identifier a client uses is not the one this server derives, and the comparison correctly
   fails. Set `--resource-url https://tunnel.example/authunnel/protected/tunnel` (the externally
-  visible identifier) and it is published verbatim. It must be an `http`/`https` URL with a host and
+  visible identifier) and it is published with its path intact, after authority normalisation only —
+  host case and a redundant default port are folded so the value matches what a client derives from
+  its own tunnel URL. It must be an `http`/`https` URL with a host and
   no fragment — a client derives the metadata location from it and fetches that over HTTP — and a
   value that fails those rules is refused at startup rather than published. Proxies that forward the
   path unchanged — the common case — need nothing.
@@ -286,18 +293,45 @@ and client ID for a client asking about `/b/tunnel`. Two consequences for deploy
   targets — Go puts the delimiter on the wire — so they are different identifiers here too. A
   fragment is the opposite case and is refused, since it is never sent at all.
 
-**The challenge header.** Unauthenticated `401` responses on the protected routes carry
-`WWW-Authenticate: Bearer resource_metadata="https://…"`, pointing at the document. This is for
-interoperability and for legibility when debugging a failed request; the authunnel client does not
-use it, because it knows it is talking to an authunnel server and derives the well-known URL from
-its own `--tunnel-url` rather than spending a deliberate `401` and a hit on the pre-auth limiter to
-be told. `403` responses (a token that validated but was rejected) carry no challenge: that is
-authorization, not a missing credential.
+**The challenge header, and the status codes.** Both follow RFC 6750 §3.1:
 
-**What the client does with it.** Any OIDC value not passed as a flag is taken from the document,
-and a value that *is* passed always wins. The fetch happens only when something essential is
-missing — no client ID, or neither issuer nor metadata URL — so an invocation that configures
-everything makes no additional request, and no fetch ever happens on a cache hit. Discovered URLs
+| Outcome | Status | `WWW-Authenticate` |
+|---|---|---|
+| No credential, or one this server cannot parse as Bearer | `401` | `Bearer resource_metadata="https://…"` |
+| A token that failed validation — signature, issuer, audience, expiry, `nbf` | `401` | `Bearer error="invalid_token", resource_metadata="https://…"` |
+| Either of the above, under `--no-resource-metadata` | `401` | as above without `resource_metadata`; where that would leave no parameter at all, `Bearer realm="authunnel"` |
+| WebSocket origin check refused | `403` | none |
+| Authenticated | `2xx` | none |
+
+`403` is reserved for a *valid* token that is not permitted, which this server never decides — it
+enforces no scopes — so it appears only for the origin check. Earlier versions answered a failed
+token with `403` and no challenge; that was neither §3.1's meaning nor usable by a client, since a
+`403` alone cannot be told apart from a WAF, a reverse proxy, or the origin check.
+
+`--no-resource-metadata` removes the `resource_metadata` parameter, **not the challenge**: RFC 9110
+§11.6.1 requires a `WWW-Authenticate` on every `401` and §3 requires it to name Bearer, and a client
+still needs the `invalid_token` code to tell a stale configuration from any other refusal. Turning
+publishing off does not turn a client's recovery off with it.
+
+The `realm` in that last case is there only to satisfy §3's grammar, which is
+`challenge = "Bearer" RWS 1#param` — at least one parameter, so a bare `Bearer` is not a conformant
+challenge even though the wider HTTP grammar allows it. It is a label, not a scope.
+
+The `error="invalid_token"` code is what the authunnel client keys its recovery on. It does not
+*navigate* by `resource_metadata` — it derives the well-known URL from its own `--tunnel-url` rather
+than spending a request to be told — but the presence of that error code is how it knows the
+rejection concerned the token and that re-reading configuration might help. See
+[Recovery when this configuration changes](#protected-resource-metadata-and-zero-configuration-clients).
+
+**What the client does with it.** A value passed as a flag always wins over the published one, and
+whatever is missing is filled from the document — **but the lookup only happens when an *essential*
+value is absent**: the client ID, or both the issuer and the metadata URL. Supply those and no
+request is made, so a published audience, resource indicator or default scope set is **not** adopted.
+That is deliberate — a fully-configured invocation should cost no extra round trip — but it has a
+sharp edge worth knowing: if your IdP needs an `audience` or `resource` parameter to populate the
+token's `aud`, a client passing only `--oidc-issuer` and `--oidc-client-id` will not pick yours up
+and its tokens will be refused here. Pass `--oidc-audience`/`--oidc-resource` on such clients, or
+leave one essential value out so the lookup runs. No fetch ever happens on a cache hit. Discovered URLs
 are held to the same rules as configured ones: `https` unless `--insecure-oidc-issuer`, `file://`
 refused either way, and no downgrade relative to the tunnel URL, so an `https` tunnel cannot send
 a client to a plaintext authorization server. Redirects may not downgrade onto plaintext either, and

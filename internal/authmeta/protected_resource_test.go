@@ -3,6 +3,7 @@ package authmeta
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,6 +199,64 @@ func TestFetchProtectedResourceRejectsDifferentPath(t *testing.T) {
 	secure, secureResource := protectedResourceServer(t, func(base string) string { return base + "/protected/tunnel" }, true)
 	if _, err := FetchProtectedResource(context.Background(), secure.Client(), secureResource); err != nil {
 		t.Fatalf("https control should succeed: %v", err)
+	}
+}
+
+// TestFetchProtectedResourceComparesByCodePoint pins §3.3's "identical": the declared
+// value is compared verbatim, with no normalisation of the remote string.
+//
+// Each declared spelling below is RFC 3986-equivalent to the identifier in use and is
+// still refused; see FetchProtectedResource for why leniency does not belong in this
+// check.
+//
+// Addressed as "localhost" rather than 127.0.0.1 because a numeric host has no case to
+// differ in, so the host-case variant would not otherwise be constructible.
+//
+// **Default-port equivalence is not covered and cannot be here**: an httptest server
+// never listens on 80 or 443. One NormalizeResourceIdentifier call folds all three
+// equivalences and TestNormalizeResourceIdentifier pins that, so these two cases
+// establish the call is not made on the remote value.
+func TestFetchProtectedResourceComparesByCodePoint(t *testing.T) {
+	for name, declare := range map[string]func(port string) string{
+		"scheme case": func(port string) string { return "HTTP://localhost:" + port + "/protected/tunnel" },
+		"host case":   func(port string) string { return "http://LOCALHOST:" + port + "/protected/tunnel" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var declared string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, ProtectedResourcePath) {
+					http.NotFound(w, r)
+					return
+				}
+				writeJSON(t, w, ProtectedResource{
+					Resource:             declared,
+					AuthorizationServers: []string{"https://idp.example"},
+				})
+			}))
+			defer server.Close()
+
+			_, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+			if err != nil {
+				t.Fatalf("split fixture address: %v", err)
+			}
+			declared = declare(port)
+			using := "http://localhost:" + port + "/protected/tunnel"
+			// The precondition that makes the assertion meaningful: equivalent under
+			// RFC 3986, so a normalising comparison would accept it.
+			if normalised, err := NormalizeResourceIdentifier(declared); err != nil {
+				t.Fatalf("declared %q does not even parse: %v", declared, err)
+			} else if normalised != using {
+				t.Fatalf("declared %q normalises to %q, not %q; this case is not testing equivalence", declared, normalised, using)
+			}
+
+			_, err = FetchProtectedResource(context.Background(), server.Client(), using)
+			if err == nil {
+				t.Fatalf("declared %q: expected a non-identical resource to be refused", declared)
+			}
+			if !strings.Contains(err.Error(), declared) || !strings.Contains(err.Error(), using) {
+				t.Fatalf("error should quote both identifiers, got: %v", err)
+			}
+		})
 	}
 }
 

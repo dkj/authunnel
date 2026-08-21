@@ -51,12 +51,16 @@ with the issuer and the audience to validate tokens at all. Each is transcribed 
   registration is a different trust question and a much larger surface.
 - **Discovery of the tunnel URL itself.** It is the entry point; something has to be typed.
 - **Caching discovered endpoints across invocations.** Explicitly rejected in
-  [PLAN_202608_client_discovery.md](PLAN_202608_client_discovery.md) § Rejected, on stale-credential-
+  [PLAN_202608_client_discovery.md](PLAN_202608_client_discovery.md) § Rejected alternatives, on stale-credential-
   destination grounds. Nothing here changes that analysis: resource metadata is re-fetched whenever
   the client is about to send a credential anywhere.
-- **Changing the server's status codes on auth failure.** The 403-for-invalid-token behaviour at
-  `tunnelserver.go:881` is not RFC 6750's 401, but changing it changes what every existing client
-  reports. The challenge header is added to the 401 paths only; the status codes stay as they are.
+- ~~**Changing the server's status codes on auth failure.**~~ **Reversed in round thirteen.** This
+  said the 403-for-invalid-token behaviour was not RFC 6750's 401 but that changing it would change
+  what every existing client reports. That was true and still insufficient: the deviation is what
+  forced the client's recovery to treat *any* 401 or 403 as a possible configuration change,
+  including an origin refusal, a WAF, or a proxy demanding its own credentials. Keeping the wrong
+  status code to avoid a breaking change meant keeping a heuristic that fires on unrelated failures.
+  See § Rounds thirteen and fourteen.
 
 ## The trust question, stated up front
 
@@ -256,7 +260,7 @@ no fragment.
 
 ## Security invariants
 
-Everything in `PLAN_202608_client_discovery.md` § Security invariants still holds. Added:
+Everything in `PLAN_202608_client_discovery.md` § Security properties still holds. Added:
 
 - **Resource metadata is fetched from the resource server's own origin, over the transport the
   tunnel URL specifies, and is checked to describe that resource.** The origin comparison is what
@@ -782,3 +786,37 @@ authority spellings must collapse to one identifier, and the five distinctions t
 deliberately — trailing slash, `%2F`, differing query, empty-versus-absent query, non-default port —
 must not. Mutation-checked accordingly: reverting the call fails it, and folding the trailing slash
 into the authority rule fails it too, along with three tests in authmeta.
+
+## Rounds thirteen and fourteen: RFC conformance
+
+Five findings, three of which changed behaviour. The invariants they produced live beside the code;
+this is the decision record.
+
+| Decision | Why, and what it costs |
+|---|---|
+| **`invalid_token` answers `401`, not `403`** | RFC 6750 §3.1 reserves `403` for a valid token with insufficient scope, which this server never decides. Reversing the non-goal above was the point: while the status was wrong, the client's recovery had to treat *any* `401` or `403` as a possible configuration change — including an origin refusal or a proxy demanding its own credentials. The trigger is now the `error="invalid_token"` challenge, and the heuristic is gone. **Breaking**: existing clients and dashboards see the new status. |
+| **The Bearer challenge is unconditional** | `--no-resource-metadata` governs the `resource_metadata` parameter, not the header. Suppressing the whole thing left a `401` that RFC 9110 §11.6.1 forbids and switched the client's recovery off for the operators who used that flag. `bearerChallenge` takes two independent optional parameters, and falls back to `realm` because §3's grammar requires at least one. |
+| **§3.3 is code-point equality** | The declared `resource` is compared verbatim; nothing about the remote value is normalised. Normalising it would decide that two strings name one resource on a rule the document's author never agreed to — inside the check that makes the document trustworthy. The client normalises its *own* identifier (it is also a cache key), and the server publishes the normalised form, so both sides agree without either being lenient. The docs previously claimed §3.3 *required* the normalisation; it requires the opposite. |
+| **Discovery fills gaps only when an essential value is missing** | Unchanged behaviour, corrected documentation. README, CLI help and comments had promised that any unset value is read from the server, so an operator supplying issuer and client ID could be handed a token with the wrong audience while the docs said otherwise. Making it true would cost a request on invocations that currently make none, against a stated goal. |
+
+Two of round fourteen's findings were faults in round thirteen rather than pre-existing, and both are
+worth keeping as cautions:
+
+- **The challenge suppression was mine.** The old design was accidentally immune because it keyed on
+  a status code that needed no header; re-keying on the challenge made a previously cosmetic omission
+  load-bearing. Changing what a signal *means* can promote unrelated dead code into a live defect.
+- **The code-point test proved nothing.** Two of three cases were byte-identical — `strings.ToUpper`
+  on a URL whose host is numeric only uppercases the scheme — and the third produced a malformed
+  `host:port:80`, refused for the wrong reason. It now asserts its own precondition: each declared
+  value must normalise to the identifier in use, so a case that does not test equivalence fails
+  loudly. Run against the old input, that guard reports `does not even parse`.
+
+Default-port equivalence stays uncovered and is stated as such: an httptest server never listens on
+80 or 443. One `NormalizeResourceIdentifier` call folds all three equivalences and
+`TestNormalizeResourceIdentifier` pins that, so the two live cases establish the call is not made on
+the remote value.
+
+The sweep for stale prose found six descriptions contradicting the code, all from earlier rounds of
+this work: `dialTunnelWithRecovery` still argued *for* keying on the status code and cited a renamed
+test; the mismatch error printed the caller's input rather than the value compared; and four places
+still said the challenge is omitted or `--resource-url` is published verbatim.

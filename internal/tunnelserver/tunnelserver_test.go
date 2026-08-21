@@ -42,7 +42,7 @@ func TestRouteAuthBoundaries(t *testing.T) {
 		{name: "protected_slash_authed_ok", method: http.MethodGet, path: "/protected/", auth: "Bearer good", wantStatus: http.StatusOK, wantBody: "Protected OK "},
 		{name: "protected_subpath_unauth_401", method: http.MethodGet, path: "/protected/foo", wantStatus: http.StatusUnauthorized, wantBody: "auth header missing"},
 		{name: "protected_subpath_authed_404", method: http.MethodGet, path: "/protected/foo", auth: "Bearer good", wantStatus: http.StatusNotFound},
-		{name: "protected_bad_token_403", method: http.MethodGet, path: "/protected", auth: "Bearer nope", wantStatus: http.StatusForbidden},
+		{name: "protected_bad_token_401", method: http.MethodGet, path: "/protected", auth: "Bearer nope", wantStatus: http.StatusUnauthorized},
 		// POST under /protected* is rejected by the mux's method matcher
 		// before the auth handler runs, so unauthenticated callers see 405
 		// rather than 401. The methods supported on these paths are not

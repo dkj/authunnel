@@ -1494,11 +1494,8 @@ func TestPublishedScopesBeatTheDefaultButNotAFlag(t *testing.T) {
 // rather than cosmetic: a document publishing only the registered scopes_supported
 // must be ignored, and the client falls back to its own default.
 //
-// RFC 9728 §7.2 is the reason. scopes_supported is a protected resource disclosing
-// the scopes *it* supports — a statement about the resource, not advice about the
-// request — so an authorization request must not be built from it, or the client asks
-// for whatever happens to be supported. Only the extension field, which a publisher
-// sets to say "ask for these", is adopted.
+// Only the extension field is adopted; see the hint table in applyResourceMetadata for
+// why the registered one is not a set to request.
 //
 // The published set differs from defaultOIDCScopes on purpose. Were they equal, this
 // test would pass whether the field was adopted or ignored.

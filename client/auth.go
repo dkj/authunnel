@@ -36,9 +36,10 @@ type authTokenSource interface {
 	// grant — used when the server warns that the current token is expiring.
 	AccessToken(ctx context.Context, useCache bool) (string, error)
 
-	// TokenAfterRejection returns a replacement token when the server has
-	// rejected the last one *because the configuration it was obtained under is
-	// no longer the configuration in force*, and "" when that is not the case.
+	// TokenAfterRejection returns a replacement token when the server has rejected
+	// the last one *because the configuration it was obtained under is no longer the
+	// configuration in force*, and "" when that is not the case. Called only for a
+	// rejection carrying RFC 6750's error="invalid_token" — see isAuthRejection.
 	//
 	// A cached token still valid by its own `exp` bypasses resolution — the fast path
 	// working as intended — so a server that changes issuer, client ID or audience

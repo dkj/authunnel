@@ -76,8 +76,9 @@ type serverConfig struct {
 	OIDCJWKSURI   string
 	TokenAudience string
 
-	// NoResourceMetadata switches off the RFC 9728 protected-resource document
-	// and the WWW-Authenticate challenge that points at it. Publishing is the
+	// NoResourceMetadata switches off the RFC 9728 protected-resource document and
+	// the resource_metadata parameter that points at it — not the WWW-Authenticate
+	// challenge, which every 401 must carry. Publishing is the
 	// default because a feature clients must opt into on both ends removes no
 	// configuration from anyone; the switch exists because publishing *is* a
 	// change in what an unauthenticated caller learns — the issuer URL, and any
@@ -94,10 +95,10 @@ type serverConfig struct {
 	ClientAudience      string
 	ClientResource      string
 	// ResourceURL is the externally visible identifier of this tunnel endpoint,
-	// published verbatim. Needed only where a reverse proxy rewrites the path, so
-	// the identifier a client uses is not the one this server would derive: the
-	// client's check on that value is exact, so a rewritten path has to be
-	// declared rather than tolerated.
+	// published after syntax normalisation. Needed only where a reverse proxy rewrites
+	// the path, so the identifier a client uses is not the one this server would
+	// derive: the client's check on that value is by code-point equality, so a
+	// rewritten path has to be declared rather than tolerated.
 	ResourceURL string
 
 	ListenAddr string
@@ -232,9 +233,11 @@ Client configuration published to clients (RFC 9728 protected-resource metadata)
                              this server reads no metadata document at all, so an egress policy can
                              deny it the discovery host, while clients still need to be told where
                              that document lives if the OIDC derivation cannot reach it.
-  --no-resource-metadata     Do not publish the document, and omit the WWW-Authenticate challenge that
-                             points at it (env: NO_RESOURCE_METADATA=true). Clients then need their
-                             own --oidc-client-id and one of --oidc-issuer / --oidc-metadata-url.
+  --no-resource-metadata     Do not publish the document, and drop the resource_metadata parameter
+                             from the WWW-Authenticate challenge (env: NO_RESOURCE_METADATA=true).
+                             The challenge itself remains: every 401 must carry one. Clients then
+                             need their own --oidc-client-id and one of --oidc-issuer /
+                             --oidc-metadata-url.
 
 TLS mode (choose exactly one):
 
@@ -663,7 +666,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		"Pinned JWKS endpoint; skips metadata discovery entirely, so the issuer-to-keys binding is asserted by you rather than verified. Mutually exclusive with --oidc-metadata-url (env: OIDC_JWKS_URI)")
 	fs.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "Audience required in validated access tokens")
 	fs.StringVar(&cfg.ResourceURL, "resource-url", cfg.ResourceURL,
-		"Externally visible resource identifier for this tunnel endpoint, published verbatim in the protected-resource document; only needed behind a path-rewriting reverse proxy (env: RESOURCE_URL)")
+		"Externally visible resource identifier for this tunnel endpoint, published in the protected-resource document after authority normalisation; only needed behind a path-rewriting reverse proxy (env: RESOURCE_URL)")
 	fs.StringVar(&cfg.ClientID, "client-id", cfg.ClientID,
 		"Public OIDC client ID published to clients in the protected-resource metadata document (env: CLIENT_ID)")
 	fs.StringVar(&cfg.ClientAudience, "client-audience", cfg.ClientAudience,
@@ -671,7 +674,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	fs.StringVar(&cfg.ClientResource, "client-resource", cfg.ClientResource,
 		"Value clients should send as the RFC 8707 'resource' authorization parameter (env: CLIENT_RESOURCE)")
 	fs.BoolVar(&cfg.NoResourceMetadata, "no-resource-metadata", cfg.NoResourceMetadata,
-		"Do not publish RFC 9728 protected-resource metadata, and omit the WWW-Authenticate challenge that points at it (env: NO_RESOURCE_METADATA=true)")
+		"Do not publish RFC 9728 protected-resource metadata, and drop the resource_metadata parameter from the WWW-Authenticate challenge; the challenge itself remains (env: NO_RESOURCE_METADATA=true)")
 	fs.Func("client-default-scopes", "Space-delimited scopes clients should request when they configure none, published to clients; a client's own --oidc-scopes wins (env: CLIENT_DEFAULT_SCOPES)", func(value string) error {
 		cfg.ClientDefaultScopes = strings.Fields(value)
 		return nil

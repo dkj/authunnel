@@ -460,16 +460,19 @@ type rejectingTunnel struct {
 	attempts []string
 }
 
-func newRejectingTunnel(t *testing.T, status int, accepted string) *rejectingTunnel {
+// newRejectingTunnel refuses every token but `accepted`, with a status and challenge
+// the caller chooses, so a test can present the exact shape a real rejection has.
+func newRejectingTunnel(t *testing.T, status int, challenge, accepted string) *rejectingTunnel {
 	t.Helper()
 	tunnel := &rejectingTunnel{status: status, accepted: accepted}
 	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		tunnel.attempts = append(tunnel.attempts, token)
 		if token != tunnel.accepted {
-			// Mirror the server's own shape: a rejected-but-well-formed token
-			// gets 403, and the challenge rides on 401s only.
-			http.Error(w, "forbidden", tunnel.status)
+			if challenge != "" {
+				w.Header().Set("WWW-Authenticate", challenge)
+			}
+			http.Error(w, "rejected by fixture", tunnel.status)
 			return
 		}
 		http.Error(w, "not upgrading in this fixture", http.StatusTeapot)
@@ -482,9 +485,14 @@ func newRejectingTunnel(t *testing.T, status int, accepted string) *rejectingTun
 // TestDialRetriesOnceAfterAConfigurationChange covers the wiring: a rejection
 // reaches the token source, and the replacement it returns is used for exactly
 // one more attempt.
+//
+// The trigger is the RFC 6750 challenge, so the fixture sends one. The status is
+// varied to show the challenge is what decides — a 403 carrying it still triggers the
+// retry, even though this server would send 401.
 func TestDialRetriesOnceAfterAConfigurationChange(t *testing.T) {
+	const challenge = `Bearer error="invalid_token", resource_metadata="https://tunnel.example/.well-known/oauth-protected-resource/protected/tunnel"`
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
-		tunnel := newRejectingTunnel(t, status, "the-new-token")
+		tunnel := newRejectingTunnel(t, status, challenge, "the-new-token")
 		source := &fakeTokenSource{token: "the-stale-token", afterRejection: "the-new-token"}
 		cfg := clientConfig{TunnelURL: tunnel.URL, HTTPClient: tunnel.client}
 
@@ -504,11 +512,47 @@ func TestDialRetriesOnceAfterAConfigurationChange(t *testing.T) {
 	}
 }
 
+// TestDialDoesNotRetryWithoutAnInvalidTokenChallenge is the reason the trigger moved
+// off the status code. Each of these is a refusal the client can do nothing about by
+// re-reading metadata: an origin check, a proxy demanding its own credentials, a WAF.
+// Under the old rule every one of them cost a metadata fetch, and could cost a browser
+// login; now none of them is mistaken for a configuration change.
+func TestDialDoesNotRetryWithoutAnInvalidTokenChallenge(t *testing.T) {
+	for name, tt := range map[string]struct {
+		status    int
+		challenge string
+	}{
+		"origin refusal":          {http.StatusForbidden, ""},
+		"bare unauthorized":       {http.StatusUnauthorized, ""},
+		"proxy asking for basic":  {http.StatusUnauthorized, `Basic realm="corp-proxy"`},
+		"bearer without an error": {http.StatusUnauthorized, `Bearer resource_metadata="https://tunnel.example/.well-known/oauth-protected-resource/protected/tunnel"`},
+		"a different error code":  {http.StatusForbidden, `Bearer error="insufficient_scope"`},
+		"invalid_token in a URL":  {http.StatusForbidden, `Bearer resource_metadata="https://tunnel.example/invalid_token"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tunnel := newRejectingTunnel(t, tt.status, tt.challenge, "never-accepted")
+			source := &fakeTokenSource{token: "the-stale-token", afterRejection: "the-new-token"}
+			cfg := clientConfig{TunnelURL: tunnel.URL, HTTPClient: tunnel.client}
+
+			if _, _, err := dialTunnelWithRecovery(context.Background(), cfg, source, "the-stale-token"); err == nil {
+				t.Fatal("expected the dial to fail")
+			}
+			if source.rejectionCalls != 0 {
+				t.Fatalf("TokenAfterRejection called %d times, want none", source.rejectionCalls)
+			}
+			if len(tunnel.attempts) != 1 {
+				t.Fatalf("tokens presented = %v, want the one attempt", tunnel.attempts)
+			}
+		})
+	}
+}
+
 // TestDialDoesNotRetryWhenNothingChanged is the no-login-storm half: with no
 // replacement offered, the server's original error is what the user sees, and no
 // second attempt is made.
 func TestDialDoesNotRetryWhenNothingChanged(t *testing.T) {
-	tunnel := newRejectingTunnel(t, http.StatusForbidden, "never-matches")
+	tunnel := newRejectingTunnel(t, http.StatusUnauthorized,
+		`Bearer error="invalid_token"`, "never-matches")
 	source := &fakeTokenSource{token: "stale", afterRejection: ""}
 	cfg := clientConfig{TunnelURL: tunnel.URL, HTTPClient: tunnel.client}
 
@@ -516,7 +560,7 @@ func TestDialDoesNotRetryWhenNothingChanged(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the rejection to be surfaced")
 	}
-	if !strings.Contains(err.Error(), "tunnel authorization rejected") {
+	if !strings.Contains(err.Error(), "tunnel authentication rejected") {
 		t.Fatalf("error = %v, want the server's own rejection reported", err)
 	}
 	if len(tunnel.attempts) != 1 {
@@ -529,7 +573,7 @@ func TestDialDoesNotRetryWhenNothingChanged(t *testing.T) {
 // would be a metadata fetch per rate-limited request.
 func TestDialDoesNotRetryOnAdmissionRejections(t *testing.T) {
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
-		tunnel := newRejectingTunnel(t, status, "never-matches")
+		tunnel := newRejectingTunnel(t, status, "", "never-matches")
 		source := &fakeTokenSource{token: "fine", afterRejection: "would-be-wrong-to-use"}
 		cfg := clientConfig{TunnelURL: tunnel.URL, HTTPClient: tunnel.client}
 

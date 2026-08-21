@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,9 +51,11 @@ type clientConfig struct {
 
 	AccessToken string
 
-	// Every OIDC value below is optional. What is not supplied is discovered
-	// from the tunnel server's RFC 9728 protected-resource metadata; see
-	// ResourceURL. What is supplied always wins over what is discovered.
+	// Every OIDC value below is optional. What is missing is discovered from the
+	// tunnel server's RFC 9728 protected-resource metadata — but only when an
+	// *essential* value is absent, so a client supplying the client ID and an issuer
+	// adopts none of the other hints. See ResourceURL and needsDiscovery. What is
+	// supplied always wins over what is discovered.
 	OIDCIssuer string
 	// OIDCMetadataURL overrides the well-known path derived from OIDCIssuer.
 	// It changes only where the metadata document is fetched from, and it makes
@@ -136,9 +139,14 @@ Choose one operating mode (mutually exclusive):
 Authentication:
 
   Managed OIDC is used unless ACCESS_TOKEN is set, and needs no configuration of its own:
-  whatever is not given below is read from the tunnel server's RFC 9728 protected-resource
-  metadata, which names its authorization server and may publish the client ID, scopes and
-  audience to use. A value you do give always wins over the published one.
+  what is missing is read from the tunnel server's RFC 9728 protected-resource metadata,
+  which names its authorization server and may publish the client ID, scopes and audience
+  to use. A value you do give always wins over the published one.
+
+  The lookup runs only when an *essential* value is absent — --oidc-client-id, or both
+  --oidc-issuer and --oidc-metadata-url. Supply those and nothing is fetched, which also
+  means no published audience, resource or scopes are adopted: pass them yourself, or
+  leave one essential value out so the lookup runs.
 
   Supply these to override what the server publishes, when it publishes nothing
   (--no-resource-metadata on the server side), or alongside --no-resource-metadata here to
@@ -615,15 +623,14 @@ func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authToken
 // could loop, and without the second every rejection — a disabled account, a
 // revoked scope — would open a browser that cannot help.
 //
-// 403 counts alongside 401, and this is the part worth reading twice. The
-// server answers a token that failed validation with 403 — wrong issuer, wrong
-// audience, bad signature — and reserves 401 for a missing or malformed header.
-// The configuration-changed case therefore arrives as a 403, which by RFC 7235
-// carries no WWW-Authenticate challenge and so carries no `resource_metadata`
-// either. Keying this recovery on the challenge, as the RFC 9728 §5.2 flow
-// suggests, would miss every case it exists for; keying it on the status code
-// catches them. tunnelserver's TestChallengeAbsentOnSuccessAndOnForbidden pins
-// the server half of that.
+// The trigger is RFC 6750's `error="invalid_token"` challenge, not a status code —
+// see isAuthRejection. A status code cannot express this: 403 is the WebSocket origin
+// check, and either status may come from a proxy or a WAF that never saw the token, so
+// re-reading metadata for those would spend a request, and possibly a browser login,
+// on something configuration cannot fix. The challenge says a token was judged and
+// found wanting, which is precisely when the configuration it was minted under is
+// worth re-checking. tunnelserver's TestChallengeMatchesTheReasonForTheRejection pins
+// the server half.
 func dialTunnelWithRecovery(ctx context.Context, cfg clientConfig, source authTokenSource, token string) (*websocket.Conn, *http.Response, error) {
 	conn, resp, err := dialTunnel(ctx, cfg, token)
 	if err == nil || !isAuthRejection(err) {
@@ -644,14 +651,45 @@ func dialTunnelWithRecovery(ctx context.Context, cfg clientConfig, source authTo
 	return dialTunnel(ctx, cfg, replacement)
 }
 
-// isAuthRejection reports whether the server refused the credential, as opposed
-// to refusing the request for capacity or rate reasons.
+// isAuthRejection reports whether the server said *the token* was the problem, which
+// is the only rejection re-reading its configuration could fix.
+//
+// Keyed on the RFC 6750 §3.1 challenge, not on the status code. A status code cannot
+// carry this: a 403 may be an origin-check refusal, a WAF, or something in front of the
+// server, and a 401 may be a proxy demanding its own credentials — for none of which is
+// metadata the answer. `error="invalid_token"` says a token was presented and rejected,
+// which is exactly the case where the configuration it was minted under may have moved.
 func isAuthRejection(err error) bool {
 	var dialErr *tunnelDialError
 	if !errors.As(err, &dialErr) {
 		return false
 	}
-	return dialErr.StatusCode == http.StatusUnauthorized || dialErr.StatusCode == http.StatusForbidden
+	return dialErr.InvalidToken
+}
+
+// invalidTokenChallenge reports whether a WWW-Authenticate header carries a Bearer
+// challenge with error="invalid_token".
+//
+// Parsed rather than matched as a substring: the parameters may appear in any order
+// with arbitrary whitespace, and a substring test would also match a *resource_metadata
+// URL* that happened to contain the text.
+func invalidTokenChallenge(header http.Header) bool {
+	for _, value := range header.Values("WWW-Authenticate") {
+		scheme, params, found := strings.Cut(strings.TrimSpace(value), " ")
+		if !found || !strings.EqualFold(scheme, "Bearer") {
+			continue
+		}
+		for _, param := range strings.Split(params, ",") {
+			name, raw, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(name), "error") {
+				continue
+			}
+			if strings.Trim(strings.TrimSpace(raw), `"`) == "invalid_token" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket.Conn, *http.Response, error) {
@@ -669,9 +707,10 @@ func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket
 		// information operators need to distinguish 401 (auth) from 429/503
 		// (admission limits) and to honour Retry-After manually.
 		return conn, resp, &tunnelDialError{
-			StatusCode: resp.StatusCode,
-			RetryAfter: resp.Header.Get("Retry-After"),
-			Err:        err,
+			StatusCode:   resp.StatusCode,
+			RetryAfter:   resp.Header.Get("Retry-After"),
+			InvalidToken: invalidTokenChallenge(resp.Header),
+			Err:          err,
 		}
 	}
 	return conn, resp, err
@@ -683,7 +722,10 @@ func dialTunnel(ctx context.Context, cfg clientConfig, token string) (*websocket
 type tunnelDialError struct {
 	StatusCode int
 	RetryAfter string
-	Err        error
+	// InvalidToken records an RFC 6750 error="invalid_token" challenge: the server
+	// says the token was the problem. See isAuthRejection.
+	InvalidToken bool
+	Err          error
 }
 
 func (e *tunnelDialError) Error() string {
@@ -701,7 +743,7 @@ func (e *tunnelDialError) categoryMessage() string {
 	case http.StatusUnauthorized:
 		return "tunnel authentication rejected"
 	case http.StatusForbidden:
-		return "tunnel authorization rejected"
+		return "tunnel request forbidden"
 	case http.StatusTooManyRequests:
 		return "tunnel rate-limited by server"
 	case http.StatusServiceUnavailable:
