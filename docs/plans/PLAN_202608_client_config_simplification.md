@@ -844,3 +844,24 @@ Third finding in three rounds where two branches had to remember the same rule a
 query attachment, then authority normalisation. Both now happen once, below the branch, on the
 settled base. The remaining per-branch call is a validity gate on `--resource-url`, not a second
 copy of the rule.
+
+### Round seventeen: concurrent recovery
+
+Concurrent sessions share one cache file and start from the same stale token. The first to take the
+lock re-authenticates; the second then loaded an entry matching the re-resolved configuration and
+reported "nothing changed" — failing a connection whose working credential was already on disk.
+`TokenAfterRejection` now takes the rejected token, which is what separates "the configuration still
+matches" from "someone else already fixed this".
+
+The signature matters as much as the fix: `(ctx)` required a reader to know that `""` meant "the
+token you gave me is still current", about a token the function never saw. Recovery can now return a
+token under *unchanged* configuration, so the contract and the retry log say so.
+
+**A combined-challenge scan was tried and reverted.** RFC 9110 lets an intermediary coalesce
+`WWW-Authenticate` lines, so a Bearer challenge can sit behind another scheme and go unnoticed. The
+cheap fix — scanning the field rather than parsing it — dropped the association between a scheme and
+its parameters, which made `Basic error="invalid_token", Bearer …` match and re-introduced the
+resource_metadata false positive the original comment existed to prevent. Recognising a combined
+challenge properly needs a quote-aware challenge-list parser; that is more machinery than an optional
+optimisation earns, so the limitation is documented at `invalidTokenChallenge` instead. Missing one
+costs no more than not having the feature.

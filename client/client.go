@@ -608,8 +608,9 @@ func runProxyCommandMode(ctx context.Context, cfg clientConfig, source authToken
 	return nil
 }
 
-// dialTunnelWithRecovery dials, and on a rejection gives the token source one
-// chance to notice that the server's configuration has moved.
+// dialTunnelWithRecovery dials, and on a rejection gives the token source one chance
+// to produce a token worth retrying with — because the server's configuration has
+// moved, or because a concurrent invocation has already obtained one.
 //
 // The case this exists for: a cached access token that is still valid by its own
 // `exp` is returned without resolving anything, which is the fast path working as
@@ -636,7 +637,7 @@ func dialTunnelWithRecovery(ctx context.Context, cfg clientConfig, source authTo
 	if err == nil || !isAuthRejection(err) {
 		return conn, resp, err
 	}
-	replacement, retryErr := source.TokenAfterRejection(ctx)
+	replacement, retryErr := source.TokenAfterRejection(ctx, token)
 	if retryErr != nil {
 		// Report what the server said, not what re-resolution then hit: the
 		// rejection is the user's actual problem and the recovery attempt was
@@ -647,7 +648,7 @@ func dialTunnelWithRecovery(ctx context.Context, cfg clientConfig, source authTo
 	if replacement == "" {
 		return conn, resp, err
 	}
-	log.Println("server configuration changed; retrying with a token obtained under the new one")
+	log.Println("retrying with a different token: the server's configuration changed, or another session already refreshed it")
 	return dialTunnel(ctx, cfg, replacement)
 }
 
@@ -673,6 +674,21 @@ func isAuthRejection(err error) bool {
 // Parsed rather than matched as a substring: the parameters may appear in any order
 // with arbitrary whitespace, and a substring test would also match a *resource_metadata
 // URL* that happened to contain the text.
+//
+// **One challenge per header line, deliberately.** RFC 9110 defines the field as
+// `1#challenge` and permits an intermediary to combine repeated lines, so
+// `Basic realm="proxy", Bearer error="invalid_token"` is legal and is *not* recognised
+// here — the first token is taken as the scheme for the whole value. Separating
+// challenges properly means telling a challenge-separating comma from a
+// parameter-separating one, inside quoted values that may contain either; that is a
+// quote-aware challenge-list parser, which is more machinery than an optional
+// optimisation earns. A looser scan was tried and rejected: dropping the association
+// between a scheme and its parameters made `Basic error="invalid_token", Bearer …`
+// match, and re-introduced exactly the resource_metadata false positive the paragraph
+// above exists to prevent.
+//
+// The cost of missing a combined challenge is bounded: recovery does not fire, and the
+// client waits out its cached token — the behaviour it would have without this feature.
 func invalidTokenChallenge(header http.Header) bool {
 	for _, value := range header.Values("WWW-Authenticate") {
 		scheme, params, found := strings.Cut(strings.TrimSpace(value), " ")

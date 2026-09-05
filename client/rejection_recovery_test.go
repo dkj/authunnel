@@ -59,7 +59,7 @@ func TestTokenAfterRejectionReplacesTheTokenWhenConfigurationChanged(t *testing.
 	// The server rejects it. Re-resolution finds a different client ID, so the
 	// cached refresh token belongs to a configuration that is gone and a fresh
 	// login is the only way forward.
-	replacement, err := source.TokenAfterRejection(context.Background())
+	replacement, err := source.TokenAfterRejection(context.Background(), token)
 	if err != nil {
 		t.Fatalf("TokenAfterRejection: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestTokenAfterRejectionDropsTheMetadataOriginPin(t *testing.T) {
 	})
 	source.cachePath = cachePath
 
-	replacement, err := source.TokenAfterRejection(context.Background())
+	replacement, err := source.TokenAfterRejection(context.Background(), "token-the-server-now-refuses")
 	if err != nil {
 		t.Fatalf("re-resolution after a rejection should follow the issuer's own delegation: %v", err)
 	}
@@ -150,6 +150,61 @@ func TestTokenAfterRejectionDropsTheMetadataOriginPin(t *testing.T) {
 	}
 	if source.metadataOriginIsPinned() {
 		t.Fatal("with no published metadata URL in force the derived fetch must not be pinned")
+	}
+}
+
+// TestTokenAfterRejectionUsesATokenAnotherInvocationObtained covers concurrent ssh
+// sessions sharing one cache file. They start from the same stale token; the first to
+// take the lock re-authenticates and writes a working entry. The second then loads that
+// entry, finds it matches the re-resolved configuration, and would report "nothing
+// changed" — failing a connection whose credential is already on disk.
+//
+// The rejected token is the parameter that makes the two cases distinguishable: the
+// entry matching the configuration is not the same claim as the entry holding the token
+// that was just refused.
+func TestTokenAfterRejectionUsesATokenAnotherInvocationObtained(t *testing.T) {
+	fixture := newDiscoveryFixture(t)
+	cachePath := filepathForTest(t, "tokens.json")
+	// What the first invocation left behind: the resolved identity, and a token this
+	// caller has never seen.
+	writeTokenCacheForTest(t, cachePath, tokenCache{
+		ResourceURL:  fixture.ResourceURL,
+		Issuer:       fixture.Issuer,
+		ClientID:     "published-cli",
+		Scopes:       normalizeScopes(publishedScopes),
+		AccessToken:  "token-the-other-invocation-obtained",
+		RefreshToken: "refresh-token-1",
+		TokenType:    "Bearer",
+		Expiry:       time.Now().Add(time.Hour),
+	})
+
+	opened := 0
+	source := fixture.discoverySource(t, completingOpener(&opened))
+	source.cachePath = cachePath
+
+	replacement, err := source.TokenAfterRejection(context.Background(), "the-stale-token-this-session-held")
+	if err != nil {
+		t.Fatalf("TokenAfterRejection: %v", err)
+	}
+	if replacement != "token-the-other-invocation-obtained" {
+		t.Fatalf("replacement = %q, want the token already recovered by another invocation", replacement)
+	}
+	if opened != 0 {
+		t.Fatalf("browser logins = %d, want none: the credential was already on disk", opened)
+	}
+	if _, tokenRequests := fixture.counts(); len(tokenRequests) != 0 {
+		t.Fatalf("token endpoint saw %d requests, want none", len(tokenRequests))
+	}
+
+	// The control, and the reason this cannot become a retry loop: presented with the
+	// token that *is* on disk, there is nothing new to offer and "" still means
+	// "surface the original rejection".
+	replacement, err = source.TokenAfterRejection(context.Background(), "token-the-other-invocation-obtained")
+	if err != nil {
+		t.Fatalf("TokenAfterRejection: %v", err)
+	}
+	if replacement != "" {
+		t.Fatalf("replacement = %q, want none when the rejected token is the one cached", replacement)
 	}
 }
 
@@ -190,7 +245,7 @@ func TestRecoveryReusesOneGuardedClient(t *testing.T) {
 
 	// Recovery re-resolves from scratch. It fails for the same reason as above, which
 	// is not what this test is about: the question is what the second resolution built.
-	if _, err := source.TokenAfterRejection(context.Background()); err == nil {
+	if _, err := source.TokenAfterRejection(context.Background(), "token-the-server-now-refuses"); err == nil {
 		t.Fatal("expected the recovery's own resolution to be refused too")
 	}
 	if source.guarded != first {
@@ -293,7 +348,7 @@ func TestTokenAfterRejectionKeepsTheAddressGuard(t *testing.T) {
 	if err := source.resolve(context.Background()); err != nil {
 		t.Fatalf("first resolution through the proxy: %v", err)
 	}
-	replacement, err := source.TokenAfterRejection(context.Background())
+	replacement, err := source.TokenAfterRejection(context.Background(), "token-the-server-now-refuses")
 	if err != nil {
 		t.Fatalf("the recovery must reach the same documents the first resolution did: %v", err)
 	}
@@ -395,7 +450,7 @@ func TestTokenAfterRejectionDoesNothingWhenConfigurationIsUnchanged(t *testing.T
 	source := fixture.discoverySource(t, failingOpener(t))
 	source.cachePath = cachePath
 
-	replacement, err := source.TokenAfterRejection(context.Background())
+	replacement, err := source.TokenAfterRejection(context.Background(), "a-token-the-server-dislikes")
 	if err != nil {
 		t.Fatalf("TokenAfterRejection: %v", err)
 	}
@@ -428,7 +483,7 @@ func TestTokenAfterRejectionNoticesAChangedIssuer(t *testing.T) {
 	source := fixture.discoverySource(t, completingOpener(&opened))
 	source.cachePath = cachePath
 
-	if _, err := source.TokenAfterRejection(context.Background()); err != nil {
+	if _, err := source.TokenAfterRejection(context.Background(), "stale-token"); err != nil {
 		t.Fatalf("TokenAfterRejection: %v", err)
 	}
 	if opened != 1 {
@@ -444,7 +499,7 @@ func TestTokenAfterRejectionNoticesAChangedIssuer(t *testing.T) {
 // TestStaticTokenSourceHasNothingToRecover pins the manual-token contract: the
 // value came from outside this process, so there is no other one to obtain.
 func TestStaticTokenSourceHasNothingToRecover(t *testing.T) {
-	replacement, err := staticTokenSource{token: "x"}.TokenAfterRejection(context.Background())
+	replacement, err := staticTokenSource{token: "x"}.TokenAfterRejection(context.Background(), "x")
 	if err != nil || replacement != "" {
 		t.Fatalf("TokenAfterRejection = (%q, %v), want no replacement and no error", replacement, err)
 	}
@@ -628,7 +683,7 @@ func TestTokenAfterRejectionForgetsWhatItResolvedEarlier(t *testing.T) {
 	// The server moves to a different client, and the token is rejected.
 	fixture.setDocument(func(d *authmeta.ProtectedResource) { d.ClientID = "the-new-client" })
 
-	replacement, err := source.TokenAfterRejection(context.Background())
+	replacement, err := source.TokenAfterRejection(context.Background(), "the-cached-token")
 	if err != nil {
 		t.Fatalf("TokenAfterRejection: %v", err)
 	}

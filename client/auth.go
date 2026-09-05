@@ -36,10 +36,19 @@ type authTokenSource interface {
 	// grant — used when the server warns that the current token is expiring.
 	AccessToken(ctx context.Context, useCache bool) (string, error)
 
-	// TokenAfterRejection returns a replacement token when the server has rejected
-	// the last one *because the configuration it was obtained under is no longer the
-	// configuration in force*, and "" when that is not the case. Called only for a
+	// TokenAfterRejection returns a usable token to retry with when one is available,
+	// and "" when there is nothing to offer but the original error. Called only for a
 	// rejection carrying RFC 6750's error="invalid_token" — see isAuthRejection.
+	//
+	// Two things make one available: the configuration the rejected credential was
+	// obtained under is no longer the configuration in force, so a token is obtained
+	// under the new one; or another invocation has already recovered and left a
+	// different, usable token in the shared cache.
+	//
+	// rejected is the token the server refused. It is needed to tell "nothing changed"
+	// from "another invocation already fixed this": concurrent ssh sessions share one
+	// cache file, so the entry on disk may already hold a working token that is simply
+	// not the one this caller presented.
 	//
 	// A cached token still valid by its own `exp` bypasses resolution — the fast path
 	// working as intended — so a server that changes issuer, client ID or audience
@@ -50,7 +59,7 @@ type authTokenSource interface {
 	// revoked scope produces the same rejection and re-authenticating fixes neither,
 	// so a client that logged in on every rejection would open a browser on every ssh
 	// invocation for as long as the real problem lasted.
-	TokenAfterRejection(ctx context.Context) (string, error)
+	TokenAfterRejection(ctx context.Context, rejected string) (string, error)
 }
 
 type staticTokenSource struct {
@@ -63,7 +72,7 @@ func (s staticTokenSource) AccessToken(_ context.Context, _ bool) (string, error
 
 // TokenAfterRejection has nothing to offer: ACCESS_TOKEN is one value supplied
 // from outside, and this process cannot obtain a different one.
-func (s staticTokenSource) TokenAfterRejection(context.Context) (string, error) {
+func (s staticTokenSource) TokenAfterRejection(context.Context, string) (string, error) {
 	return "", nil
 }
 
@@ -330,17 +339,17 @@ func (s *managedOIDCTokenSource) tokenForResolvedIdentity(ctx context.Context, c
 	return s.interactiveToken(ctx)
 }
 
-// TokenAfterRejection re-resolves from scratch and, if the configuration turns
-// out to have changed under the credential the server just rejected, obtains a
-// token under the new one.
+// TokenAfterRejection re-resolves from scratch and returns a token to retry with,
+// from whichever of two sources has one: a configuration that has changed under the
+// rejected credential, or a cache another invocation has already refreshed.
 //
-// "Changed" is judged against the cache entry, not against what this process
-// resolved earlier: the point is to compare the configuration the *rejected
-// credential* was obtained under with the configuration in force now. When they
-// agree, the rejection is about the credential or the user rather than the
-// configuration, and "" is returned so the caller surfaces the original error
-// instead of starting a login that would end the same way.
-func (s *managedOIDCTokenSource) TokenAfterRejection(ctx context.Context) (string, error) {
+// "Changed" is judged against the cache entry, not against what this process resolved
+// earlier: the point is to compare the configuration the *rejected credential* was
+// obtained under with the configuration in force now. When they agree *and* the entry
+// still holds the rejected token, the rejection is about the credential or the user
+// rather than the configuration, and "" is returned so the caller surfaces the
+// original error instead of starting a login that would end the same way.
+func (s *managedOIDCTokenSource) TokenAfterRejection(ctx context.Context, rejected string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -362,6 +371,15 @@ func (s *managedOIDCTokenSource) TokenAfterRejection(ctx context.Context) (strin
 		return "", err
 	}
 	if s.cacheMatchesResolved(cache) {
+		// The configuration is unchanged — but another invocation may have recovered
+		// while this one waited for the file lock. Concurrent ssh sessions start from
+		// the same stale token and only the first re-authenticates; the entry it wrote
+		// matches the resolved configuration and holds a *different* token from the one
+		// that was rejected. Reporting "nothing changed" would fail a connection whose
+		// working credential is already on disk.
+		if cache.AccessToken != rejected && tokenUsable(cache.asOAuth2Token(), s.now()) {
+			return cache.AccessToken, nil
+		}
 		return "", nil
 	}
 

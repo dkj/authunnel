@@ -359,7 +359,7 @@ func (f *fakeTokenSource) AccessToken(_ context.Context, _ bool) (string, error)
 	return f.token, f.err
 }
 
-func (f *fakeTokenSource) TokenAfterRejection(context.Context) (string, error) {
+func (f *fakeTokenSource) TokenAfterRejection(context.Context, string) (string, error) {
 	f.rejectionCalls++
 	return f.afterRejection, nil
 }
