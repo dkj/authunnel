@@ -820,3 +820,27 @@ The sweep for stale prose found six descriptions contradicting the code, all fro
 this work: `dialTunnelWithRecovery` still argued *for* keying on the status code and cited a renamed
 test; the mismatch error printed the caller's input rather than the value compared; and four places
 still said the challenge is omitted or `--resource-url` is published verbatim.
+
+### Round fifteen: the query rule, fifth site
+
+`--resource-url` returned before the query was attached, so a path-rewriting deployment whose clients
+distinguish resources by query published an identifier no client could match.
+
+Fifth finding against one rule, and none a re-fix of the same code: extracting `CarryQuery` made
+*how* to copy a query uniform and left *whether* to per-branch, so an early `return` still skipped
+it. `resourceIdentity` now settles the base — declared or derived — and attaches the query once
+below both branches. `--resource-url` is validated as the external base; a query in it is refused,
+since it would compete with the request's for one slot.
+
+### Round sixteen: the same shape once more
+
+The request-derived branch published the authority as the Host header spelled it, while the declared
+branch normalised — so `TUNNEL.example:443` reached a client that had normalised its own identifier
+to `tunnel.example`, and the exact §3.3 comparison failed. The `resource` and the challenge's
+location also disagreed: the §3.1 derivation normalises internally, so a client following the
+challenge landed on a document it then had to refuse.
+
+Third finding in three rounds where two branches had to remember the same rule and one did not —
+query attachment, then authority normalisation. Both now happen once, below the branch, on the
+settled base. The remaining per-branch call is a validity gate on `--resource-url`, not a second
+copy of the rule.

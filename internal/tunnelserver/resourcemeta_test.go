@@ -260,7 +260,7 @@ func TestPublishedWireKeysAreTheAgreedOnes(t *testing.T) {
 // the document can be trusted.
 //
 // The path is untouched, which is the part the flag exists for: normalisation is
-// syntax-based, so a prefix a reverse proxy strips is still declared verbatim.
+// syntax-based, so a prefix a reverse proxy strips reaches the document unchanged.
 func TestDeclaredResourceURLIsPublishedNormalised(t *testing.T) {
 	mux := resourceMetadataHandler(t, HandlerOptions{
 		ResourceMetadata: &ResourceMetadataConfig{
@@ -287,6 +287,119 @@ func TestDeclaredResourceURLIsPublishedNormalised(t *testing.T) {
 	const wantMetadata = "https://tunnel.example/.well-known/oauth-protected-resource/authunnel/protected/tunnel"
 	if !strings.Contains(challenge, wantMetadata) {
 		t.Fatalf("challenge = %q, want it to name %q", challenge, wantMetadata)
+	}
+}
+
+// TestDeclaredResourceCarriesTheRequestQuery covers the combination a path-rewriting
+// deployment actually needs: --resource-url declares the external base, and the client
+// still distinguishes resources by query.
+//
+// The declared branch used to return before the query was attached, so `?tenant=a`
+// vanished from both the document and the challenge. The client derives a
+// query-bearing identifier from its own tunnel URL and compares by code-point equality,
+// so nothing matched and zero-configuration login could not proceed at all — for the
+// one deployment shape the flag exists to serve.
+func TestDeclaredResourceCarriesTheRequestQuery(t *testing.T) {
+	const declared = "https://tunnel.example/authunnel/protected/tunnel"
+	mux := resourceMetadataHandler(t, HandlerOptions{
+		ResourceMetadata: &ResourceMetadataConfig{Issuer: "https://idp.example", ResourceURL: declared},
+	})
+
+	for name, tt := range map[string]struct{ query, want string }{
+		"a query":        {"?tenant=a", declared + "?tenant=a"},
+		"another":        {"?tenant=b", declared + "?tenant=b"},
+		"none":           {"", declared},
+		"bare delimiter": {"?", declared + "?"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// The document, as the client fetches it.
+			_, document := fetchDocumentForTest(t, mux, authmeta.ProtectedResourcePath+tunnelResourcePath+tt.query, nil)
+			if document.Resource != tt.want {
+				t.Fatalf("resource = %q, want %q", document.Resource, tt.want)
+			}
+
+			// And the challenge, which must point at the document describing *that*
+			// identifier — a client following it lands there and compares.
+			request := httptest.NewRequest(http.MethodGet, tunnelResourcePath+tt.query, nil)
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, request)
+			challenge := recorder.Header().Get("WWW-Authenticate")
+			wantMetadata, err := authmeta.ProtectedResourceURL(tt.want)
+			if err != nil {
+				t.Fatalf("derive expected metadata URL: %v", err)
+			}
+			if !strings.Contains(challenge, `resource_metadata="`+wantMetadata+`"`) {
+				t.Fatalf("challenge = %q, want it to point at %q", challenge, wantMetadata)
+			}
+		})
+	}
+}
+
+// TestResourceURLRejectsAQuery pins the other half: the flag declares a base, so a
+// query in it would compete with the request's for the same slot.
+func TestResourceURLRejectsAQuery(t *testing.T) {
+	for name, resourceURL := range map[string]string{
+		"query":          "https://tunnel.example/protected/tunnel?tenant=a",
+		"bare delimiter": "https://tunnel.example/protected/tunnel?",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &ResourceMetadataConfig{Issuer: "https://idp.example", ResourceURL: resourceURL}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("--resource-url %q: expected rejection", resourceURL)
+			}
+			if !strings.Contains(err.Error(), "--resource-url") {
+				t.Fatalf("error should name the flag to fix, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestRequestDerivedIdentifierIsNormalised covers the branch --resource-url does not
+// take. A Host header spelling — case, or a redundant default port — must not decide
+// whether the client's exact §3.3 comparison succeeds, since the client normalises the
+// identifier it compares.
+//
+// The second assertion is the one that shows the shape of the bug: the metadata URL was
+// already normalised, because the §3.1 derivation normalises internally, so the
+// published `resource` and the location the challenge names described the same resource
+// with different spellings. A client following the challenge landed on a document it
+// then had to refuse.
+func TestRequestDerivedIdentifierIsNormalised(t *testing.T) {
+	const canonical = "https://tunnel.example/protected/tunnel"
+	mux := resourceMetadataHandler(t, HandlerOptions{
+		TrustForwardedProto: true,
+		ResourceMetadata:    &ResourceMetadataConfig{Issuer: "https://idp.example"},
+	})
+
+	for _, host := range []string{
+		"tunnel.example",
+		"TUNNEL.Example",
+		"tunnel.example:443",
+		"TUNNEL.example:443",
+	} {
+		t.Run(host, func(t *testing.T) {
+			headers := map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": host}
+			_, document := fetchDocumentForTest(t, mux, authmeta.ProtectedResourcePath+tunnelResourcePath, headers)
+			if document.Resource != canonical {
+				t.Fatalf("Host %q published resource %q, want the canonical %q", host, document.Resource, canonical)
+			}
+
+			// And the challenge points at the document for exactly that identifier.
+			request := httptest.NewRequest(http.MethodGet, tunnelResourcePath, nil)
+			for name, value := range headers {
+				request.Header.Set(name, value)
+			}
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, request)
+			want, err := authmeta.ProtectedResourceURL(document.Resource)
+			if err != nil {
+				t.Fatalf("derive expected metadata URL: %v", err)
+			}
+			if got := recorder.Header().Get("WWW-Authenticate"); !strings.Contains(got, `resource_metadata="`+want+`"`) {
+				t.Fatalf("challenge = %q, want it to name %q — the location for the identifier just published", got, want)
+			}
+		})
 	}
 }
 
@@ -609,10 +722,12 @@ func TestResourceURLValidatedAsFetchable(t *testing.T) {
 	}
 }
 
-// TestResourceURLIsPublishedVerbatim is the point of the flag: a deployment whose
-// externally visible path differs from the one this server sees declares it, and
-// what a client compares against is that declaration.
-func TestResourceURLIsPublishedVerbatim(t *testing.T) {
+// TestDeclaredResourceURLIsWhatClientsCompareAgainst is the point of the flag: a
+// deployment whose externally visible path differs from the one this server sees
+// declares it, and that declaration is what a client compares against. The declared
+// value reaches the document normalised and with the request's query appended; this
+// case has neither to apply, so it arrives unchanged.
+func TestDeclaredResourceURLIsWhatClientsCompareAgainst(t *testing.T) {
 	const declared = "https://tunnel.example/authunnel/protected/tunnel"
 	mux := resourceMetadataHandler(t, HandlerOptions{
 		ResourceMetadata: &ResourceMetadataConfig{Issuer: "https://idp.example", ResourceURL: declared},
@@ -620,7 +735,7 @@ func TestResourceURLIsPublishedVerbatim(t *testing.T) {
 
 	_, document := fetchDocumentForTest(t, mux, authmeta.ProtectedResourcePath+"/protected/tunnel", nil)
 	if document.Resource != declared {
-		t.Fatalf("resource = %q, want the declared identifier verbatim", document.Resource)
+		t.Fatalf("resource = %q, want the declared identifier %q", document.Resource, declared)
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/protected/tunnel", nil)

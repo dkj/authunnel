@@ -294,8 +294,10 @@ type HandlerOptions struct {
 	PreAuthForwardedForMode ForwardedForMode
 
 	// ResourceMetadata publishes RFC 9728 protected-resource metadata at the
-	// well-known location and adds a WWW-Authenticate challenge pointing at it
-	// to unauthenticated 401 responses. A nil value disables both.
+	// well-known location and adds a resource_metadata parameter pointing at it to
+	// the WWW-Authenticate challenge on unauthenticated 401 responses. A nil value
+	// disables the document and that parameter; the Bearer challenge itself remains,
+	// since every 401 must carry one.
 	ResourceMetadata *ResourceMetadataConfig
 }
 

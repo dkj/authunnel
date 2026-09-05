@@ -264,7 +264,8 @@ redundant default ports, never the path or query. Two consequences for deploymen
   fails. Set `--resource-url https://tunnel.example/authunnel/protected/tunnel` (the externally
   visible identifier) and it is published with its path intact, after authority normalisation only —
   host case and a redundant default port are folded so the value matches what a client derives from
-  its own tunnel URL. It must be an `http`/`https` URL with a host and
+  its own tunnel URL. It declares the *base*: no query, since the query is taken from each request
+  and appended, so a value carrying one is refused at startup. It must be an `http`/`https` URL with a host and
   no fragment — a client derives the metadata location from it and fetches that over HTTP — and a
   value that fails those rules is refused at startup rather than published. Proxies that forward the
   path unchanged — the common case — need nothing.
@@ -282,7 +283,7 @@ redundant default ports, never the path or query. Two consequences for deploymen
   unauthenticated document under that prefix; requests to those shapes
   (`/protected/.well-known/…`, `/protected/tunnel/.well-known/…`) stay behind the token check and
   answer 401, then 404 once authenticated.
-- **A query in the tunnel URL is part of the identifier.** It is echoed back into `resource`, and
+- **A query in the tunnel URL is part of the identifier**, with or without `--resource-url`. It is echoed back into `resource`, and
   into the `resource_metadata` URL in the `WWW-Authenticate` challenge, so a standards-following
   client that follows the challenge lands on the document describing the identifier it is using;
   this server routes on path alone and attaches no meaning to a query, so a client whose tunnel URL
@@ -408,8 +409,9 @@ client that sets it must be given `--oidc-client-id` and one of `--oidc-issuer` 
 refusal should be a standing rule visible in the `ProxyCommand` line rather than an accident of the
 configuration happening to be complete.
 
-Server-side, `--no-resource-metadata` stops publication and removes the challenge header;
-both well-known paths then return `404`. The document is public by default because a feature both
+Server-side, `--no-resource-metadata` stops publication and drops the `resource_metadata` parameter
+from the `WWW-Authenticate` challenge; both well-known paths then return `404`. The challenge itself
+remains on every `401` — see the table above. The document is public by default because a feature both
 ends must opt into removes no configuration from anyone. What the switch buys is narrow: any client
 holding a token already knows the issuer, since it obtained the token there, and a public client ID
 is not a credential. It is a switch for a deployment whose policy treats the IdP's identity as

@@ -40,9 +40,10 @@ const challengeRealm = "authunnel"
 type ResourceMetadataConfig struct {
 	// Issuer is published as the sole entry in authorization_servers.
 	Issuer string
-	// ResourceURL is the externally visible resource identifier, published as
-	// `resource` after syntax normalisation. Empty means derive it from each request,
-	// which is correct whenever the path a client uses is the path this server sees.
+	// ResourceURL is the externally visible *base* identifier — scheme, host and path,
+	// no query — published as `resource` after syntax normalisation with the requesting
+	// client's query appended. Empty means derive the base from each request too, which
+	// is correct whenever the path a client uses is the path this server sees.
 	//
 	// It exists for the case where that is false — a reverse proxy that strips a
 	// path prefix — because the client compares `resource` against the identifier
@@ -84,8 +85,16 @@ func (c *ResourceMetadataConfig) Validate() error {
 		// ProtectedResourceURL to "prove the derivation runs": that function is
 		// built on this same rule and adds no rejection of its own, so the
 		// indirection would be a distinction no test could detect.
-		if _, err := authmeta.NormalizeResourceIdentifier(c.ResourceURL); err != nil {
+		normalized, err := authmeta.NormalizeResourceIdentifier(c.ResourceURL)
+		if err != nil {
 			return fmt.Errorf("--resource-url: %w", err)
+		}
+		// The flag declares the external *base*; the query belongs to each request.
+		// Accepting one here would make the published identifier depend on which of
+		// two sources won, and a client whose tunnel URL carries a different query
+		// would be refused by a value it had no way to predict.
+		if u, err := url.Parse(normalized); err == nil && (u.RawQuery != "" || u.ForceQuery) {
+			return fmt.Errorf("--resource-url must not carry a query (%q): it declares the externally visible base identifier, and the query is taken from each request", c.ResourceURL)
 		}
 	}
 	if c.ClientID != "" {
@@ -128,23 +137,12 @@ func (c *ResourceMetadataConfig) document(r *http.Request, trustForwardedProto b
 }
 
 // resourceIdentity returns what this server calls itself and where the document
-// describing it lives — as a pair, from one decision, because the two must agree.
+// describing it lives — as a pair, from one decision, because the two must agree. A
+// document saying one thing while the challenge points at the document for another
+// sends a client to a location it will then refuse.
 //
-// They did not. The document published ResourceURL verbatim while the challenge
-// used it only if the §3.1 derivation succeeded, falling back to the
-// request-derived URL otherwise. Validate() makes that unreachable for the server
-// binary, but NewHandler does not call Validate, so a caller constructing this
-// directly got a document saying one thing and a challenge pointing at the document
-// for another — and a client following the challenge would land on a document
-// describing a resource it is not using, and refuse it. Deriving both from one
-// branch removes the possibility rather than documenting it.
-//
-// The declared identifier is used only when a metadata location can actually be
-// derived from it. That is not defence in depth: it is what lets the two values
-// stay consistent when the config was never validated.
-//
-// Derived per request otherwise, using the same scheme/host helpers — and so the
-// same X-Forwarded-* trust rules — as the WebSocket origin check. The Host header is
+// The base uses the same scheme/host helpers — and so the same X-Forwarded-* trust
+// rules — as the WebSocket origin check. The Host header is
 // caller-controlled, so a caller can make the document name an origin of its
 // choosing, which is harmless because it affects only that caller's own response and
 // the client compares the result against the identifier it actually used.
@@ -158,31 +156,51 @@ func (c *ResourceMetadataConfig) document(r *http.Request, trustForwardedProto b
 // Echoing it is what lets such a client validate at all; it weakens nothing, since
 // the only value that can match is the one the client already had.
 func (c *ResourceMetadataConfig) resourceIdentity(r *http.Request, trustForwardedProto bool) (identifier, metadataURL string) {
-	if c.ResourceURL != "" {
-		// Published in normalised form, not verbatim. RFC 9728 §3.3 has the client
-		// compare `resource` against its own identifier for identity, and a client
-		// normalises what it derives from its tunnel URL, so publishing a
-		// differently-spelled authority — upper-case host, a redundant :443 — would
-		// fail that comparison for what is one resource. Normalisation is
-		// syntax-based, so the path this flag exists to declare is untouched.
-		if identifier, err := authmeta.NormalizeResourceIdentifier(c.ResourceURL); err == nil {
-			if derived, err := authmeta.ProtectedResourceURL(identifier); err == nil {
-				return identifier, derived
-			}
-		}
-	}
-	requested := url.URL{
+	// The base is what this resource is called: derived per request, or declared by
+	// ResourceURL when a proxy rewrites the path out from under the derivation.
+	base := url.URL{
 		Scheme: requestScheme(r, trustForwardedProto),
 		Host:   requestHost(r, trustForwardedProto),
 		Path:   tunnelResourcePath,
 	}
-	// Including a bare "?", which arrives in ForceQuery rather than RawQuery: the
-	// identifier published here is compared byte for byte against the URL the client
-	// dialled, and that dial does send the delimiter.
-	authmeta.CarryQuery(&requested, r.URL)
-	document := requested
-	document.Path = authmeta.ProtectedResourcePath + tunnelResourcePath
-	return requested.String(), document.String()
+	if c.ResourceURL != "" {
+		// Normalised, because a client normalises what it derives from its own
+		// tunnel URL and the §3.3 comparison is exact. Syntax-based only, so the
+		// path this flag exists to declare is untouched.
+		if declared, err := authmeta.NormalizeResourceIdentifier(c.ResourceURL); err == nil {
+			if parsed, err := url.Parse(declared); err == nil {
+				base = *parsed
+			}
+		}
+	}
+	// One place attaches the query, below both branches: *whether* to attach it must
+	// not depend on which branch produced the base. A query on ResourceURL is
+	// overwritten rather than merged — Validate refuses one, and this keeps an
+	// unvalidated config deterministic.
+	authmeta.CarryQuery(&base, r.URL)
+	// Normalised at the same single point, and for the same reason: a Host header's
+	// spelling — case, or a redundant default port — must not decide whether the exact
+	// §3.3 comparison succeeds, since the client normalises the identifier it compares.
+	// The derivation below normalises regardless, so without this the published
+	// `resource` and the location the challenge names disagree about one resource.
+	rawIdentifier := base.String()
+	identifier, err := authmeta.NormalizeResourceIdentifier(rawIdentifier)
+	if err != nil {
+		// A request whose effective host is missing or invalid, which includes a
+		// trusted X-Forwarded-Host this server cannot parse — not only an absent Host
+		// header. Publish what there is and omit the challenge parameter: there is no
+		// location to name.
+		return rawIdentifier, ""
+	}
+
+	// Via the same §3.1 rule the client uses, rather than reimplemented here. It
+	// re-normalises, so the only failures left are ones the check above already
+	// excluded.
+	derived, err := authmeta.ProtectedResourceURL(identifier)
+	if err != nil {
+		return identifier, ""
+	}
+	return identifier, derived
 }
 
 // challenge builds the RFC 6750 WWW-Authenticate value that points an

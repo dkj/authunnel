@@ -94,11 +94,12 @@ type serverConfig struct {
 	ClientDefaultScopes []string
 	ClientAudience      string
 	ClientResource      string
-	// ResourceURL is the externally visible identifier of this tunnel endpoint,
-	// published after syntax normalisation. Needed only where a reverse proxy rewrites
-	// the path, so the identifier a client uses is not the one this server would
-	// derive: the client's check on that value is by code-point equality, so a
-	// rewritten path has to be declared rather than tolerated.
+	// ResourceURL is the externally visible *base* identifier of this tunnel endpoint —
+	// no query, which comes from each request — published after syntax normalisation.
+	// Needed only where a reverse proxy rewrites the path, so the identifier a client
+	// uses is not the one this server would derive: the client's check on that value is
+	// by code-point equality, so a rewritten path has to be declared rather than
+	// tolerated.
 	ResourceURL string
 
 	ListenAddr string
@@ -209,11 +210,13 @@ Client configuration published to clients (RFC 9728 protected-resource metadata)
   supplies none of its own fails at startup. Each hint is optional and unset hints are
   simply absent from the document.
 
-  --resource-url <url>       Externally visible resource identifier of this tunnel endpoint, e.g.
-                             https://tunnel.example/protected/tunnel (env: RESOURCE_URL). Published
-                             verbatim; by default it is derived from each request, which is right
-                             unless a reverse proxy rewrites the path. Clients compare this value
-                             exactly against the URL they used, so a rewritten path must be declared.
+  --resource-url <url>       Externally visible base resource identifier of this tunnel endpoint, e.g.
+                             https://tunnel.example/protected/tunnel (env: RESOURCE_URL). Scheme, host
+                             and path only: the query comes from each request and is appended, so a
+                             value carrying one is refused at startup. Published after authority
+                             normalisation. By default the base is derived from each request too,
+                             which is right unless a reverse proxy rewrites the path. Clients compare
+                             the result by code-point equality, so a rewritten path must be declared.
   --client-id <id>           Public OIDC client ID clients should use (env: CLIENT_ID). This is the
                              client you registered at the IdP for authunnel; it is not a secret.
   --client-default-scopes <scopes>
@@ -666,7 +669,7 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		"Pinned JWKS endpoint; skips metadata discovery entirely, so the issuer-to-keys binding is asserted by you rather than verified. Mutually exclusive with --oidc-metadata-url (env: OIDC_JWKS_URI)")
 	fs.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "Audience required in validated access tokens")
 	fs.StringVar(&cfg.ResourceURL, "resource-url", cfg.ResourceURL,
-		"Externally visible resource identifier for this tunnel endpoint, published in the protected-resource document after authority normalisation; only needed behind a path-rewriting reverse proxy (env: RESOURCE_URL)")
+		"Externally visible base resource identifier for this tunnel endpoint — no query, which is taken from each request — published in the protected-resource document after authority normalisation; only needed behind a path-rewriting reverse proxy (env: RESOURCE_URL)")
 	fs.StringVar(&cfg.ClientID, "client-id", cfg.ClientID,
 		"Public OIDC client ID published to clients in the protected-resource metadata document (env: CLIENT_ID)")
 	fs.StringVar(&cfg.ClientAudience, "client-audience", cfg.ClientAudience,
