@@ -3,8 +3,10 @@ package authhttp
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // ErrUnsafeTransport marks a local refusal, rather than a failure to reach or
@@ -52,6 +54,98 @@ func RefuseTransportDowngrade(base *http.Client) *http.Client {
 	return &guarded
 }
 
+// SameOrigin reports whether two auth URLs share a scheme and authority, after the
+// syntax normalisation RFC 3986 §6.2.2 permits.
+//
+// Used where one configured value bounds another discovered one: a published metadata
+// URL may only relocate a pinned issuer's document within that issuer's own origin.
+func SameOrigin(a, b string) (bool, error) {
+	first, err := url.Parse(a)
+	if err != nil {
+		return false, fmt.Errorf("%q is not a valid URL: %w", a, err)
+	}
+	second, err := url.Parse(b)
+	if err != nil {
+		return false, fmt.Errorf("%q is not a valid URL: %w", b, err)
+	}
+	for _, u := range []*url.URL{first, second} {
+		if u.Scheme == "" || u.Host == "" {
+			return false, fmt.Errorf("%q is not an absolute URL with a host", u.String())
+		}
+	}
+	return originOf(first) == originOf(second), nil
+}
+
+func originOf(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	return scheme + "://" + NormalizeAuthority(scheme, u)
+}
+
+// NormalizeAuthority reduces a URL's authority to the form comparisons run on: host
+// case-folded, IP literal canonicalised, redundant default port dropped, IPv6
+// re-bracketed. Shared with internal/authmeta so resource identifiers and origins are
+// judged by one rule.
+func NormalizeAuthority(scheme string, u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	port := u.Port()
+	if (strings.EqualFold(scheme, "https") && port == "443") || (strings.EqualFold(scheme, "http") && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+// PinRedirectOrigin refuses a redirect that leaves the origin the request started on.
+//
+// Narrow by design. HTTPS-to-HTTPS delegation is permitted generally (see the
+// discovery simplification plan's non-goals), but that concerns where a *document*
+// may come from. This is applied to the two cases the reasoning does not reach:
+//
+//   - a metadata URL published by a tunnel server and adopted under a pinned
+//     --oidc-issuer, where the same-origin check on the published value is the whole
+//     of the pin and an open redirect on the issuer's host would defeat it;
+//   - the token requests, whose bodies carry a refresh token or an authorization
+//     code. A 307 preserves method and body, so without this the credential is
+//     posted to whatever origin the token endpoint's host names.
+//
+// Layers on any policy the caller already set, so the composed verdict is the
+// caller's AND ours.
+func PinRedirectOrigin(base *http.Client) *http.Client {
+	pinned := *base
+	inherited := base.CheckRedirect
+	pinned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// The inherited policy is consulted first so its verdict is the one reported:
+		// a redirect onto plaintext is both a downgrade and an origin change, and
+		// "downgrade" is the more specific fault to hand an operator.
+		if inherited != nil {
+			if err := inherited(req, via); err != nil {
+				return err
+			}
+		}
+		if len(via) == 0 {
+			return nil
+		}
+		same, err := SameOrigin(via[0].URL.String(), req.URL.String())
+		if err != nil {
+			return refusef("refusing redirect to %s: %v", req.URL.Redacted(), err)
+		}
+		if !same {
+			return refusef("refusing redirect from %s to %s: this request is pinned to the origin it started on",
+				originOf(via[0].URL), originOf(req.URL))
+		}
+		return nil
+	}
+	return &pinned
+}
+
 // CheckDiscoveredEndpoint validates an endpoint supplied by issuer metadata.
 // It must be an absolute http(s) URL with a host and must not downgrade from an
 // HTTPS metadata source. Keeping both rules in one call prevents a caller from
@@ -60,7 +154,7 @@ func CheckDiscoveredEndpoint(label, metadataSource, endpoint string) error {
 	if endpoint == "" {
 		return refusef("issuer metadata did not advertise %s", label)
 	}
-	resolved, err := parseAuthURL(label, endpoint)
+	resolved, err := ParseAuthURL(label, endpoint)
 	if err != nil {
 		return err
 	}
@@ -83,7 +177,7 @@ func CheckHTTPURL(label, rawURL string) error {
 	if rawURL == "" {
 		return refusef("%s is required", label)
 	}
-	_, err := parseAuthURL(label, rawURL)
+	_, err := ParseAuthURL(label, rawURL)
 	return err
 }
 
@@ -97,7 +191,7 @@ func CheckConfiguredURL(label, rawURL string, allowPlaintext bool) error {
 	if rawURL == "" {
 		return refusef("%s is required", label)
 	}
-	u, err := parseAuthURL(label, rawURL)
+	u, err := ParseAuthURL(label, rawURL)
 	if err != nil {
 		return err
 	}
@@ -107,9 +201,9 @@ func CheckConfiguredURL(label, rawURL string, allowPlaintext bool) error {
 	return nil
 }
 
-// parseAuthURL holds the shared definition of a usable auth URL: absolute
+// ParseAuthURL holds the shared definition of a usable auth URL: absolute
 // http(s), with a host and no opaque component.
-func parseAuthURL(label, rawURL string) (*url.URL, error) {
+func ParseAuthURL(label, rawURL string) (*url.URL, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, refusef("%s %q is not a valid URL: %v", label, rawURL, err)

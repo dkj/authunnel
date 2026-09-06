@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
+	"golang.org/x/oauth2"
 
 	"authunnel/internal/authhttp"
 )
@@ -60,6 +62,17 @@ func failingOpener(t *testing.T) browserOpener {
 	}
 }
 
+// resolveAndConfig mirrors the order AccessToken uses — resolve, then build the
+// config from what resolution produced — so these tests keep asserting on
+// discovery failures through a single call.
+func resolveAndConfig(t *testing.T, source *managedOIDCTokenSource, redirectURL string) (*oauth2.Config, error) {
+	t.Helper()
+	if err := source.resolve(context.Background()); err != nil {
+		return nil, err
+	}
+	return source.oauthConfig(redirectURL), nil
+}
+
 func newTestSource(t *testing.T, issuerURL string, client *http.Client, opener browserOpener) *managedOIDCTokenSource {
 	t.Helper()
 	return &managedOIDCTokenSource{
@@ -86,7 +99,7 @@ func TestDiscoveryRejectsPlaintextEndpoints(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			issuer, client := newMetadataIssuer(t, true, tt.auth, tt.token)
 			source := newTestSource(t, issuer.URL, client, failingOpener(t))
-			_, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+			_, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
 			if err == nil || !strings.Contains(err.Error(), "non-https "+tt.field) {
 				t.Fatalf("error = %v, want %s downgrade rejection", err, tt.field)
 			}
@@ -99,7 +112,7 @@ func TestDiscoveryAcceptsHTTPSEndpoints(t *testing.T) {
 	issuer, client := newMetadataIssuer(t, true, sameHost("/auth"), sameHost("/token"))
 
 	source := newTestSource(t, issuer.URL, client, failingOpener(t))
-	config, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	config, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
 	if err != nil {
 		t.Fatalf("https endpoints should be accepted: %v", err)
 	}
@@ -144,7 +157,7 @@ func TestDiscoveryRejectsNonHTTPEndpointsOverPlaintextMetadata(t *testing.T) {
 			issuer, client := newMetadataIssuer(t, false, tt.auth, tt.token)
 
 			source := newTestSource(t, issuer.URL, client, failingOpener(t))
-			_, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+			_, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
 			if err == nil {
 				t.Fatal("expected a non-http(s) endpoint to be rejected even over plaintext metadata")
 			}
@@ -343,13 +356,13 @@ func TestMetadataURLReachesNonDerivedPath(t *testing.T) {
 	issuer, metadataURL, client := newTenantIssuer(t, func(base string) string { return base + "/tenant1" })
 
 	source := newTestSource(t, issuer, client, failingOpener(t))
-	if _, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback"); err == nil {
+	if _, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback"); err == nil {
 		t.Fatal("expected discovery to fail when metadata is not at the derived path")
 	}
 
 	source = newTestSource(t, issuer, client, failingOpener(t))
 	source.metadataURL = metadataURL
-	config, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	config, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
 	if err != nil {
 		t.Fatalf("discovery with --oidc-metadata-url should succeed: %v", err)
 	}
@@ -409,7 +422,7 @@ func TestClientMetadataURLRejectsIssuerMismatch(t *testing.T) {
 
 	source := newTestSource(t, issuer, client, failingOpener(t))
 	source.metadataURL = metadataURL
-	_, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	_, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
 	if err == nil {
 		t.Fatal("expected a document advertising a different issuer to be rejected")
 	}
@@ -438,7 +451,7 @@ func TestDowngradeIsJudgedAgainstMetadataURLNotIssuer(t *testing.T) {
 
 	source := newTestSource(t, plain.URL, server.Client(), failingOpener(t))
 	source.metadataURL = httpsBase + "/meta"
-	_, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	_, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
 	if err == nil {
 		t.Fatal("expected https-fetched metadata advertising plaintext endpoints to be refused")
 	}
@@ -452,11 +465,70 @@ func TestPlaintextIssuerWithPlaintextEndpointsStillWorks(t *testing.T) {
 	issuer, client := newMetadataIssuer(t, false, sameHost("/auth"), sameHost("/token"))
 
 	source := newTestSource(t, issuer.URL, client, failingOpener(t))
-	config, err := source.oauthConfig(context.Background(), "http://127.0.0.1:0/callback")
+	config, err := resolveAndConfig(t, source, "http://127.0.0.1:0/callback")
 	if err != nil {
 		t.Fatalf("plaintext development issuer should still work: %v", err)
 	}
 	if config.Endpoint.AuthURL != issuer.URL+"/auth" {
 		t.Fatalf("auth URL = %q, want the discovered endpoint", config.Endpoint.AuthURL)
+	}
+}
+
+// newSecureTokenMirror is the same working token endpoint as
+// newPlaintextTokenMirror but served over https on its own origin, for the case
+// where nothing is downgraded and only the origin changes.
+func newSecureTokenMirror(t *testing.T) (*plaintextTokenMirror, *x509.CertPool) {
+	t.Helper()
+	mirror := &plaintextTokenMirror{}
+	server := newIPv4TLSTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mirror.mu.Lock()
+		mirror.requests++
+		mirror.bodies = append(mirror.bodies, string(body))
+		mirror.mu.Unlock()
+
+		writeJSONForTest(t, w, map[string]any{
+			"access_token":  "token-from-the-other-origin",
+			"token_type":    "Bearer",
+			"refresh_token": "refresh-from-the-other-origin",
+			"expires_in":    3600,
+		})
+	}))
+	mirror.URL = server.URL + "/token"
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	return mirror, pool
+}
+
+// TestTokenEndpointCrossOriginRedirectIsRefused covers the gap the downgrade rule
+// leaves on the credential path: https to https, so nothing is downgraded, but to
+// a different origin. A 307 preserves method and body, so unguarded this posts the
+// refresh token to that other host.
+//
+// The mirror is a *working* https token endpoint, which is what makes the assertion
+// meaningful: the refusal has to be attributable to the redirect policy rather than
+// to the target being unusable, and the recorded bodies prove the credential never
+// left.
+func TestTokenEndpointCrossOriginRedirectIsRefused(t *testing.T) {
+	mirror, mirrorPool := newSecureTokenMirror(t)
+	issuerURL, client := newRedirectingTokenIssuer(t, mirror.URL, http.StatusTemporaryRedirect)
+	// Trust the mirror's certificate too, so a refusal cannot be a TLS failure in
+	// disguise.
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("fixture client should carry an *http.Transport")
+	}
+	transport.TLSClientConfig.RootCAs = mirrorPool
+
+	source := newRefreshableSource(t, issuerURL, client)
+	_, err := source.AccessToken(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected a cross-origin token-endpoint redirect to be refused")
+	}
+	if !errors.Is(err, authhttp.ErrUnsafeTransport) {
+		t.Fatalf("error = %v, want a refusal", err)
+	}
+	if requests, bodies := mirror.received(); requests != 0 {
+		t.Fatalf("the other origin received %d request(s) with bodies %q; the refresh token must not have been forwarded", requests, bodies)
 	}
 }

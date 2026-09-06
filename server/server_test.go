@@ -358,8 +358,8 @@ func TestCheckTokenDoesNotLeakValidationErrors(t *testing.T) {
 	if ok {
 		t.Fatalf("expected token check to fail for invalid token")
 	}
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, rr.Code)
 	}
 	if strings.Contains(rr.Body.String(), "kid=abc123") || strings.Contains(rr.Body.String(), "signature mismatch") {
 		t.Fatalf("expected response body to avoid leaking verifier internals, got %q", rr.Body.String())
@@ -534,10 +534,10 @@ func TestProtectedSocksAllowsSameHostOriginToReachAuth(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "forbidden") {
+	if !strings.Contains(rr.Body.String(), "invalid token") {
 		t.Fatalf("expected request to pass admission checks and fail in token validation, got %q", rr.Body.String())
 	}
 }
@@ -559,10 +559,10 @@ func TestProtectedSocksAllowsOriginWithImplicitDefaultHTTPSPort(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected status %d, got %d", http.StatusForbidden, rr.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "forbidden") {
+	if !strings.Contains(rr.Body.String(), "invalid token") {
 		t.Fatalf("expected request to pass admission checks and fail in token validation, got %q", rr.Body.String())
 	}
 }

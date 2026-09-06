@@ -38,17 +38,52 @@ func TestParseClientConfigDefaultsMetadataURLEmpty(t *testing.T) {
 	}
 }
 
-// The metadata override changes lookup location, not the expected issuer.
-func TestParseClientConfigMetadataURLRequiresIssuer(t *testing.T) {
-	_, err := parseClientConfig(
+// The override can now stand in for the issuer: the document declares one, and
+// with nothing to compare it against it is adopted. That is the consistency check
+// being traded away deliberately — see the metadataURL field comment in auth.go.
+func TestParseClientConfigMetadataURLWithoutIssuer(t *testing.T) {
+	cfg, err := parseClientConfig(
 		[]string{
 			"--tunnel-url", "https://tunnel.example/protected/tunnel",
+			"--oidc-client-id", "authunnel-cli",
 			"--oidc-metadata-url", "https://as.example/meta",
 		},
 		func(string) string { return "" },
 	)
-	if err == nil || !strings.Contains(err.Error(), "--oidc-issuer") {
-		t.Fatalf("expected --oidc-metadata-url without an issuer to be rejected, got: %v", err)
+	if err != nil {
+		t.Fatalf("--oidc-metadata-url should stand alone, got: %v", err)
+	}
+	if cfg.OIDCIssuer != "" {
+		t.Fatalf("OIDCIssuer = %q, want it left empty for resolution to fill", cfg.OIDCIssuer)
+	}
+	if cfg.AuthMode != authModeOIDC {
+		t.Fatalf("AuthMode = %q, want managed OIDC", cfg.AuthMode)
+	}
+}
+
+// TestParseClientConfigFallsBackToDiscovery covers the other half of dropping the
+// requirements: a configuration missing an essential value is not rejected, it is
+// completed from the tunnel server. Each case asserts on ResourceURL, since that
+// field being set is what turns the fetch on.
+func TestParseClientConfigFallsBackToDiscovery(t *testing.T) {
+	for name, args := range map[string][]string{
+		"client ID only": {"--oidc-client-id", "authunnel-cli"},
+		"issuer only":    {"--oidc-issuer", "https://issuer.example"},
+		"metadata only":  {"--oidc-metadata-url", "https://as.example/meta"},
+		"nothing":        {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := parseClientConfig(
+				append([]string{"--tunnel-url", "https://tunnel.example/protected/tunnel"}, args...),
+				func(string) string { return "" },
+			)
+			if err != nil {
+				t.Fatalf("parseClientConfig: %v", err)
+			}
+			if cfg.ResourceURL != "https://tunnel.example/protected/tunnel" {
+				t.Fatalf("ResourceURL = %q, want the tunnel endpoint's resource identifier", cfg.ResourceURL)
+			}
+		})
 	}
 }
 
@@ -135,5 +170,70 @@ func TestParseClientConfigRejectsMalformedMetadataURL(t *testing.T) {
 		); err == nil {
 			t.Fatalf("--oidc-metadata-url %q: expected rejection, got nil", value)
 		}
+	}
+}
+
+// TestParseClientConfigNoResourceMetadataRequiresCompleteConfig pins the earlier
+// failure the flag buys. Without it these configurations are valid and complete
+// themselves from the server; with it they cannot, and that is decidable here
+// rather than at first use inside ssh's stderr.
+func TestParseClientConfigNoResourceMetadataRequiresCompleteConfig(t *testing.T) {
+	for name, args := range map[string][]string{
+		"nothing":        {},
+		"client ID only": {"--oidc-client-id", "authunnel-cli"},
+		"issuer only":    {"--oidc-issuer", "https://issuer.example"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := []string{"--tunnel-url", "https://tunnel.example/protected/tunnel", "--no-resource-metadata"}
+			_, err := parseClientConfig(append(base, args...), func(string) string { return "" })
+			if err == nil {
+				t.Fatalf("expected %s with --no-resource-metadata to be rejected at parse time", name)
+			}
+			if !strings.Contains(err.Error(), "--no-resource-metadata") {
+				t.Fatalf("error should name the flag that makes this incomplete, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseClientConfigNoResourceMetadataAcceptsCompleteConfig(t *testing.T) {
+	for name, args := range map[string][]string{
+		"issuer and client ID":       {"--oidc-issuer", "https://issuer.example", "--oidc-client-id", "authunnel-cli"},
+		"metadata URL and client ID": {"--oidc-metadata-url", "https://as.example/meta", "--oidc-client-id", "authunnel-cli"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := []string{"--tunnel-url", "https://tunnel.example/protected/tunnel", "--no-resource-metadata"}
+			cfg, err := parseClientConfig(append(base, args...), func(string) string { return "" })
+			if err != nil {
+				t.Fatalf("parseClientConfig: %v", err)
+			}
+			if cfg.ResourceURL != "" {
+				t.Fatalf("ResourceURL = %q, want no lookup target at all", cfg.ResourceURL)
+			}
+			// The scopes default belongs at parse time here: nothing will be
+			// discovered, so leaving it empty would only defer the same value.
+			if cfg.OIDCScopes != normalizeScopes(defaultOIDCScopes) {
+				t.Fatalf("OIDCScopes = %q, want the default applied at parse time", cfg.OIDCScopes)
+			}
+		})
+	}
+}
+
+// TestParseClientConfigRejectsNoResourceMetadataWithAccessToken keeps the flag
+// from being a silent no-op: manual mode never looks anything up, so a flag
+// refusing that lookup cannot take effect, and the server applies the same rule
+// to a hint it would never publish.
+func TestParseClientConfigRejectsNoResourceMetadataWithAccessToken(t *testing.T) {
+	_, err := parseClientConfig(
+		[]string{"--tunnel-url", "https://tunnel.example/protected/tunnel", "--no-resource-metadata"},
+		func(key string) string {
+			if key == "ACCESS_TOKEN" {
+				return "static-token"
+			}
+			return ""
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "ACCESS_TOKEN cannot be combined") {
+		t.Fatalf("expected the combination to be rejected, got: %v", err)
 	}
 }

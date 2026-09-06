@@ -320,11 +320,32 @@ bearer token, as does the auto-routed `HEAD` on the smoke-test paths
 (`/protected` and `/protected/`). `HEAD /protected/tunnel` is rejected with
 `405` before auth (HEAD has no meaning on a websocket endpoint), and other
 methods receive `405` from the router before the auth handler runs. `/` is
-unauthenticated.
+unauthenticated, and so is
+`/.well-known/oauth-protected-resource` (plus the same path with the resource path
+appended) unless the server runs with `--no-resource-metadata`. A `401` on the
+protected routes carries `WWW-Authenticate: Bearer resource_metadata="…"` when the
+document is published, which is a quick way to see what a client would discover:
+
+```bash
+curl -si https://localhost:8443/protected --cacert dev-ca.pem | grep -i www-authenticate
+curl -s https://localhost:8443/.well-known/oauth-protected-resource --cacert dev-ca.pem | jq
+# `resource` must equal the --tunnel-url a client uses, exactly; behind a
+# path-rewriting proxy declare it with the server's --resource-url.
+```
 
 ### Managed OIDC client notes
 
-Managed login now has two extra knobs that matter for some IdPs:
+The client flags below are all optional. Anything not passed is read from the
+tunnel server's protected-resource metadata, so `--tunnel-url` alone is a working
+configuration when the server publishes the hints (`--client-id`,
+`--client-default-scopes`, `--client-audience`, `--client-resource`,
+`--client-oidc-metadata-url`). Passing a value
+overrides what the server publishes. The examples above keep `--oidc-issuer` and
+`--oidc-client-id` explicit because they predate publication and still work; adding
+`--no-resource-metadata` to them turns "the client happens not to need the lookup"
+into "the client refuses it", and makes an incomplete config fail at startup.
+
+Managed login has two extra knobs that matter for some IdPs:
 
 - `--oidc-audience` requests a specific API/resource audience during the
   authorization flow.
