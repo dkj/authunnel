@@ -31,7 +31,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 
 ## Documentation
 
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist. Also two things that span both binaries: the [transport rules on the auth path](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path), and [protected-resource metadata](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients), which is how a client can be configured with nothing but `--tunnel-url`.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — running the server: TLS modes, reverse-proxy configuration, the full server flag reference, egress policy, OIDC client registration, and the deployment hardening checklist. Also two things that span both binaries: the [transport rules on the auth path](docs/DEPLOYMENT.md#transport-rules-on-the-auth-path), and [protected-resource metadata](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients), which is how a server can let a client be configured with nothing but `--tunnel-url`.
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building and testing from source: codebase layout, auth-flow invariants, the test suite, and the local Keycloak environment.
 - [examples/](examples/) — runnable CloudFormation templates that stand up a complete Authunnel topology on AWS, so you can see it working end to end before deploying on your own infrastructure.
 
@@ -73,7 +73,7 @@ These compose naturally with Authunnel: OIDC governs the tunnel (network admissi
 1. Either:
    - uses a bearer token supplied via the `ACCESS_TOKEN` environment variable, or
    - runs managed OIDC mode, which is the default whenever `ACCESS_TOKEN` is unset.
-2. In managed mode, missing OIDC values are read from the tunnel server's RFC 9728 protected-resource metadata, so `--tunnel-url` on its own is a complete configuration. The lookup runs only when an *essential* value is absent — the client ID, or both the issuer and metadata URL — and never on a cache hit, so a client that supplies those makes no extra request and adopts no published hints either. A value you pass always wins over the published one. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients).
+2. In managed mode, missing OIDC values are read from the tunnel server's RFC 9728 protected-resource metadata, so `--tunnel-url` on its own is a complete configuration provided the server publishes a client ID. The lookup runs only when an *essential* value is absent — the client ID, or both the issuer and metadata URL — and never on a cache hit, so a client that supplies those makes no extra request and adopts no published hints either. A value you pass always wins over the published one. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#protected-resource-metadata-and-zero-configuration-clients).
 3. In managed mode the client:
    - reuses a cached token when it remains valid for more than 60 seconds,
    - otherwise refreshes it when a refresh token is available,
@@ -103,8 +103,9 @@ The following properties are enforced by default with no silent bypass. Where a 
 ### A trade to understand: where the client's OIDC configuration comes from
 
 By default a client takes the authorization server's identity from the tunnel server
-it is connecting to. That is what makes `--tunnel-url` a complete configuration, and
-it is a real change in what the tunnel URL controls:
+it is connecting to. That is what lets `--tunnel-url` be a complete configuration when
+the server publishes a client ID, and it is a real change in what the tunnel URL
+controls:
 
 - **What it removes.** Every value an operator would otherwise transcribe into an
   `ssh_config` line per user, per host block — and with it the class of failure where

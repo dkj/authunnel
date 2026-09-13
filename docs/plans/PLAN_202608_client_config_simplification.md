@@ -865,3 +865,43 @@ resource_metadata false positive the original comment existed to prevent. Recogn
 challenge properly needs a quote-aware challenge-list parser; that is more machinery than an optional
 optimisation earns, so the limitation is documented at `invalidTokenChallenge` instead. Missing one
 costs no more than not having the feature.
+
+### Round eighteen: internationalised hostnames refused, and why converting them is not a fix
+
+`url.URL.String` renders a Unicode host percent-escaped while the network sees its IDNA form, so a
+client using `https://bücher.example/…` derived `https://b%C3%BCcher.example/…` while its server
+derived `https://xn--bcher-kva.example/…` from the request. Under §3.3's exact comparison the client
+refuses its own document: not a degraded login, an impossible one. `NormalizeResourceIdentifier`
+refuses a non-ASCII hostname and the error names the IDNA form to use instead.
+
+Converting in `NormalizeAuthority` with `golang.org/x/net/idna` was tried and reverted, which is
+worth recording because the reason is not visible from the API. **net/http applies two different
+IDNA profiles to the same URL**: `idna.Lookup` in `canonicalAddr`, which keys the connection pool
+and picks the DNS and TLS target, and the unmapped `idna.Punycode` in `httpguts.PunycodeHostPort`,
+which writes the `Host` header. Measured on x/net v0.56.0 — all of these dial
+`xn--bcher-kva.example`:
+
+| spelling | transformation | `Host` header |
+| --- | --- | --- |
+| `bücher.example` | — | `xn--bcher-kva.example` ✓ |
+| `BÜCHER.example` | case folding | `xn--BCHER-2pa.example` |
+| `ｂücher.example` | width mapping | `xn--cher-zra77610b.example` |
+| `bücher.example` in NFD | composition | `xn--bucher-xyd.example` |
+
+Three consequences, each of which cost a round to learn:
+
+- Following the `Host` header is wrong, because the metadata URL derived from an identifier is
+  itself fetched: a resource would name one host and describe itself from another. An identifier
+  must follow the destination.
+- Following the destination leaves the `Host` header disagreeing, which surfaces as a §3.3 mismatch
+  against a host that was never contacted.
+- Refusing the spellings where they disagree cannot be done by inspecting the spelling. A lower-case
+  test was staged and is insufficient — case folding is one of at least three transformations, and
+  the list is not enumerable by reading the code.
+
+Comparing the two profiles' actual output and accepting only where they agree would be sound, and is
+the shape to reach for if this is ever revisited. It was rejected on two grounds: it makes a
+published protocol identifier depend on the quirks of one HTTP client, when the document is fetched
+by others too; and it cost ~240 lines against a repository whose goal is auditability, for hosts that
+production DNS already holds as A-labels. The refusal is eight lines and the workaround is one
+keystroke.

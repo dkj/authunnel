@@ -266,8 +266,14 @@ redundant default ports, never the path or query. Two consequences for deploymen
   host case and a redundant default port are folded so the value matches what a client derives from
   its own tunnel URL. It declares the *base*: no query, since the query is taken from each request
   and appended, so a value carrying one is refused at startup. It must be an `http`/`https` URL with a host and
-  no fragment — a client derives the metadata location from it and fetches that over HTTP — and a
-  value that fails those rules is refused at startup rather than published. Proxies that forward the
+  no fragment. An internationalised hostname must be written in its IDNA
+  form — `xn--bcher-kva.example` rather than `bücher.example` — and a Unicode spelling is refused at
+  startup. A Unicode host has no single form on the wire: Go picks the host it connects to and the
+  name it puts in the `Host` header by two different IDNA rules, which disagree for upper-case,
+  fullwidth and decomposed spellings alike, so an identifier derived from one of them would not
+  match. The `xn--` form is ASCII, is what DNS holds, and is unambiguous. A client derives the metadata location from this value and
+  fetches it over HTTP, and a value that fails those rules is refused at startup rather than
+  published. Proxies that forward the
   path unchanged — the common case — need nothing.
 - **Escaped path segments are preserved, not decoded.** `/tenant%2Fone/tunnel` and
   `/tenant/one/tunnel` are two identifiers, so a proxy that routes on an encoded segment gets two

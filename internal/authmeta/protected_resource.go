@@ -268,14 +268,34 @@ func NormalizeResourceIdentifier(rawURL string) (string, error) {
 		return "", fmt.Errorf("resource identifier %q must not contain a fragment", rawURL)
 	}
 	scheme := strings.ToLower(u.Scheme)
+	authority := authhttp.NormalizeAuthority(scheme, u)
+	// Non-ASCII hostnames are refused rather than converted. Go does not put a Unicode
+	// host on the wire consistently: it picks the host it connects to and the name it
+	// writes in the Host header by two different IDNA profiles, which disagree for
+	// several classes of spelling. An identifier derived from either would fail to match
+	// the other, and §3.3's exact comparison admits no near miss. The A-label is ASCII,
+	// unambiguous, and what DNS holds. The plan's round eighteen has the measurements.
+	if !isASCII(u.Hostname()) {
+		return "", fmt.Errorf("resource identifier %q has a non-ASCII hostname: use its IDNA form instead (for example xn--bcher-kva.example rather than bücher.example), which is unambiguous on the wire", rawURL)
+	}
 	// Re-parsed from the escaped path so an encoded separator survives: assigning
 	// Path would re-encode from the decoded form and lose it.
-	normalized, err := url.Parse(scheme + "://" + authhttp.NormalizeAuthority(scheme, u) + u.EscapedPath())
+	normalized, err := url.Parse(scheme + "://" + authority + u.EscapedPath())
 	if err != nil {
 		return "", fmt.Errorf("resource identifier %q could not be normalised: %w", rawURL, err)
 	}
 	CarryQuery(normalized, u)
 	return normalized.String(), nil
+}
+
+// isASCII reports whether s is entirely ASCII.
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
 }
 
 // maxHintBytes and maxScopeBytes bound values that arrive in a metadata document
@@ -291,7 +311,8 @@ const (
 )
 
 // ValidateClientID applies RFC 6749 appendix A's *VSCHAR to a client identifier:
-// printable ASCII, no controls, no whitespace, non-empty and bounded.
+// printable ASCII, non-empty and bounded. *VSCHAR is %x20-7E, so a space is legal and
+// only controls are excluded; a provider is free to issue one.
 //
 // Shared by the server, which validates the hint it is configured to publish, and
 // the client, which validates the hint it receives. The server check produces the

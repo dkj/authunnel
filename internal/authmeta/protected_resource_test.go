@@ -202,6 +202,52 @@ func TestFetchProtectedResourceRejectsDifferentPath(t *testing.T) {
 	}
 }
 
+// TestNonASCIIHostnamesAreRefused pins the refusal and, more usefully, the way out.
+//
+// net/http applies one IDNA profile to choose the host it dials and another to write the
+// Host header, so a Unicode spelling has no single wire form. The three bücher.example
+// variants below each dial xn--bcher-kva.example while announcing a different name, by
+// three different transformations. Under §3.3's exact comparison an identifier matching
+// either profile is wrong for some of them, and wrong as a login that cannot complete
+// rather than as a degraded one. See NormalizeResourceIdentifier.
+func TestNonASCIIHostnamesAreRefused(t *testing.T) {
+	for _, resource := range []string{
+		"https://b\u00fccher.example/protected/tunnel",
+		// Upper case, fullwidth and decomposed: three transformations the two profiles
+		// handle differently, none of which a check on the spelling could enumerate.
+		"https://B\u00dcCHER.example/protected/tunnel",
+		"https://\uff42\u00fccher.example/protected/tunnel",
+		"https://bu\u0308cher.example/protected/tunnel",
+		"https://\u4f8b\u3048.\u30c6\u30b9\u30c8/protected/tunnel",
+	} {
+		_, err := NormalizeResourceIdentifier(resource)
+		if err == nil {
+			t.Fatalf("NormalizeResourceIdentifier(%q): expected a refusal", resource)
+		}
+		if !strings.Contains(err.Error(), "IDNA") {
+			t.Fatalf("error should name the way out, got: %v", err)
+		}
+	}
+
+	// The way out: the IDNA spelling is ordinary ASCII, so neither profile transforms it
+	// and every client sends it unchanged.
+	const punycode = "https://xn--bcher-kva.example/protected/tunnel"
+	got, err := NormalizeResourceIdentifier(punycode)
+	if err != nil {
+		t.Fatalf("the punycode form must be usable: %v", err)
+	}
+	if got != punycode {
+		t.Fatalf("NormalizeResourceIdentifier(%q) = %q, want it unchanged", punycode, got)
+	}
+
+	// An underscore is not a valid IDNA label character, but such names exist on internal
+	// networks and are ASCII, so nothing here may disturb them.
+	const underscore = "https://my_host.internal/protected/tunnel"
+	if got, err := NormalizeResourceIdentifier(underscore); err != nil || got != underscore {
+		t.Fatalf("NormalizeResourceIdentifier(%q) = %q, %v; want it unchanged", underscore, got, err)
+	}
+}
+
 // TestFetchProtectedResourceComparesByCodePoint pins §3.3's "identical": the declared
 // value is compared verbatim, with no normalisation of the remote string.
 //
