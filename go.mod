@@ -7,7 +7,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/zitadel/oidc/v3 v3.49.4
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.15.0
