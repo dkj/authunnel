@@ -1,4 +1,4 @@
-package tunnelserver
+package ipblock
 
 import (
 	"net"
@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestParseIPBlock(t *testing.T) {
+func TestParse(t *testing.T) {
 	cases := []struct {
 		input    string
 		wantCIDR string
@@ -23,24 +23,24 @@ func TestParseIPBlock(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
-			got, err := ParseIPBlock(tc.input)
+			got, err := Parse(tc.input)
 			if err != nil {
-				t.Fatalf("ParseIPBlock(%q) unexpected error: %v", tc.input, err)
+				t.Fatalf("Parse(%q) unexpected error: %v", tc.input, err)
 			}
 			if got.cidr == nil {
-				t.Fatalf("ParseIPBlock(%q) returned nil cidr", tc.input)
+				t.Fatalf("Parse(%q) returned nil cidr", tc.input)
 			}
 			if s := got.cidr.String(); s != tc.wantCIDR {
-				t.Errorf("ParseIPBlock(%q) cidr = %q, want %q", tc.input, s, tc.wantCIDR)
+				t.Errorf("Parse(%q) cidr = %q, want %q", tc.input, s, tc.wantCIDR)
 			}
 			if got.label != tc.wantCIDR {
-				t.Errorf("ParseIPBlock(%q) label = %q, want %q (operator-supplied entries label themselves with the CIDR string)", tc.input, got.label, tc.wantCIDR)
+				t.Errorf("Parse(%q) label = %q, want %q (operator-supplied entries label themselves with the CIDR string)", tc.input, got.label, tc.wantCIDR)
 			}
 		})
 	}
 }
 
-func TestParseIPBlockInvalid(t *testing.T) {
+func TestParseInvalid(t *testing.T) {
 	cases := []string{
 		"",               // empty
 		"   ",            // whitespace
@@ -56,7 +56,7 @@ func TestParseIPBlockInvalid(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc, func(t *testing.T) {
-			_, err := ParseIPBlock(tc)
+			_, err := Parse(tc)
 			if err == nil {
 				t.Errorf("expected error for %q, got nil", tc)
 			}
@@ -64,9 +64,9 @@ func TestParseIPBlockInvalid(t *testing.T) {
 	}
 }
 
-func TestParseIPBlocklistFromCSV(t *testing.T) {
+func TestParseListFromCSV(t *testing.T) {
 	t.Run("empty string", func(t *testing.T) {
-		bl, err := ParseIPBlocklistFromCSV("")
+		bl, err := ParseListFromCSV("")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -76,7 +76,7 @@ func TestParseIPBlocklistFromCSV(t *testing.T) {
 	})
 
 	t.Run("whitespace only", func(t *testing.T) {
-		bl, err := ParseIPBlocklistFromCSV("   ,   ")
+		bl, err := ParseListFromCSV("   ,   ")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -86,7 +86,7 @@ func TestParseIPBlocklistFromCSV(t *testing.T) {
 	})
 
 	t.Run("multiple entries", func(t *testing.T) {
-		bl, err := ParseIPBlocklistFromCSV("127.0.0.0/8, 169.254.169.254, [::1]")
+		bl, err := ParseListFromCSV("127.0.0.0/8, 169.254.169.254, [::1]")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -96,15 +96,15 @@ func TestParseIPBlocklistFromCSV(t *testing.T) {
 	})
 
 	t.Run("invalid entry returns error", func(t *testing.T) {
-		_, err := ParseIPBlocklistFromCSV("127.0.0.0/8,not-an-ip,169.254.169.254")
+		_, err := ParseListFromCSV("127.0.0.0/8,not-an-ip,169.254.169.254")
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
 	})
 }
 
-func TestIPBlocklistBlocks(t *testing.T) {
-	def := DefaultIPBlocklist()
+func TestListBlocks(t *testing.T) {
+	def := Default()
 
 	cases := []struct {
 		name      string
@@ -143,22 +143,22 @@ func TestIPBlocklistBlocks(t *testing.T) {
 	}
 }
 
-func TestIPBlocklistEmptyDoesNotBlock(t *testing.T) {
-	var bl IPBlocklist
+func TestListEmptyDoesNotBlock(t *testing.T) {
+	var bl List
 	if blocked, _ := bl.Blocks(net.ParseIP("127.0.0.1")); blocked {
 		t.Fatal("empty blocklist must not block any address (matches --no-ip-block posture)")
 	}
 }
 
-func TestIPBlocklistOperatorSuppliedEntryUsesCIDRLabel(t *testing.T) {
+func TestListOperatorSuppliedEntryUsesCIDRLabel(t *testing.T) {
 	// An operator who passes --ip-block 10.0.0.0/8 expects the deny log to
 	// identify the matching range without forcing them to invent a category
 	// name. Verify the label is the CIDR string itself.
-	r, err := ParseIPBlock("10.0.0.0/8")
+	r, err := Parse("10.0.0.0/8")
 	if err != nil {
-		t.Fatalf("ParseIPBlock: %v", err)
+		t.Fatalf("Parse: %v", err)
 	}
-	bl := IPBlocklist{r}
+	bl := List{r}
 	blocked, label := bl.Blocks(net.ParseIP("10.5.5.5"))
 	if !blocked {
 		t.Fatal("expected operator-supplied range to block matching IP")
@@ -168,10 +168,10 @@ func TestIPBlocklistOperatorSuppliedEntryUsesCIDRLabel(t *testing.T) {
 	}
 }
 
-func TestDefaultIPBlocklistLabels(t *testing.T) {
+func TestDefaultLabels(t *testing.T) {
 	// Stable label set: alerting and dashboards key off these strings, so
 	// removals/renames must be deliberate. This test catches accidental drift.
-	def := DefaultIPBlocklist()
+	def := Default()
 	gotLabels := make(map[string]struct{}, len(def))
 	for _, r := range def {
 		gotLabels[r.label] = struct{}{}

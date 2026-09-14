@@ -114,8 +114,8 @@ func TestCheckTokenLogsAuthFailureWithRequestID(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("unexpected status: got %d want %d", rr.Code, http.StatusForbidden)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: got %d want %d", rr.Code, http.StatusUnauthorized)
 	}
 
 	requestID := rr.Header().Get(requestIDHeader)

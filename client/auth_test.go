@@ -1101,3 +1101,29 @@ func TestParseClientConfigRejectsAccessTokenFlag(t *testing.T) {
 		t.Fatalf("error %q does not mention the removed flag", err.Error())
 	}
 }
+
+// readTokenCacheForTest reads the cache back so a test can assert on what was
+// written, not only on what was returned.
+func readTokenCacheForTest(t *testing.T, path string) tokenCache {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read token cache: %v", err)
+	}
+	cache := tokenCache{}
+	if err := json.Unmarshal(data, &cache); err != nil {
+		t.Fatalf("parse token cache: %v", err)
+	}
+	return cache
+}
+
+// readBodyForTest reads a bounded request body for fixtures that record what an
+// endpoint received.
+func readBodyForTest(t *testing.T, r *http.Request) string {
+	t.Helper()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8*1024))
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	return string(body)
+}

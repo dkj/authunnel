@@ -53,18 +53,56 @@ const httpServerMaxHeaderBytes = 16 * 1024
 
 type serverConfig struct {
 	Issuer string
-	// OIDCMetadataURL overrides the well-known path derived from Issuer.
-	// Mutually exclusive with OIDCJWKSURI. Changes where metadata is fetched
-	// from. The document's issuer is compared against Issuer, but that field
-	// is self-asserted, so the comparison catches an honest wrong URL rather
-	// than a hostile one — this value needs the same trust as Issuer.
+	// OIDCMetadataURL overrides the well-known path derived from Issuer, for
+	// *this process's* own JWT validation. Mutually exclusive with OIDCJWKSURI.
+	// The document's issuer is compared against Issuer, but that field is
+	// self-asserted, so the comparison catches an honest wrong URL rather than a
+	// hostile one — this value needs the same trust as Issuer.
 	OIDCMetadataURL string
+	// ClientOIDCMetadataURL is the location published to *clients*, defaulting to
+	// OIDCMetadataURL when unset. This process never fetches it.
+	//
+	// Separate from OIDCMetadataURL because the two answer different questions with
+	// different egress requirements: where this process finds keys, and where clients
+	// find metadata. Under OIDCJWKSURI this server reads no metadata document at all —
+	// an egress policy may deny it the discovery host — while clients still need one,
+	// and cannot derive it when the authorization server publishes RFC 8414 metadata
+	// at a path the OIDC derivation cannot construct.
+	ClientOIDCMetadataURL string
 	// OIDCJWKSURI restricts auth egress to a configured key endpoint by
-	// skipping metadata discovery. Mutually exclusive with OIDCMetadataURL.
+	// skipping metadata discovery. Mutually exclusive with OIDCMetadataURL —
+	// but not with ClientOIDCMetadataURL, which this process never fetches.
 	// Issuer remains required and is enforced as the `iss` claim.
 	OIDCJWKSURI   string
 	TokenAudience string
-	ListenAddr    string
+
+	// NoResourceMetadata switches off the RFC 9728 protected-resource document and
+	// the resource_metadata parameter that points at it — not the WWW-Authenticate
+	// challenge, which every 401 must carry. Publishing is the
+	// default because a feature clients must opt into on both ends removes no
+	// configuration from anyone; the switch exists because publishing *is* a
+	// change in what an unauthenticated caller learns — the issuer URL, and any
+	// client hints — even though any client holding a token already knows the
+	// issuer, and a public client ID is not a credential.
+	NoResourceMetadata bool
+	// ClientID, ClientDefaultScopes, ClientAudience and ClientResource are hints
+	// published in that document, each standing in for exactly one client flag
+	// so a client can run with --tunnel-url alone. All optional; a hint that is
+	// not set is not published, and the client falls back to its own default or
+	// its own flag.
+	ClientID            string
+	ClientDefaultScopes []string
+	ClientAudience      string
+	ClientResource      string
+	// ResourceURL is the externally visible *base* identifier of this tunnel endpoint —
+	// no query, which comes from each request — published after syntax normalisation.
+	// Needed only where a reverse proxy rewrites the path, so the identifier a client
+	// uses is not the one this server would derive: the client's check on that value is
+	// by code-point equality, so a rewritten path has to be declared rather than
+	// tolerated.
+	ResourceURL string
+
+	ListenAddr string
 	// TLS files mode
 	TLSCertPath string
 	TLSKeyPath  string
@@ -130,11 +168,13 @@ Flags and their environment variable equivalents:
                              overrides below change where the key set is found — which fixes the
                              issuer name accepted, but not which keys may sign for it, so treat
                              them as trusted configuration.
-  --oidc-metadata-url <url>  Authorization server metadata document URL, overriding the well-known
-                             path derived from --oidc-issuer (env: OIDC_METADATA_URL). For an
-                             authorization server publishing RFC 8414 metadata at a path the OIDC
-                             derivation cannot construct. The document's issuer must still match
-                             --oidc-issuer. Mutually exclusive with --oidc-jwks-uri.
+  --oidc-metadata-url <url>  Authorization server metadata document URL *this server* uses for JWT
+                             validation, overriding the well-known path derived from --oidc-issuer
+                             (env: OIDC_METADATA_URL). For an authorization server publishing RFC
+                             8414 metadata at a path the OIDC derivation cannot construct. The
+                             document's issuer must still match --oidc-issuer. Mutually exclusive
+                             with --oidc-jwks-uri. Also published to clients unless
+                             --client-oidc-metadata-url overrides it.
   --oidc-jwks-uri <url>      Pinned JWKS endpoint; skips metadata discovery so server auth egress can
                              be limited to the key endpoint (env: OIDC_JWKS_URI). Keys are fetched on
                              the first protected request and during rotation, so this endpoint must
@@ -142,6 +182,7 @@ Flags and their environment variable equivalents:
                              than verified. Mutually exclusive with --oidc-metadata-url.
   --token-audience <string>  Audience required in validated access tokens (env: TOKEN_AUDIENCE)
   --listen-addr <addr>       Listen address (env: LISTEN_ADDR, default: :8443 for TLS-files, :443 for ACME, :8080 for plaintext-behind-reverse-proxy)
+
   --log-level <level>        Log level: debug, info, warn, or error (env: LOG_LEVEL, default: info)
   --allow <rule>             Restrict outbound connections to matching targets (repeatable; env: ALLOW_RULES comma-separated).
                              Rule formats: host-glob:port, host-glob:lo-hi, CIDR:port, CIDR:lo-hi, [IPv6]:port, [IPv6]:lo-hi.
@@ -159,6 +200,47 @@ Flags and their environment variable equivalents:
   --no-ip-block              Disable the resolved-IP guard entirely (env: NO_IP_BLOCK=true). Mutually exclusive with
                              --ip-block. Use only when the deployment legitimately needs to reach addresses in the
                              default protected set and a tighter --ip-block list is not sufficient.
+
+Client configuration published to clients (RFC 9728 protected-resource metadata):
+
+  By default the server publishes GET /.well-known/oauth-protected-resource, naming
+  --oidc-issuer as the authorization server for this tunnel, so clients need not be told
+  where to authenticate. For a client to run with --tunnel-url as its *only* flag it also
+  needs a client ID, which means setting --client-id below: without it a client that
+  supplies none of its own fails at startup. Each hint is optional and unset hints are
+  simply absent from the document.
+
+  --resource-url <url>       Externally visible base resource identifier of this tunnel endpoint, e.g.
+                             https://tunnel.example/protected/tunnel (env: RESOURCE_URL). Scheme, host
+                             and path only: the query comes from each request and is appended, so a
+                             value carrying one is refused at startup. Published after authority
+                             normalisation. By default the base is derived from each request too,
+                             which is right unless a reverse proxy rewrites the path. Clients compare
+                             the result by code-point equality, so a rewritten path must be declared.
+  --client-id <id>           Public OIDC client ID clients should use (env: CLIENT_ID). This is the
+                             client you registered at the IdP for authunnel; it is not a secret.
+  --client-default-scopes <scopes>
+                             Space-delimited scopes clients should request when they configure none
+                             (env: CLIENT_DEFAULT_SCOPES). Include offline_access if clients are to
+                             refresh without re-authenticating. A client's own --oidc-scopes wins.
+  --client-audience <string> Value clients should send as the provider-specific 'audience' parameter,
+                             the Auth0 style (env: CLIENT_AUDIENCE).
+  --client-resource <url>    Value clients should send as the RFC 8707 'resource' parameter, for
+                             providers that bind the token 'aud' to it, e.g. AWS Cognito (env:
+                             CLIENT_RESOURCE). Set whichever of these two your IdP implements: it
+                             knows what audience it requires, not how yours wants it requested.
+  --client-oidc-metadata-url <url>
+                             Authorization server metadata document URL published to *clients* (env:
+                             CLIENT_OIDC_METADATA_URL). Defaults to --oidc-metadata-url, which is
+                             usually right. Set it when the two must differ: with --oidc-jwks-uri
+                             this server reads no metadata document at all, so an egress policy can
+                             deny it the discovery host, while clients still need to be told where
+                             that document lives if the OIDC derivation cannot reach it.
+  --no-resource-metadata     Do not publish the document, and drop the resource_metadata parameter
+                             from the WWW-Authenticate challenge (env: NO_RESOURCE_METADATA=true).
+                             The challenge itself remains: every 401 must carry one. Clients then
+                             need their own --oidc-client-id and one of --oidc-issuer /
+                             --oidc-metadata-url.
 
 TLS mode (choose exactly one):
 
@@ -330,9 +412,19 @@ func main() {
 		Rate:  rate.Limit(cfg.PreAuthRate),
 		Burst: cfg.PreAuthBurst,
 	})
+	resourceMetadata := cfg.resourceMetadata()
+	if resourceMetadata == nil {
+		logger.Info("resource_metadata_disabled",
+			slog.String("hint", "--no-resource-metadata is set; clients must supply their own --oidc-client-id and one of --oidc-issuer or --oidc-metadata-url"))
+	} else {
+		logger.Info("resource_metadata_published",
+			slog.String("path", "/.well-known/oauth-protected-resource"),
+			slog.Bool("client_id_hint", resourceMetadata.ClientID != ""))
+	}
 	serverMux := tunnelserver.NewHandler(validator, tunnelserver.NewObservedSOCKSServer(stdLogger, cfg.AllowRules, cfg.IPBlockRanges, cfg.DialTimeout),
 		tunnelserver.HandlerOptions{
 			TrustForwardedProto: cfg.PlaintextBehindProxy,
+			ResourceMetadata:    resourceMetadata,
 			Longevity: tunnelserver.LongevityConfig{
 				MaxDuration:      cfg.MaxConnectionDuration,
 				ImplementsExpiry: !cfg.NoConnectionTokenExpiry,
@@ -394,16 +486,21 @@ func main() {
 
 func parseServerConfig(args []string, getenv func(string) string) (serverConfig, error) {
 	cfg := serverConfig{
-		Issuer:          getenv("OIDC_ISSUER"),
-		OIDCMetadataURL: getenv("OIDC_METADATA_URL"),
-		OIDCJWKSURI:     getenv("OIDC_JWKS_URI"),
-		TokenAudience:   getenv("TOKEN_AUDIENCE"),
-		TLSCertPath:     getenv("TLS_CERT_FILE"),
-		TLSKeyPath:      getenv("TLS_KEY_FILE"),
-		ACMECacheDir:    "/var/cache/authunnel/acme",
-		LogLevel:        slog.LevelInfo,
-		ExpiryWarning:   3 * time.Minute,
-		DialTimeout:     10 * time.Second,
+		Issuer:                getenv("OIDC_ISSUER"),
+		OIDCMetadataURL:       getenv("OIDC_METADATA_URL"),
+		ClientOIDCMetadataURL: getenv("CLIENT_OIDC_METADATA_URL"),
+		OIDCJWKSURI:           getenv("OIDC_JWKS_URI"),
+		TokenAudience:         getenv("TOKEN_AUDIENCE"),
+		ClientID:              getenv("CLIENT_ID"),
+		ResourceURL:           getenv("RESOURCE_URL"),
+		ClientAudience:        getenv("CLIENT_AUDIENCE"),
+		ClientResource:        getenv("CLIENT_RESOURCE"),
+		TLSCertPath:           getenv("TLS_CERT_FILE"),
+		TLSKeyPath:            getenv("TLS_KEY_FILE"),
+		ACMECacheDir:          "/var/cache/authunnel/acme",
+		LogLevel:              slog.LevelInfo,
+		ExpiryWarning:         3 * time.Minute,
+		DialTimeout:           10 * time.Second,
 	}
 	if listenAddr := getenv("LISTEN_ADDR"); listenAddr != "" {
 		cfg.ListenAddr = listenAddr
@@ -416,6 +513,12 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	}
 	if getenv("INSECURE_OIDC_ISSUER") == "true" {
 		cfg.InsecureOIDCIssuer = true
+	}
+	if getenv("NO_RESOURCE_METADATA") == "true" {
+		cfg.NoResourceMetadata = true
+	}
+	if scopes := getenv("CLIENT_DEFAULT_SCOPES"); scopes != "" {
+		cfg.ClientDefaultScopes = strings.Fields(scopes)
 	}
 	if getenv("ALLOW_OPEN_EGRESS") == "true" {
 		cfg.AllowOpenEgress = true
@@ -559,10 +662,26 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 	fs.StringVar(&cfg.Issuer, "oidc-issuer", cfg.Issuer, "OIDC issuer used for JWT discovery and validation")
 	fs.StringVar(&cfg.OIDCMetadataURL, "oidc-metadata-url", cfg.OIDCMetadataURL,
-		"Authorization server metadata document URL, overriding the well-known path derived from --oidc-issuer; the document's issuer must still match (env: OIDC_METADATA_URL)")
+		"Authorization server metadata document URL this server uses for JWT validation, overriding the well-known path derived from --oidc-issuer; the document's issuer must still match (env: OIDC_METADATA_URL)")
+	fs.StringVar(&cfg.ClientOIDCMetadataURL, "client-oidc-metadata-url", cfg.ClientOIDCMetadataURL,
+		"Authorization server metadata document URL published to clients; defaults to --oidc-metadata-url, and unlike it may be combined with --oidc-jwks-uri (env: CLIENT_OIDC_METADATA_URL)")
 	fs.StringVar(&cfg.OIDCJWKSURI, "oidc-jwks-uri", cfg.OIDCJWKSURI,
 		"Pinned JWKS endpoint; skips metadata discovery entirely, so the issuer-to-keys binding is asserted by you rather than verified. Mutually exclusive with --oidc-metadata-url (env: OIDC_JWKS_URI)")
 	fs.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "Audience required in validated access tokens")
+	fs.StringVar(&cfg.ResourceURL, "resource-url", cfg.ResourceURL,
+		"Externally visible base resource identifier for this tunnel endpoint — no query, which is taken from each request — published in the protected-resource document after authority normalisation; only needed behind a path-rewriting reverse proxy (env: RESOURCE_URL)")
+	fs.StringVar(&cfg.ClientID, "client-id", cfg.ClientID,
+		"Public OIDC client ID published to clients in the protected-resource metadata document (env: CLIENT_ID)")
+	fs.StringVar(&cfg.ClientAudience, "client-audience", cfg.ClientAudience,
+		"Value clients should send as the provider-specific 'audience' authorization parameter (env: CLIENT_AUDIENCE)")
+	fs.StringVar(&cfg.ClientResource, "client-resource", cfg.ClientResource,
+		"Value clients should send as the RFC 8707 'resource' authorization parameter (env: CLIENT_RESOURCE)")
+	fs.BoolVar(&cfg.NoResourceMetadata, "no-resource-metadata", cfg.NoResourceMetadata,
+		"Do not publish RFC 9728 protected-resource metadata, and drop the resource_metadata parameter from the WWW-Authenticate challenge; the challenge itself remains (env: NO_RESOURCE_METADATA=true)")
+	fs.Func("client-default-scopes", "Space-delimited scopes clients should request when they configure none, published to clients; a client's own --oidc-scopes wins (env: CLIENT_DEFAULT_SCOPES)", func(value string) error {
+		cfg.ClientDefaultScopes = strings.Fields(value)
+		return nil
+	})
 	fs.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "Path to the TLS certificate PEM file")
 	fs.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "Path to the TLS private key PEM file")
 	fs.StringVar(&cfg.ACMECacheDir, "acme-cache-dir", cfg.ACMECacheDir, "Directory to cache ACME certificates")
@@ -802,6 +921,14 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 			return cfg, err
 		}
 	}
+	if cfg.ClientOIDCMetadataURL != "" {
+		// Held to the same rule as the server's own, though this process never
+		// fetches it: an unusable URL published to every client is worth refusing
+		// where the operator can see it.
+		if err := authhttp.CheckConfiguredURL("--client-oidc-metadata-url", cfg.ClientOIDCMetadataURL, cfg.InsecureOIDCIssuer); err != nil {
+			return cfg, err
+		}
+	}
 	if cfg.OIDCJWKSURI != "" {
 		if err := authhttp.CheckConfiguredURL("--oidc-jwks-uri", cfg.OIDCJWKSURI, cfg.InsecureOIDCIssuer); err != nil {
 			return cfg, err
@@ -899,7 +1026,57 @@ func parseServerConfig(args []string, getenv func(string) string) (serverConfig,
 		}
 	}
 
+	// Validate the published hints here, where the operator who typed them is
+	// watching, rather than leaving a malformed value to be refused by every
+	// client that later reads it.
+	if err := cfg.resourceMetadata().Validate(); err != nil {
+		return cfg, err
+	}
+	// A hint that nothing will publish is a configuration error, not a value to
+	// silently ignore: an operator who sets --client-id alongside
+	// --no-resource-metadata believes clients are being told something.
+	if cfg.NoResourceMetadata {
+		for _, hint := range []struct{ flag, value string }{
+			{"--resource-url", cfg.ResourceURL},
+			{"--client-id", cfg.ClientID},
+			{"--client-default-scopes", strings.Join(cfg.ClientDefaultScopes, " ")},
+			{"--client-audience", cfg.ClientAudience},
+			{"--client-resource", cfg.ClientResource},
+			// Not --oidc-metadata-url, which this server also uses itself and so
+			// remains meaningful with publishing off. This one is publication only.
+			{"--client-oidc-metadata-url", cfg.ClientOIDCMetadataURL},
+		} {
+			if hint.value != "" {
+				return cfg, fmt.Errorf("%s cannot be combined with --no-resource-metadata: nothing would publish it", hint.flag)
+			}
+		}
+	}
+
 	return cfg, nil
+}
+
+// resourceMetadata builds the handler's view of what to publish, or nil when
+// publishing is switched off.
+//
+// The published metadata URL falls back to this server's own, so the common case needs
+// no second flag; see ClientOIDCMetadataURL for why it is separately settable at all.
+func (cfg serverConfig) resourceMetadata() *tunnelserver.ResourceMetadataConfig {
+	if cfg.NoResourceMetadata {
+		return nil
+	}
+	publishedMetadataURL := cfg.ClientOIDCMetadataURL
+	if publishedMetadataURL == "" {
+		publishedMetadataURL = cfg.OIDCMetadataURL
+	}
+	return &tunnelserver.ResourceMetadataConfig{
+		Issuer:                         cfg.Issuer,
+		ResourceURL:                    cfg.ResourceURL,
+		AuthorizationServerMetadataURL: publishedMetadataURL,
+		ClientID:                       cfg.ClientID,
+		Audience:                       cfg.ClientAudience,
+		ResourceIndicator:              cfg.ClientResource,
+		DefaultScopes:                  cfg.ClientDefaultScopes,
+	}
 }
 
 func checkACMECacheDir(dir string) error {

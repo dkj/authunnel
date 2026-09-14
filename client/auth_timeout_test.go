@@ -113,7 +113,7 @@ func TestManagedOIDCTokenSourceDiscoveryTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected discovery against blocking issuer to fail, got nil")
 	}
-	if !strings.Contains(err.Error(), "discover issuer") {
+	if !strings.Contains(err.Error(), "discover authorization server") {
 		t.Fatalf("expected error to mention discovery, got %v", err)
 	}
 	if elapsed > 5*time.Second {
